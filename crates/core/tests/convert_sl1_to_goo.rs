@@ -156,3 +156,36 @@ fn every_layer_survives_the_conversion_pixel_for_pixel() {
         plan.layer_count, pixels_per_layer
     );
 }
+
+#[test]
+fn conversion_reports_progress_for_every_layer() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let Some(src) = real_sl1() else {
+        eprintln!("skipped: set CHEAPAZSLA_REAL_SL1");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dst = convert::destination_for(&src, "goo", Some(dir.path())).unwrap();
+    let plan = convert::plan(&src, "goo", &dst).unwrap();
+
+    let seen = Arc::new(AtomicU32::new(0));
+    let last = Arc::new(AtomicU32::new(0));
+    let reported_total = Arc::new(AtomicU32::new(0));
+    {
+        let (seen, last, reported_total) = (seen.clone(), last.clone(), reported_total.clone());
+        convert::run_with_progress(&plan, move |done, total| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            last.store(done, Ordering::Relaxed);
+            reported_total.store(total, Ordering::Relaxed);
+        })
+        .expect("convert");
+    }
+
+    let n = seen.load(Ordering::Relaxed);
+    assert_eq!(n, plan.layer_count, "one report per layer");
+    assert_eq!(last.load(Ordering::Relaxed), plan.layer_count, "final report is the last layer");
+    assert_eq!(reported_total.load(Ordering::Relaxed), plan.layer_count, "total is reported");
+    println!("  {n} progress reports for {} layers", plan.layer_count);
+}

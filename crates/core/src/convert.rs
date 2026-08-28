@@ -161,11 +161,23 @@ pub fn losses_between(print: &PrintFile, from: &FormatInfo, to: &FormatInfo) -> 
 /// Carry out a plan. Overwrites `destination`, so the caller decides about
 /// existing files first.
 pub fn run(plan: &Plan) -> Result<()> {
+    run_with_progress(plan, |_, _| {})
+}
+
+/// Carry out a plan, reporting `(layers_done, layers_total)` as it goes.
+///
+/// Progress comes from counting layer fetches rather than from each writer
+/// reporting for itself, so a new format gets progress reporting for free.
+pub fn run_with_progress(
+    plan: &Plan,
+    on_progress: impl Fn(u32, u32) + Send + Sync,
+) -> Result<()> {
     let from = registry::by_id(plan.from.id).ok_or(Error::UnknownFormat)?;
     let to = registry::by_id(plan.to.id).ok_or(Error::UnknownFormat)?;
 
     let opened = from.open(&plan.source)?;
-    to.write(&plan.destination, &opened.print, opened.layers.as_ref())?;
+    let counted = crate::layers::ProgressLayers::new(opened.layers.as_ref(), on_progress);
+    to.write(&plan.destination, &opened.print, &counted)?;
 
     // Confirm something actually landed (§25).
     match std::fs::metadata(&plan.destination) {

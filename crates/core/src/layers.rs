@@ -129,3 +129,45 @@ impl LayerProvider for InMemoryLayers {
             })
     }
 }
+
+/// Wraps a provider and reports each layer as it is fetched.
+///
+/// Writers pull layers one at a time, so counting fetches gives real progress
+/// without every handler having to know about reporting. The callback runs on
+/// whichever thread is doing the writing, so it must not touch the interface
+/// directly.
+pub struct ProgressLayers<'a> {
+    inner: &'a dyn LayerProvider,
+    #[allow(clippy::type_complexity)]
+    on_layer: Box<dyn Fn(u32, u32) + Send + Sync + 'a>,
+}
+
+impl<'a> ProgressLayers<'a> {
+    pub fn new(
+        inner: &'a dyn LayerProvider,
+        on_layer: impl Fn(u32, u32) + Send + Sync + 'a,
+    ) -> Self {
+        Self {
+            inner,
+            on_layer: Box::new(on_layer),
+        }
+    }
+}
+
+impl LayerProvider for ProgressLayers<'_> {
+    fn layer_count(&self) -> u32 {
+        self.inner.layer_count()
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        self.inner.dimensions()
+    }
+
+    fn layer(&self, index: u32) -> Result<LayerImage> {
+        let img = self.inner.layer(index)?;
+        // Reported after the fetch succeeds, so a failed layer is not counted
+        // as done.
+        (self.on_layer)(index + 1, self.inner.layer_count());
+        Ok(img)
+    }
+}

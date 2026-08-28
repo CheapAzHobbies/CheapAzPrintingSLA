@@ -53,6 +53,7 @@ struct Ui {
     convert_bar: gtk::Box,
     format_row: adw::ComboRow,
     dest_row: adw::ActionRow,
+    name_row: adw::EntryRow,
     convert_btn: gtk::Button,
     progress: gtk::ProgressBar,
     out_dir: RefCell<Option<PathBuf>>,
@@ -177,6 +178,10 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     dest_row.add_suffix(&pick_dir);
     dest_row.add_suffix(&reset_dir);
     convert_group.add(&dest_row);
+
+    let name_row = adw::EntryRow::builder().title("Save as").build();
+    name_row.set_show_apply_button(false);
+    convert_group.add(&name_row);
 
     let convert_btn = gtk::Button::with_label("Convert");
     convert_btn.add_css_class("suggested-action");
@@ -309,6 +314,7 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         convert_bar,
         format_row,
         dest_row,
+        name_row: name_row.clone(),
         convert_btn: convert_btn.clone(),
         progress,
         out_dir: RefCell::new(None),
@@ -652,6 +658,7 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
 
     ui.convert_bar.set_visible(true);
     LOADED.with(|l| *l.borrow_mut() = Some(loaded));
+    suggest_name(ui);
     ui.stack.set_visible_child_name("inspect");
     show_layer(ui, 0);
 }
@@ -819,6 +826,45 @@ fn wire_convert(
         let ui = ui.clone();
         reset_dir.connect_clicked(move |_| set_out_dir(&ui, None));
     }
+    {
+        // Changing the output format re-suggests the filename, unless the user
+        // has already typed something of their own.
+        let ui = ui.clone();
+        ui.format_row.clone().connect_selected_notify(move |_| {
+            let current = ui.name_row.text().to_string();
+            let untouched = with_loaded(|l| l.path.clone())
+                .and_then(|src| {
+                    let idx_ids = ui.writable.borrow();
+                    idx_ids
+                        .iter()
+                        .filter_map(|id| convert::destination_for(&src, id, None))
+                        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .find(|n| *n == current)
+                        .map(|_| ())
+                })
+                .is_some();
+            if current.is_empty() || untouched {
+                suggest_name(&ui);
+            }
+        });
+    }
+}
+
+/// Fill the filename box with a name derived from the source and the chosen
+/// output format. Only the extension changes; the stem is preserved (§27).
+fn suggest_name(ui: &Rc<Ui>) {
+    let Some(source) = with_loaded(|l| l.path.clone()) else {
+        return;
+    };
+    let idx = ui.format_row.selected() as usize;
+    let Some(&format_id) = ui.writable.borrow().get(idx) else {
+        return;
+    };
+    if let Some(p) = convert::destination_for(&source, format_id, None) {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            ui.name_row.set_text(name);
+        }
+    }
 }
 
 fn set_out_dir(ui: &Rc<Ui>, dir: Option<PathBuf>) {
@@ -852,9 +898,34 @@ fn start_convert(ui: &Rc<Ui>) {
     };
 
     let out_dir = ui.out_dir.borrow().clone();
-    let Some(desired) = convert::destination_for(&source, format_id, out_dir.as_deref()) else {
+    let Some(generated) = convert::destination_for(&source, format_id, out_dir.as_deref()) else {
         ui.toasts.add_toast(adw::Toast::new("Could not work out a destination filename"));
         return;
+    };
+    // Whatever the user typed wins, but a name is required and it must stay a
+    // filename rather than becoming a path.
+    let typed = ui.name_row.text().trim().to_string();
+    let desired = if typed.is_empty() || typed.contains('/') {
+        if typed.contains('/') {
+            ui.toasts
+                .add_toast(adw::Toast::new("The file name cannot contain a slash"));
+            return;
+        }
+        generated
+    } else {
+        let dir = generated.parent().map(Path::to_path_buf).unwrap_or_default();
+        // Keep the extension matching the chosen format if the user dropped it.
+        let want_ext = registry::by_id(format_id).map(|h| h.info().extension).unwrap_or("");
+        let name = if Path::new(&typed)
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case(want_ext))
+            .unwrap_or(false)
+        {
+            typed
+        } else {
+            format!("{typed}.{want_ext}")
+        };
+        dir.join(name)
     };
 
     // Destination must exist and be writable before anything else (§ storage).
@@ -982,40 +1053,71 @@ fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
     ui.convert_btn.set_sensitive(false);
     ui.progress.set_visible(true);
     ui.progress.set_fraction(0.0);
-    ui.progress.set_text(Some(&format!(
-        "Converting {} layers to {}…",
-        plan.layer_count, plan.to.name
-    )));
-    // Indeterminate pulse: the engine converts as one call, so this reports
-    // that work is happening rather than pretending to know how far along.
-    let pulse = glib::timeout_add_local(std::time::Duration::from_millis(100), {
-        let ui = ui.clone();
-        move || {
-            ui.progress.pulse();
-            glib::ControlFlow::Continue
-        }
-    });
+    ui.progress.set_text(Some(&format!("Preparing {} layers…", plan.layer_count)));
 
-    let (tx, rx) = async_channel::bounded(1);
+    // Progress arrives from the worker as (done, total). The channel is
+    // unbounded and sent to without blocking, so reporting can never slow the
+    // conversion down; dropping an update just means one fewer redraw.
+    let (ptx, prx) = async_channel::unbounded::<(u32, u32)>();
+    let (dtx, drx) = async_channel::bounded(1);
+
     let dest = plan.destination.clone();
+    let total = plan.layer_count;
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = convert::run(&plan).map(|_| started.elapsed());
-        let _ = tx.send_blocking(result);
+        let result = convert::run_with_progress(&plan, move |done, total| {
+            let _ = ptx.try_send((done, total));
+        })
+        .map(|_| started.elapsed());
+        let _ = dtx.send_blocking(result);
     });
 
+    // Progress updates.
+    {
+        let ui = ui.clone();
+        let started = std::time::Instant::now();
+        glib::spawn_future_local(async move {
+            while let Ok((done, total)) = prx.recv().await {
+                if total == 0 {
+                    continue;
+                }
+                let fraction = done as f64 / total as f64;
+                ui.progress.set_fraction(fraction);
+                let elapsed = started.elapsed().as_secs_f64();
+                // Only estimate once there is enough signal to be worth
+                // showing; an estimate from one layer is noise.
+                let text = if done >= 3 && fraction > 0.0 {
+                    let remaining = elapsed / fraction - elapsed;
+                    format!(
+                        "Layer {done} of {total}  ·  {:.0}%  ·  about {} left",
+                        fraction * 100.0,
+                        render::human_time(remaining.max(0.0).round() as u64)
+                    )
+                } else {
+                    format!("Layer {done} of {total}  ·  {:.0}%", fraction * 100.0)
+                };
+                ui.progress.set_text(Some(&text));
+            }
+        });
+    }
+
+    // Completion.
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let outcome = rx.recv().await;
-        pulse.remove();
+        let outcome = drx.recv().await;
         ui.progress.set_visible(false);
         ui.convert_btn.set_sensitive(true);
         match outcome {
             Ok(Ok(elapsed)) => {
                 let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                let rate = if elapsed.as_secs_f32() > 0.0 {
+                    format!(", {:.0} layers/s", total as f32 / elapsed.as_secs_f32())
+                } else {
+                    String::new()
+                };
                 let toast = adw::Toast::builder()
                     .title(format!(
-                        "Converted to {} ({}, {:.1}s)",
+                        "Converted to {} ({}, {:.1}s{rate})",
                         name_of(&dest),
                         render::human_bytes(size),
                         elapsed.as_secs_f32()
