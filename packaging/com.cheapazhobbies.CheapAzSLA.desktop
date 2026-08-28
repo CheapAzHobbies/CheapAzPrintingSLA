@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=CheapAzSLA
+GenericName=Resin Print File Converter
+Comment=Open, inspect and convert resin/SLA print files
+Exec=cheapazsla-gui %f
+Icon=com.cheapazhobbies.CheapAzSLA
+Terminal=false
+Categories=Graphics;3DGraphics;
+Keywords=resin;sla;msla;dlp;3d;print;sl1;goo;ctb;phz;convert;inspect;
+MimeType=application/x-sl1;
+StartupNotify=true
+StartupWMClass=cheapazsla-gui

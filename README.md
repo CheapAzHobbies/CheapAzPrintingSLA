@@ -170,6 +170,55 @@ CHEAPAZSLA_REAL_SL1=/path/to/a/real.sl1 cargo test
 A converter that only reads files it wrote itself proves very little, so the
 suite is built to run against genuine slicer output.
 
+## Credits
+
+CheapAzSLA would not be possible without work other people did first and
+published openly. The format handlers here are written from format
+documentation rather than copied from anyone's source, but the documentation
+is the hard part and it was not mine to make.
+
+### File formats
+
+- **[Elegoo](https://www.elegoo.com)** publish the specification for the
+  `.goo` format used by the Saturn and Mars printers. An open, documented
+  format from a printer manufacturer is rarer than it should be, and it is the
+  reason `.goo` support here can be correct rather than guessed at.
+- **[connorslade/goo](https://github.com/connorslade/goo)** and the
+  [mslicer](https://connorslade.com/projects/mslicer) project publish an ImHex
+  pattern and notes covering the parts of the `.goo` layout the official
+  document leaves implicit, including that the file is big-endian throughout
+  and how the layer checksum is formed. Their notes saved a great deal of
+  guesswork.
+- **[PrusaSlicer](https://github.com/prusa3d/PrusaSlicer)** by Prusa Research
+  defines the SL1 format, which is a plain ZIP of PNGs and settings and is by
+  some margin the most inspectable resin format.
+
+### Reference implementations
+
+- **[UVtools](https://github.com/sn4k3/UVtools)** by Tiago Conceição is the
+  reference implementation for a great many mSLA formats and the tool most of
+  us have relied on for years. It was used here to cross-check that files
+  CheapAzSLA reads are understood the same way a known-good implementation
+  understands them. If you need a format CheapAzSLA does not support yet,
+  UVtools very likely already has it.
+
+### Built with
+
+[Rust](https://www.rust-lang.org), [GTK4](https://www.gtk.org) and
+[libadwaita](https://gitlab.gnome.org/GNOME/libadwaita), plus the
+[gtk4-rs](https://github.com/gtk-rs/gtk4-rs) bindings, and the `zip`, `png`
+and `thiserror` crates.
+
+### On correctness
+
+Format support here is written from specifications and verified against real
+files produced by other software. Where CheapAzSLA and an established tool
+disagree about a file, assume the established tool is right until proven
+otherwise, and please open an issue.
+
 ## Licence
 
 GPL-3.0-or-later.
+
+The formats themselves are not owned by this project, and nothing here
+restricts anyone else from implementing them.

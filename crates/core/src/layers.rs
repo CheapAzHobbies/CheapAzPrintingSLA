@@ -12,9 +12,12 @@ use std::sync::Mutex;
 
 /// Decodes individual layers on request.
 ///
+/// Providers are read-only and shared across threads, so they are `Send + Sync`:
+/// the interface decodes layers on a worker while the main thread stays free.
+///
 /// Implementations must be cheap to construct: the expensive work belongs in
 /// [`LayerProvider::layer`].
-pub trait LayerProvider: Send {
+pub trait LayerProvider: Send + Sync {
     /// Total number of layers available.
     fn layer_count(&self) -> u32;
 
