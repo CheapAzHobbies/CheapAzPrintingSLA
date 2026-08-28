@@ -9,7 +9,7 @@
 mod render;
 
 use adw::prelude::*;
-use cheapazsla_core::{registry, OpenedFile};
+use cheapazsla_core::{convert, registry, OpenedFile};
 use gtk::glib;
 use gtk::{gdk, gio};
 use std::cell::RefCell;
@@ -49,6 +49,14 @@ struct Ui {
     play_button: gtk::Button,
     spinner: gtk::Spinner,
     title: adw::WindowTitle,
+    // convert bar
+    convert_bar: gtk::Box,
+    format_row: adw::ComboRow,
+    dest_row: adw::ActionRow,
+    convert_btn: gtk::Button,
+    progress: gtk::ProgressBar,
+    out_dir: RefCell<Option<PathBuf>>,
+    writable: RefCell<Vec<&'static str>>,
 }
 
 thread_local! {
@@ -136,11 +144,60 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     let warn_group = adw::PreferencesGroup::builder().title("Validation").build();
     warn_group.set_visible(false);
 
+    // ---- convert controls (§21, §27) ----
+    let convert_group = adw::PreferencesGroup::builder().title("Convert").build();
+    let format_row = adw::ComboRow::builder()
+        .title("Output format")
+        .subtitle("What to write")
+        .build();
+    let fmt_model = gtk::StringList::new(&[]);
+    let mut writable_ids: Vec<&'static str> = Vec::new();
+    for info in registry::writable() {
+        fmt_model.append(&format!("{}  ·  .{}", info.name, info.extension));
+        writable_ids.push(info.id);
+    }
+    format_row.set_model(Some(&fmt_model));
+    convert_group.add(&format_row);
+
+    let dest_row = adw::ActionRow::builder()
+        .title("Save to")
+        .subtitle("Beside the original")
+        .build();
+    let pick_dir = gtk::Button::builder()
+        .label("Choose…")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Pick a folder, including a USB drive or SD card")
+        .build();
+    let reset_dir = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Back to saving beside the original")
+        .build();
+    reset_dir.add_css_class("flat");
+    dest_row.add_suffix(&pick_dir);
+    dest_row.add_suffix(&reset_dir);
+    convert_group.add(&dest_row);
+
+    let convert_btn = gtk::Button::with_label("Convert");
+    convert_btn.add_css_class("suggested-action");
+    convert_btn.add_css_class("pill");
+    convert_btn.set_halign(gtk::Align::Fill);
+    convert_btn.set_tooltip_text(Some("Convert this file  (Ctrl+Enter)"));
+
+    let progress = gtk::ProgressBar::builder().show_text(true).visible(false).build();
+
+    let convert_bar = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    convert_bar.set_visible(false);
+    convert_bar.append(&convert_group);
+    convert_bar.append(&convert_btn);
+    convert_bar.append(&progress);
+
     let side = gtk::Box::new(gtk::Orientation::Vertical, 12);
     side.set_margin_top(12);
     side.set_margin_bottom(12);
     side.set_margin_start(12);
     side.set_margin_end(6);
+    side.append(&convert_bar);
     side.append(&info_group);
     side.append(&warn_group);
     let side_scroll = gtk::ScrolledWindow::builder()
@@ -249,9 +306,17 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         play_button: play_button.clone(),
         spinner,
         title,
+        convert_bar,
+        format_row,
+        dest_row,
+        convert_btn: convert_btn.clone(),
+        progress,
+        out_dir: RefCell::new(None),
+        writable: RefCell::new(writable_ids),
     });
 
     wire(&ui, &open_btn, &empty_btn, &about_btn, &first, &prev, &next, &last, &play_button);
+    wire_convert(&ui, &convert_btn, &pick_dir, &reset_dir);
     ui
 }
 
@@ -340,6 +405,10 @@ fn wire(
             match key {
                 gdk::Key::o if ctrl => {
                     choose_file(&ui);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Return if ctrl => {
+                    start_convert(&ui);
                     glib::Propagation::Stop
                 }
                 gdk::Key::Left if count > 0 => {
@@ -581,6 +650,7 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
     }
     ui.play_button.set_sensitive(count > 1);
 
+    ui.convert_bar.set_visible(true);
     LOADED.with(|l| *l.borrow_mut() = Some(loaded));
     ui.stack.set_visible_child_name("inspect");
     show_layer(ui, 0);
@@ -713,4 +783,257 @@ fn show_about(ui: &Rc<Ui>) {
         .license_type(gtk::License::Gpl30)
         .build();
     about.present();
+}
+
+/// Wire up the conversion controls.
+fn wire_convert(
+    ui: &Rc<Ui>,
+    convert_btn: &gtk::Button,
+    pick_dir: &gtk::Button,
+    reset_dir: &gtk::Button,
+) {
+    {
+        let ui = ui.clone();
+        convert_btn.connect_clicked(move |_| start_convert(&ui));
+    }
+    {
+        let ui = ui.clone();
+        pick_dir.connect_clicked(move |_| {
+            // Native folder picker: USB drives, SD cards and network shares
+            // all appear through the desktop portal, so nothing is hardcoded.
+            let dialog = gtk::FileDialog::builder()
+                .title("Save converted files to")
+                .modal(true)
+                .build();
+            let ui2 = ui.clone();
+            dialog.select_folder(Some(&ui.window.clone()), gio::Cancellable::NONE, move |res| {
+                if let Ok(folder) = res {
+                    if let Some(path) = folder.path() {
+                        set_out_dir(&ui2, Some(path));
+                    }
+                }
+            });
+        });
+    }
+    {
+        let ui = ui.clone();
+        reset_dir.connect_clicked(move |_| set_out_dir(&ui, None));
+    }
+}
+
+fn set_out_dir(ui: &Rc<Ui>, dir: Option<PathBuf>) {
+    match &dir {
+        Some(d) => {
+            let free = free_space(d)
+                .map(|b| format!("  ·  {} free", render::human_bytes(b)))
+                .unwrap_or_default();
+            ui.dest_row.set_subtitle(&format!("{}{free}", d.display()));
+        }
+        None => ui.dest_row.set_subtitle("Beside the original"),
+    }
+    *ui.out_dir.borrow_mut() = dir;
+}
+
+/// Free space on the filesystem holding `dir`, when the OS will say.
+fn free_space(dir: &Path) -> Option<u64> {
+    let info = gio::File::for_path(dir)
+        .query_filesystem_info("filesystem::free", gio::Cancellable::NONE)
+        .ok()?;
+    Some(info.attribute_uint64("filesystem::free"))
+}
+
+fn start_convert(ui: &Rc<Ui>) {
+    let Some(source) = with_loaded(|l| l.path.clone()) else {
+        return;
+    };
+    let idx = ui.format_row.selected() as usize;
+    let Some(&format_id) = ui.writable.borrow().get(idx) else {
+        return;
+    };
+
+    let out_dir = ui.out_dir.borrow().clone();
+    let Some(desired) = convert::destination_for(&source, format_id, out_dir.as_deref()) else {
+        ui.toasts.add_toast(adw::Toast::new("Could not work out a destination filename"));
+        return;
+    };
+
+    // Destination must exist and be writable before anything else (§ storage).
+    let dir = desired.parent().unwrap_or(Path::new("."));
+    if !dir.exists() {
+        unavailable_dialog(ui, dir);
+        return;
+    }
+    if !writable(dir) {
+        let d = adw::MessageDialog::builder()
+            .transient_for(&ui.window)
+            .modal(true)
+            .heading("Cannot write to this location")
+            .body(format!(
+                "CheapAzSLA does not have permission to save files in {}.\n\nChoose another location.",
+                dir.display()
+            ))
+            .build();
+        d.add_response("ok", "Close");
+        d.present();
+        return;
+    }
+
+    let plan = match convert::plan(&source, format_id, &desired) {
+        Ok(p) => p,
+        Err(e) => {
+            error_dialog(ui, "This conversion is not possible.", &e.to_string());
+            return;
+        }
+    };
+
+    // Existing file: replace, keep both, or cancel (§27).
+    if desired.exists() {
+        let d = adw::MessageDialog::builder()
+            .transient_for(&ui.window)
+            .modal(true)
+            .heading("File already exists")
+            .body(format!("{} is already in that folder.", name_of(&desired)))
+            .build();
+        d.add_response("cancel", "Cancel");
+        d.add_response("both", "Keep Both");
+        d.add_response("replace", "Replace");
+        d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+        d.set_default_response(Some("both"));
+        let ui2 = ui.clone();
+        let plan2 = plan.clone();
+        d.connect_response(None, move |dlg, resp| {
+            dlg.close();
+            let mut p = plan2.clone();
+            match resp {
+                "replace" => {}
+                "both" => p.destination = convert::unique_path(&p.destination),
+                _ => return,
+            }
+            confirm_losses_then_run(&ui2, p);
+        });
+        d.present();
+        return;
+    }
+
+    confirm_losses_then_run(ui, plan);
+}
+
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(".cheapazsla-write-test");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn unavailable_dialog(ui: &Rc<Ui>, dir: &Path) {
+    let d = adw::MessageDialog::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .heading("Output location unavailable")
+        .body(format!(
+            "{} is not there any more. If it was a removable drive, reconnect it or choose another location.",
+            dir.display()
+        ))
+        .build();
+    d.add_response("ok", "Close");
+    d.present();
+}
+
+/// Show what the destination format cannot carry, then convert (§14, §29).
+fn confirm_losses_then_run(ui: &Rc<Ui>, plan: convert::Plan) {
+    if plan.is_lossless() {
+        run_convert(ui, plan);
+        return;
+    }
+    let body = plan
+        .losses
+        .iter()
+        .map(|l| format!("• {}\n   {}", l.what, l.because))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let d = adw::MessageDialog::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .heading("Some information cannot be preserved")
+        .body(format!(
+            "Converting {} to {} will drop:\n\n{body}",
+            plan.from.name, plan.to.name
+        ))
+        .build();
+    d.add_response("cancel", "Cancel");
+    d.add_response("go", "Convert Anyway");
+    d.set_response_appearance("go", adw::ResponseAppearance::Suggested);
+    d.set_default_response(Some("go"));
+    let ui2 = ui.clone();
+    d.connect_response(None, move |dlg, resp| {
+        dlg.close();
+        if resp == "go" {
+            run_convert(&ui2, plan.clone());
+        }
+    });
+    d.present();
+}
+
+fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
+    ui.convert_btn.set_sensitive(false);
+    ui.progress.set_visible(true);
+    ui.progress.set_fraction(0.0);
+    ui.progress.set_text(Some(&format!(
+        "Converting {} layers to {}…",
+        plan.layer_count, plan.to.name
+    )));
+    // Indeterminate pulse: the engine converts as one call, so this reports
+    // that work is happening rather than pretending to know how far along.
+    let pulse = glib::timeout_add_local(std::time::Duration::from_millis(100), {
+        let ui = ui.clone();
+        move || {
+            ui.progress.pulse();
+            glib::ControlFlow::Continue
+        }
+    });
+
+    let (tx, rx) = async_channel::bounded(1);
+    let dest = plan.destination.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = convert::run(&plan).map(|_| started.elapsed());
+        let _ = tx.send_blocking(result);
+    });
+
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let outcome = rx.recv().await;
+        pulse.remove();
+        ui.progress.set_visible(false);
+        ui.convert_btn.set_sensitive(true);
+        match outcome {
+            Ok(Ok(elapsed)) => {
+                let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                let toast = adw::Toast::builder()
+                    .title(format!(
+                        "Converted to {} ({}, {:.1}s)",
+                        name_of(&dest),
+                        render::human_bytes(size),
+                        elapsed.as_secs_f32()
+                    ))
+                    .button_label("Open Folder")
+                    .timeout(8)
+                    .build();
+                let d = dest.clone();
+                toast.connect_button_clicked(move |_| {
+                    if let Some(parent) = d.parent() {
+                        let uri = gio::File::for_path(parent).uri();
+                        let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                    }
+                });
+                ui.toasts.add_toast(toast);
+            }
+            Ok(Err(e)) => error_dialog(&ui, "The conversion failed.", &e.to_string()),
+            Err(_) => {}
+        }
+    });
 }
