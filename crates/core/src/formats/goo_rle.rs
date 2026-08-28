@@ -52,46 +52,65 @@ fn push_run(out: &mut Vec<u8>, value: u8, mut len: u32) {
             0xFF => TYPE_WHITE,
             _ => TYPE_GREY,
         };
-        if take <= MAX_4 {
-            out.push(ty | (take as u8 & 0x0F));
-        } else if take <= MAX_12 {
-            out.push(ty | (0b01 << 4) | (take as u8 & 0x0F));
-            out.push(((take >> 4) & 0xFF) as u8);
-        } else if take <= MAX_20 {
-            out.push(ty | (0b10 << 4) | (take as u8 & 0x0F));
-            out.push(((take >> 12) & 0xFF) as u8);
-            out.push(((take >> 4) & 0xFF) as u8);
-        } else {
-            out.push(ty | (0b11 << 4) | (take as u8 & 0x0F));
-            out.push(((take >> 20) & 0xFF) as u8);
-            out.push(((take >> 12) & 0xFF) as u8);
-            out.push(((take >> 4) & 0xFF) as u8);
-        }
+        let head_index = out.len();
+        out.push(0); // control byte, filled in below
+        // A grey chunk carries its value in the byte immediately after the
+        // control byte, ahead of the length bytes. Putting it after them
+        // instead desynchronises every chunk that follows, which shows up
+        // only on layers that contain grey pixels at all.
         if ty == TYPE_GREY {
             out.push(value);
         }
+        let size_bits = if take <= MAX_4 {
+            0b00
+        } else if take <= MAX_12 {
+            out.push(((take >> 4) & 0xFF) as u8);
+            0b01
+        } else if take <= MAX_20 {
+            out.push(((take >> 12) & 0xFF) as u8);
+            out.push(((take >> 4) & 0xFF) as u8);
+            0b10
+        } else {
+            out.push(((take >> 20) & 0xFF) as u8);
+            out.push(((take >> 12) & 0xFF) as u8);
+            out.push(((take >> 4) & 0xFF) as u8);
+            0b11
+        };
+        out[head_index] = ty | (size_bits << 4) | (take as u8 & 0x0F);
         len -= take;
     }
 }
 
 /// Encode one layer's pixels.
 ///
+/// `width` matters: the format walks the image row by row, and a run may not
+/// continue past the end of a row into the next one. Encoders that ignore
+/// this produce files their own decoder will happily read back and a printer
+/// will reject. UVtools reports it as "RLE run exceeds the image bounds".
+///
 /// Returns the payload without the leading magic byte or trailing checksum,
 /// and the number of pixels it accounts for so the caller can confirm the
 /// whole panel is covered.
-pub fn encode(pixels: &[u8]) -> (Vec<u8>, u64) {
+pub fn encode(pixels: &[u8], width: u32) -> (Vec<u8>, u64) {
     let mut out = Vec::with_capacity(pixels.len() / 32 + 16);
     let mut covered: u64 = 0;
-    let mut i = 0usize;
-    while i < pixels.len() {
-        let value = pixels[i];
-        let mut run = 1u32;
-        while (i + run as usize) < pixels.len() && pixels[i + run as usize] == value && run < MAX_28 {
-            run += 1;
+    let row = if width == 0 { pixels.len() } else { width as usize };
+
+    for line in pixels.chunks(row) {
+        let mut i = 0usize;
+        while i < line.len() {
+            let value = line[i];
+            let mut run = 1u32;
+            while (i + run as usize) < line.len()
+                && line[i + run as usize] == value
+                && run < MAX_28
+            {
+                run += 1;
+            }
+            push_run(&mut out, value, run);
+            covered += run as u64;
+            i += run as usize;
         }
-        push_run(&mut out, value, run);
-        covered += run as u64;
-        i += run as usize;
     }
     (out, covered)
 }
@@ -143,6 +162,17 @@ pub fn decode(payload: &[u8], expected_pixels: usize) -> Result<Vec<u8>, String>
         }
 
         let size = (head >> 4) & 0b11;
+
+        // The grey value precedes the length bytes.
+        let mut grey: Option<u8> = None;
+        if ty == 0b01 {
+            if i >= payload.len() {
+                return Err("grey chunk has no value byte".into());
+            }
+            grey = Some(payload[i]);
+            i += 1;
+        }
+
         let mut len = (head & 0x0F) as u32;
         let extra = size as usize;
         if i + extra > payload.len() {
@@ -168,14 +198,7 @@ pub fn decode(payload: &[u8], expected_pixels: usize) -> Result<Vec<u8>, String>
         let value = match ty {
             0b00 => 0x00,
             0b11 => 0xFF,
-            0b01 => {
-                if i >= payload.len() {
-                    return Err("grey chunk has no value byte".into());
-                }
-                let v = payload[i];
-                i += 1;
-                v
-            }
+            0b01 => grey.expect("read above"),
             _ => unreachable!("difference chunks are handled above"),
         };
         previous = value;

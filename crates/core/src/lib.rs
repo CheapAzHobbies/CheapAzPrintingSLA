@@ -12,6 +12,7 @@
 //! input -> detect -> parse -> PrintFile -> validate -> write -> output
 //! ```
 
+pub mod convert;
 pub mod error;
 pub mod format;
 pub mod formats;

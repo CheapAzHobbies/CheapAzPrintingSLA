@@ -6,6 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::format::{Confidence, Detection, FormatHandler, FormatInfo, OpenedFile, DETECT_BYTES};
+use crate::formats::goo::GooHandler;
 use crate::formats::sl1::Sl1Handler;
 use std::fs::File;
 use std::io::Read;
@@ -15,7 +16,8 @@ use std::path::Path;
 pub fn handlers() -> Vec<&'static dyn FormatHandler> {
     // Registering a new format is one line here (§45).
     static SL1: Sl1Handler = Sl1Handler;
-    vec![&SL1]
+    static GOO: GooHandler = GooHandler;
+    vec![&SL1, &GOO]
 }
 
 /// Handlers that can read, for the input format list.
