@@ -6,9 +6,11 @@
 //! Anything the engine cannot yet do is presented as unavailable rather than
 //! mocked up (§47).
 
+mod drives;
 mod render;
 
 use adw::prelude::*;
+use cheapazsla_core::settings::Settings;
 use cheapazsla_core::{convert, registry, OpenedFile};
 use gtk::glib;
 use gtk::{gdk, gio};
@@ -48,15 +50,18 @@ struct Ui {
     nav_buttons: Vec<gtk::Button>,
     play_button: gtk::Button,
     spinner: gtk::Spinner,
+    clear_btn: gtk::Button,
     title: adw::WindowTitle,
     // convert bar
     convert_bar: gtk::Box,
     format_row: adw::ComboRow,
     dest_row: adw::ActionRow,
+    drive_box: gtk::Box,
     name_row: adw::EntryRow,
     convert_btn: gtk::Button,
     progress: gtk::ProgressBar,
     out_dir: RefCell<Option<PathBuf>>,
+    settings: RefCell<Settings>,
     writable: RefCell<Vec<&'static str>>,
 }
 
@@ -116,6 +121,14 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     open_btn.add_css_class("suggested-action");
     header.pack_start(&open_btn);
 
+    let clear_btn = gtk::Button::builder()
+        .icon_name("edit-clear-all-symbolic")
+        .tooltip_text("Clear the loaded file  (Ctrl+W)")
+        .build();
+    clear_btn.add_css_class("flat");
+    clear_btn.set_visible(false);
+    header.pack_start(&clear_btn);
+
     let spinner = gtk::Spinner::new();
     header.pack_end(&spinner);
 
@@ -125,6 +138,13 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         .build();
     about_btn.add_css_class("flat");
     header.pack_end(&about_btn);
+
+    let prefs_btn = gtk::Button::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Settings")
+        .build();
+    prefs_btn.add_css_class("flat");
+    header.pack_end(&prefs_btn);
 
     // ---- empty state (§38) ----
     let empty = adw::StatusPage::builder()
@@ -178,6 +198,16 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     dest_row.add_suffix(&pick_dir);
     dest_row.add_suffix(&reset_dir);
     convert_group.add(&dest_row);
+
+    // Quick access to pinned drives. Rebuilt whenever the pin list changes or
+    // a drive is plugged in or out.
+    let drive_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    drive_box.set_margin_top(4);
+    drive_box.set_margin_start(12);
+    drive_box.set_margin_end(12);
+    drive_box.set_margin_bottom(4);
+    drive_box.set_visible(false);
+    convert_group.add(&drive_box);
 
     let name_row = adw::EntryRow::builder().title("Save as").build();
     name_row.set_show_apply_button(false);
@@ -310,19 +340,61 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         nav_buttons: vec![first.clone(), prev.clone(), next.clone(), last.clone()],
         play_button: play_button.clone(),
         spinner,
+        clear_btn: clear_btn.clone(),
         title,
         convert_bar,
         format_row,
         dest_row,
+        drive_box: drive_box.clone(),
         name_row: name_row.clone(),
         convert_btn: convert_btn.clone(),
         progress,
         out_dir: RefCell::new(None),
+        settings: RefCell::new(Settings::load()),
         writable: RefCell::new(writable_ids),
     });
 
     wire(&ui, &open_btn, &empty_btn, &about_btn, &first, &prev, &next, &last, &play_button);
     wire_convert(&ui, &convert_btn, &pick_dir, &reset_dir);
+    {
+        let ui2 = ui.clone();
+        clear_btn.connect_clicked(move |_| clear_file(&ui2));
+    }
+    {
+        let ui2 = ui.clone();
+        prefs_btn.connect_clicked(move |_| show_settings(&ui2));
+    }
+
+    // Restore last session's choices, but only if they are still valid: a USB
+    // drive that has since been unplugged must not silently become the target.
+    refresh_drive_buttons(&ui);
+
+    // Rebuild the quick buttons when a drive appears or disappears, so a stick
+    // plugged in after launch shows up without restarting.
+    {
+        let monitor = gio::VolumeMonitor::get();
+        for signal in ["mount-added", "mount-removed"] {
+            let ui2 = ui.clone();
+            monitor.connect_local(signal, false, move |_| {
+                refresh_drive_buttons(&ui2);
+                None
+            });
+        }
+        // Keep the monitor alive for the life of the window.
+        unsafe { ui.window.set_data("volume-monitor", monitor) };
+    }
+
+    {
+        let saved = ui.settings.borrow().clone();
+        if let Some(dir) = saved.last_output_dir.filter(|d| d.is_dir()) {
+            set_out_dir(&ui, Some(dir));
+        }
+        if let Some(fmt) = saved.last_output_format {
+            if let Some(idx) = ui.writable.borrow().iter().position(|id| *id == fmt) {
+                ui.format_row.set_selected(idx as u32);
+            }
+        }
+    }
     ui
 }
 
@@ -417,6 +489,10 @@ fn wire(
                     start_convert(&ui);
                     glib::Propagation::Stop
                 }
+                gdk::Key::w if ctrl => {
+                    clear_file(&ui);
+                    glib::Propagation::Stop
+                }
                 gdk::Key::Left if count > 0 => {
                     ui.slider.set_value(cur.saturating_sub(1) as f64);
                     glib::Propagation::Stop
@@ -442,6 +518,80 @@ fn wire(
         });
     }
     ui.window.add_controller(keys);
+}
+
+/// Rebuild the row of pinned drive shortcuts.
+///
+/// A pinned drive that is not plugged in stays visible but disabled, so the
+/// user can see it is expected and simply absent rather than wondering where
+/// the button went.
+fn refresh_drive_buttons(ui: &Rc<Ui>) {
+    while let Some(child) = ui.drive_box.first_child() {
+        ui.drive_box.remove(&child);
+    }
+    let (pinned, sub) = {
+        let s = ui.settings.borrow();
+        (s.pinned_volumes.clone(), s.pinned_subfolder.clone())
+    };
+    if pinned.is_empty() {
+        ui.drive_box.set_visible(false);
+        return;
+    }
+    for name in pinned {
+        let target = drives::target_dir(&name, &sub);
+        let btn = gtk::Button::builder()
+            .label(&name)
+            .sensitive(target.is_some())
+            .build();
+        btn.add_css_class("pill");
+        match &target {
+            Some(dir) => {
+                let space = drives::space(dir)
+                    .map(|(free, total)| {
+                        format!(
+                            "\n{} free of {}",
+                            render::human_bytes(free),
+                            render::human_bytes(total)
+                        )
+                    })
+                    .unwrap_or_default();
+                btn.set_tooltip_text(Some(&format!("Save to {}{space}", dir.display())));
+                btn.add_css_class("suggested-action");
+                let ui2 = ui.clone();
+                let d = dir.clone();
+                btn.connect_clicked(move |_| set_out_dir(&ui2, Some(d.clone())));
+            }
+            None => {
+                btn.set_tooltip_text(Some(&format!("{name} is not connected")));
+                btn.add_css_class("dim-label");
+            }
+        }
+        ui.drive_box.append(&btn);
+    }
+    ui.drive_box.set_visible(true);
+}
+
+/// Unload the current file and go back to the drop target.
+fn clear_file(ui: &Rc<Ui>) {
+    stop_play();
+    LOADED.with(|l| *l.borrow_mut() = None);
+    for r in ui.info_rows.borrow_mut().drain(..) {
+        ui.info_group.remove(&r);
+    }
+    for r in ui.warn_rows.borrow_mut().drain(..) {
+        ui.warn_group.remove(&r);
+    }
+    ui.warn_group.set_visible(false);
+    ui.convert_bar.set_visible(false);
+    ui.clear_btn.set_visible(false);
+    ui.picture.set_paintable(gdk::Paintable::NONE);
+    ui.layer_label.set_text("Layer — / —");
+    ui.scale_label.set_text("");
+    ui.name_row.set_text("");
+    ui.play_button.set_icon_name("media-playback-start-symbolic");
+    ui.title.set_title("CheapAzSLA");
+    ui.title.set_subtitle("Resin print file converter & inspector");
+    ui.stack.set_visible_child_name("empty");
 }
 
 fn with_loaded<T>(f: impl FnOnce(&Loaded) -> T) -> Option<T> {
@@ -473,6 +623,9 @@ fn choose_file(ui: &Rc<Ui>) {
         .filters(&filters)
         .modal(true)
         .build();
+    if let Some(dir) = ui.settings.borrow().open_start_dir() {
+        dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
+    }
 
     let ui = ui.clone();
     dialog.open(Some(&ui.window.clone()), gio::Cancellable::NONE, move |res| {
@@ -641,6 +794,14 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
         ui.warn_group.set_visible(true);
     }
 
+    if let Some(dir) = loaded.path.parent() {
+        let mut st = ui.settings.borrow_mut();
+        if st.last_open_dir.as_deref() != Some(dir) {
+            st.last_open_dir = Some(dir.to_path_buf());
+            let _ = st.save();
+        }
+    }
+
     ui.title.set_title(&name_of(&loaded.path));
     ui.title.set_subtitle(&format!(
         "{}  ·  {} layers  ·  {}",
@@ -657,6 +818,7 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
     ui.play_button.set_sensitive(count > 1);
 
     ui.convert_bar.set_visible(true);
+    ui.clear_btn.set_visible(true);
     LOADED.with(|l| *l.borrow_mut() = Some(loaded));
     suggest_name(ui);
     ui.stack.set_visible_child_name("inspect");
@@ -769,6 +931,254 @@ fn error_dialog(ui: &Rc<Ui>, message: &str, detail: &str) {
     }
     dialog.add_response("ok", "Close");
     dialog.present();
+}
+
+/// Settings (§31). Deliberately short: only choices that change behaviour.
+fn show_settings(ui: &Rc<Ui>) {
+    let win = adw::PreferencesWindow::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .title("Settings")
+        .search_enabled(false)
+        .build();
+
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::builder()
+        .title("Conversion")
+        .description("What CheapAzSLA checks before writing a file")
+        .build();
+
+    let current = ui.settings.borrow().clone();
+
+    let warn = adw::SwitchRow::builder()
+        .title("Warn before dropping information")
+        .subtitle("Ask first when the output format cannot hold everything the source has")
+        .active(current.warn_on_information_loss)
+        .build();
+    {
+        let ui = ui.clone();
+        warn.connect_active_notify(move |row| {
+            let mut s = ui.settings.borrow_mut();
+            s.warn_on_information_loss = row.is_active();
+            let _ = s.save();
+        });
+    }
+    group.add(&warn);
+
+    let overwrite = adw::SwitchRow::builder()
+        .title("Confirm before replacing a file")
+        .subtitle("Ask when a file of the same name is already there")
+        .active(current.confirm_overwrite)
+        .build();
+    {
+        let ui = ui.clone();
+        overwrite.connect_active_notify(move |row| {
+            let mut s = ui.settings.borrow_mut();
+            s.confirm_overwrite = row.is_active();
+            let _ = s.save();
+        });
+    }
+    group.add(&overwrite);
+    page.add(&group);
+
+    // Recent output folders, filtered to those still present, so a drive that
+    // has been unplugged is not offered.
+    let recent = current.available_recent_dirs();
+    if !recent.is_empty() {
+        let rg = adw::PreferencesGroup::builder()
+            .title("Recent output folders")
+            .description("Folders converted files were saved to")
+            .build();
+        for dir in recent {
+            let row = adw::ActionRow::builder()
+                .title(dir.display().to_string())
+                .activatable(true)
+                .build();
+            let ui2 = ui.clone();
+            let d = dir.clone();
+            let w = win.clone();
+            row.connect_activated(move |_| {
+                set_out_dir(&ui2, Some(d.clone()));
+                w.close();
+            });
+            rg.add(&row);
+        }
+        page.add(&rg);
+    }
+
+    let og = adw::PreferencesGroup::builder()
+        .title("Opening files")
+        .description("Where the Open dialog starts")
+        .build();
+    let open_dir_row = adw::ActionRow::builder()
+        .title("Default folder")
+        .subtitle(
+            current
+                .default_open_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Wherever the last file was opened from".into()),
+        )
+        .build();
+    let choose = gtk::Button::builder().label("Choose…").valign(gtk::Align::Center).build();
+    let clear_default = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Go back to using the last folder used")
+        .build();
+    clear_default.add_css_class("flat");
+    {
+        let ui = ui.clone();
+        let row = open_dir_row.clone();
+        let parent = win.clone();
+        choose.connect_clicked(move |_| {
+            let dlg = gtk::FileDialog::builder().title("Default folder for opening files").build();
+            let ui2 = ui.clone();
+            let row2 = row.clone();
+            dlg.select_folder(Some(&parent), gio::Cancellable::NONE, move |res| {
+                if let Ok(f) = res {
+                    if let Some(path) = f.path() {
+                        row2.set_subtitle(&path.display().to_string());
+                        let mut st = ui2.settings.borrow_mut();
+                        st.default_open_dir = Some(path);
+                        let _ = st.save();
+                    }
+                }
+            });
+        });
+    }
+    {
+        let ui = ui.clone();
+        let row = open_dir_row.clone();
+        clear_default.connect_clicked(move |_| {
+            let mut st = ui.settings.borrow_mut();
+            st.default_open_dir = None;
+            let _ = st.save();
+            row.set_subtitle("Wherever the last file was opened from");
+        });
+    }
+    open_dir_row.add_suffix(&choose);
+    open_dir_row.add_suffix(&clear_default);
+    og.add(&open_dir_row);
+    page.add(&og);
+
+    let dg = adw::PreferencesGroup::builder()
+        .title("Drives")
+        .description(
+            "Pin a drive to get a one-click shortcut when converting. Drives are \
+             remembered by name, so it still works when the mount point changes.",
+        )
+        .build();
+
+    let sub_row = adw::EntryRow::builder().title("Subfolder on pinned drives").build();
+    sub_row.set_text(&current.pinned_subfolder);
+    {
+        let ui = ui.clone();
+        sub_row.connect_changed(move |row| {
+            let mut st = ui.settings.borrow_mut();
+            st.pinned_subfolder = row.text().trim().trim_matches('/').to_string();
+            let _ = st.save();
+            drop(st);
+            refresh_drive_buttons(&ui);
+        });
+    }
+    dg.add(&sub_row);
+
+    let mounted = drives::mounted();
+    if mounted.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("No drives detected")
+            .subtitle("Connect a USB drive or SD card and it will appear here")
+            .build();
+        dg.add(&row);
+    } else {
+        for d in &mounted {
+            let space = drives::space(&d.path)
+                .map(|(free, total)| {
+                    format!(
+                        "{}  ·  {} free of {}",
+                        d.path.display(),
+                        render::human_bytes(free),
+                        render::human_bytes(total)
+                    )
+                })
+                .unwrap_or_else(|| d.path.display().to_string());
+            let row = adw::SwitchRow::builder()
+                .title(&d.name)
+                .subtitle(&space)
+                .active(current.is_pinned(&d.name))
+                .build();
+            if d.removable {
+                row.add_prefix(&gtk::Image::from_icon_name("drive-removable-media-symbolic"));
+            } else {
+                row.add_prefix(&gtk::Image::from_icon_name("drive-harddisk-symbolic"));
+            }
+            let ui2 = ui.clone();
+            let name = d.name.clone();
+            row.connect_active_notify(move |r| {
+                {
+                    let mut st = ui2.settings.borrow_mut();
+                    if r.is_active() {
+                        st.pin_volume(&name);
+                    } else {
+                        st.unpin_volume(&name);
+                    }
+                    let _ = st.save();
+                }
+                refresh_drive_buttons(&ui2);
+            });
+            dg.add(&row);
+        }
+    }
+
+    // Drives pinned earlier that are not connected now.
+    for name in &current.pinned_volumes {
+        if mounted.iter().any(|d| &d.name == name) {
+            continue;
+        }
+        let row = adw::ActionRow::builder()
+            .title(name.as_str())
+            .subtitle("Not connected")
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name("drive-removable-media-symbolic"));
+        row.add_css_class("dim-label");
+        let unpin = gtk::Button::builder()
+            .icon_name("list-remove-symbolic")
+            .valign(gtk::Align::Center)
+            .tooltip_text("Forget this drive")
+            .build();
+        unpin.add_css_class("flat");
+        let ui2 = ui.clone();
+        let n = name.clone();
+        let w = win.clone();
+        unpin.connect_clicked(move |_| {
+            {
+                let mut st = ui2.settings.borrow_mut();
+                st.unpin_volume(&n);
+                let _ = st.save();
+            }
+            refresh_drive_buttons(&ui2);
+            w.close();
+        });
+        row.add_suffix(&unpin);
+        dg.add(&row);
+    }
+    page.add(&dg);
+
+    let sg = adw::PreferencesGroup::builder().title("Storage").build();
+    let loc = adw::ActionRow::builder()
+        .title("Settings file")
+        .subtitle(
+            Settings::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not available".into()),
+        )
+        .build();
+    sg.add(&loc);
+    page.add(&sg);
+
+    win.add(&page);
+    win.present();
 }
 
 fn show_about(ui: &Rc<Ui>) {
@@ -1016,7 +1426,8 @@ fn unavailable_dialog(ui: &Rc<Ui>, dir: &Path) {
 
 /// Show what the destination format cannot carry, then convert (§14, §29).
 fn confirm_losses_then_run(ui: &Rc<Ui>, plan: convert::Plan) {
-    if plan.is_lossless() {
+    // Lossless, or the user has said they do not want to be asked again.
+    if plan.is_lossless() || !ui.settings.borrow().warn_on_information_loss {
         run_convert(ui, plan);
         return;
     }
@@ -1035,21 +1446,40 @@ fn confirm_losses_then_run(ui: &Rc<Ui>, plan: convert::Plan) {
             plan.from.name, plan.to.name
         ))
         .build();
+
+    let dont_ask = gtk::CheckButton::with_label("Do not ask me again");
+    dont_ask.set_tooltip_text(Some(
+        "Future conversions will go ahead without this warning. \
+         You can turn it back on in Settings.",
+    ));
+    dont_ask.set_margin_top(12);
+    d.set_extra_child(Some(&dont_ask));
+
     d.add_response("cancel", "Cancel");
     d.add_response("go", "Convert Anyway");
     d.set_response_appearance("go", adw::ResponseAppearance::Suggested);
     d.set_default_response(Some("go"));
     let ui2 = ui.clone();
+    let check = dont_ask.clone();
     d.connect_response(None, move |dlg, resp| {
         dlg.close();
-        if resp == "go" {
-            run_convert(&ui2, plan.clone());
+        if resp != "go" {
+            return;
         }
+        // Only remember the choice when the user actually proceeded. Ticking
+        // the box and then cancelling should not silence future warnings.
+        if check.is_active() {
+            let mut s = ui2.settings.borrow_mut();
+            s.warn_on_information_loss = false;
+            let _ = s.save();
+        }
+        run_convert(&ui2, plan.clone());
     });
     d.present();
 }
 
 fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
+    let format_id = plan.to.id;
     ui.convert_btn.set_sensitive(false);
     ui.progress.set_visible(true);
     ui.progress.set_fraction(0.0);
@@ -1109,6 +1539,14 @@ fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
         ui.convert_btn.set_sensitive(true);
         match outcome {
             Ok(Ok(elapsed)) => {
+                {
+                    let mut s = ui.settings.borrow_mut();
+                    if let Some(parent) = dest.parent() {
+                        s.remember_output_dir(parent);
+                    }
+                    s.last_output_format = Some(format_id.to_string());
+                    let _ = s.save();
+                }
                 let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
                 let rate = if elapsed.as_secs_f32() > 0.0 {
                     format!(", {:.0} layers/s", total as f32 / elapsed.as_secs_f32())

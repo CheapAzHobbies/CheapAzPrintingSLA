@@ -20,6 +20,7 @@ pub mod layers;
 pub mod limits;
 pub mod model;
 pub mod registry;
+pub mod settings;
 
 pub use error::{Error, FormatError, Result};
 pub use format::{Capabilities, Confidence, Detection, FormatHandler, FormatInfo, OpenedFile};
