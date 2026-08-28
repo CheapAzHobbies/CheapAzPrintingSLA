@@ -44,7 +44,11 @@ static INFO: FormatInfo = FormatInfo {
     ],
     capabilities: Capabilities {
         reads: true,
-        writes: true,
+        // Writing SL1 is not implemented. This must stay false until it is:
+        // the interface builds its output format list from these flags, and
+        // claiming a capability the code lacks puts a broken option in front
+        // of the user.
+        writes: false,
         per_layer_exposure: false,
         per_layer_lift: false,
         thumbnails: true,

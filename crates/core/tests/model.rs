@@ -222,3 +222,111 @@ fn clearing_the_cache_empties_it() {
     assert_eq!(cached.cached_len(), 0);
     assert_eq!(cached.layer(1).unwrap().pixels[0], 1, "still readable after a clear");
 }
+
+// --- capability honesty (§47) ---
+
+/// A handler that advertises writing must actually write.
+///
+/// The interface builds its output format list from these flags, so a format
+/// claiming a capability it does not have puts an option in front of the user
+/// that fails when chosen. This test exists because that happened.
+#[test]
+fn every_format_claiming_to_write_can_actually_write() {
+    use cheapazsla_core::layers::InMemoryLayers;
+    use cheapazsla_core::registry;
+    use std::collections::BTreeMap;
+
+    let print = PrintFile {
+        source_format: "test".into(),
+        geometry: Geometry {
+            resolution_x: 64,
+            resolution_y: 32,
+            display_width_mm: Some(12.8),
+            display_height_mm: Some(6.4),
+            machine_z_mm: Some(100.0),
+        },
+        exposure: Exposure {
+            layer_height_mm: 0.05,
+            exposure_s: 2.5,
+            bottom_exposure_s: Some(30.0),
+            bottom_layers: Some(2),
+            light_off_delay_s: Some(0.5),
+            bottom_light_off_delay_s: None,
+            transition_layers: Some(1),
+            light_pwm: Some(255),
+            bottom_light_pwm: Some(255),
+        },
+        lift: Lift::default(),
+        layers: (0..4)
+            .map(|i| LayerInfo {
+                z_mm: 0.05 * (i + 1) as f32,
+                exposure_s: None,
+                light_off_delay_s: None,
+                lift_height_mm: None,
+                lift_speed_mm_min: None,
+            })
+            .collect(),
+        thumbnails: vec![],
+        print_time_s: Some(120),
+        material_volume_ml: Some(1.5),
+        material_grams: None,
+        material_name: None,
+        machine_name: Some("Test".into()),
+        extra: BTreeMap::new(),
+    };
+    let images: Vec<LayerImage> = (0..4)
+        .map(|i| {
+            let mut img = LayerImage::blank(64, 32);
+            // Mix black, white and grey so every chunk type is exercised.
+            for (n, px) in img.pixels.iter_mut().enumerate() {
+                *px = match (n + i) % 3 {
+                    0 => 0,
+                    1 => 255,
+                    _ => 128,
+                };
+            }
+            img
+        })
+        .collect();
+    let provider = InMemoryLayers::new(images, 64, 32);
+
+    let dir = tempfile::tempdir().unwrap();
+    for handler in registry::handlers() {
+        let info = handler.info();
+        if !info.capabilities.writes {
+            continue;
+        }
+        let path = dir.path().join(format!("out.{}", info.extension));
+        let result = handler.write(&path, &print, &provider);
+        assert!(
+            result.is_ok(),
+            "{} advertises writes: true but writing failed: {:?}",
+            info.name,
+            result.err()
+        );
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 0, "{} wrote an empty file", info.name);
+    }
+}
+
+/// Likewise for reading.
+#[test]
+fn every_format_claiming_to_read_has_a_working_opener() {
+    use cheapazsla_core::registry;
+    let dir = tempfile::tempdir().unwrap();
+    for handler in registry::handlers() {
+        let info = handler.info();
+        if !info.capabilities.reads {
+            continue;
+        }
+        // Opening nonsense must fail with an error, never a panic, and never
+        // by claiming success.
+        let path = dir.path().join(format!("junk.{}", info.extension));
+        std::fs::write(&path, vec![0x00; 512]).unwrap();
+        assert!(
+            handler.open(&path).is_err(),
+            "{} claims to read but accepted 512 zero bytes as a valid file",
+            info.name
+        );
+    }
+}
