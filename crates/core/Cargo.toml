@@ -1,0 +1,20 @@
+[package]
+name = "cheapazsla-core"
+description = "Conversion and inspection engine for resin/SLA print files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No GUI dependencies belong here, ever. The engine is consumed by both the
+# CLI and the GUI, and must stay usable headless.
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+png = "0.17"
+
+[dev-dependencies]
+tempfile = "3"

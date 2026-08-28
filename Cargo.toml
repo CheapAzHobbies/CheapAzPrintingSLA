@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "crates/gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+authors = ["CheapAzHobbies"]
+repository = "https://github.com/CheapAzHobbies/CheapAzSLA"
+homepage = "https://github.com/CheapAzHobbies/CheapAzSLA"
+
+[workspace.dependencies]
+cheapazsla-core = { path = "crates/core", version = "0.1.0" }
+thiserror = "2"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

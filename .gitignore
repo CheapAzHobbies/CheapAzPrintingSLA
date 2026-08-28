@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+*.pdb
+# Test fixtures that are someone else's model data
+/fixtures/private
