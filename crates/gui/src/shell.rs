@@ -170,6 +170,30 @@ impl Shell {
         *self.current.borrow()
     }
 
+    /// Keep the icons, drop the labels. At narrow widths the sidebar's text is
+    /// most of its width and the icons carry the meaning on their own.
+    pub fn set_compact(&self, compact: bool) {
+        for item in self.items.borrow().iter() {
+            if let Some(row) = item.button.child() {
+                let mut child = row.first_child();
+                while let Some(c) = child {
+                    if c.is::<gtk::Label>() {
+                        c.set_visible(!compact);
+                    }
+                    child = c.next_sibling();
+                }
+            }
+        }
+        if let Some(sidebar) = self.widget.first_child() {
+            sidebar.set_size_request(if compact { 56 } else { theme::SIDEBAR_WIDTH }, -1);
+            // The wordmark goes with the labels; an icon rail with a title
+            // wrapped over three lines is worse than no title.
+            if let Some(brand) = sidebar.first_child() {
+                brand.set_visible(!compact);
+            }
+        }
+    }
+
     fn select_visual(&self, section: Section) {
         for item in self.items.borrow().iter() {
             if item.section == section {

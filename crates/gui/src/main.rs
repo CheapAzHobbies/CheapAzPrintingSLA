@@ -149,6 +149,8 @@ struct App {
     slider: gtk::Scale,
     play_btn: gtk::Button,
     info_panel: gtk::Box,
+    /// The information column beside the preview, dropped when narrow.
+    preview_side: gtk::Widget,
 
     // history page
     history_list: gtk::ListBox,
@@ -214,8 +216,11 @@ fn build(app: &adw::Application) -> Rc<App> {
         .title("CheapAzSLA")
         .default_width(1440)
         .default_height(900)
-        .width_request(1000) // §3: still usable at 1280x720
-        .height_request(640)
+        // Half of a 1920 display is 960 wide and a quarter is 960x540, so a
+        // 1000px minimum quietly made the window untileable. The layout gives
+        // things up as it narrows rather than refusing to narrow.
+        .width_request(560)
+        .height_request(440)
         .build();
     window.add_css_class("cheapazsla");
 
@@ -351,7 +356,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     slider.set_increments(1.0, 10.0);
     let play_btn = shell::icon_button("media-playback-start-symbolic", "Play  (Space)");
     let info_panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
-    let (preview_page, preview_stack) = build_preview_page(
+    let (preview_page, preview_stack, preview_side) = build_preview_page(
         &viewer,
         &layer_label,
         &slider,
@@ -407,6 +412,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         slider: slider.clone(),
         play_btn: play_btn.clone(),
         info_panel,
+        preview_side,
         history_list,
         history_stack,
         files: RefCell::new(Vec::new()),
@@ -430,9 +436,41 @@ fn build(app: &adw::Application) -> Rc<App> {
     }
     build_settings_page(&ui, &settings_page);
     wire(&ui, &add_more);
+    wire_responsive(&ui);
     restore_session(&ui);
     refresh_history(&ui);
     ui
+}
+
+/// Drop things as the window narrows, rather than refusing to narrow (§25).
+///
+/// Two steps. Below the first the information panel beside the preview goes,
+/// since the image is the point and the numbers are still on the Convert page.
+/// Below the second the sidebar keeps its icons and loses its labels, which is
+/// most of its width.
+fn wire_responsive(ui: &Rc<App>) {
+    const HIDE_INFO_BELOW: i32 = 940;
+    const NARROW_SIDEBAR_BELOW: i32 = 720;
+
+    let apply = {
+        let ui = ui.clone();
+        move |width: i32| {
+            ui.preview_side.set_visible(width >= HIDE_INFO_BELOW);
+            ui.shell.set_compact(width < NARROW_SIDEBAR_BELOW);
+            // The slider gives up its minimum before anything overlaps.
+            ui.slider.set_size_request(
+                if width < NARROW_SIDEBAR_BELOW {
+                    120
+                } else {
+                    360
+                },
+                -1,
+            );
+        }
+    };
+    apply(ui.window.width());
+    let window = ui.window.clone();
+    window.connect_default_width_notify(move |w| apply(w.width()));
 }
 
 /// An icon and a label side by side, for buttons that deserve both (§6).
@@ -649,7 +687,7 @@ fn build_preview_page(
     play_btn: &gtk::Button,
     info_panel: &gtk::Box,
     layer_detail: &gtk::Box,
-) -> (gtk::Widget, gtk::Stack) {
+) -> (gtk::Widget, gtk::Stack, gtk::Widget) {
     // Only the layer number sits beside the slider, in a cell wide enough for
     // the largest count it will ever show. Anything whose width follows its
     // content cannot share a row with the widget that expands.
@@ -737,7 +775,7 @@ fn build_preview_page(
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&split, Some("view"));
     stack.set_visible_child_name("empty");
-    (stack.clone().upcast(), stack)
+    (stack.clone().upcast(), stack, side_scroll.upcast())
 }
 
 fn build_history_page(list: &gtk::ListBox) -> (gtk::Widget, gtk::Stack) {
@@ -1474,6 +1512,7 @@ fn select_file(ui: &Rc<App>, index: usize) {
     ui.input_label.set_text(&input);
 
     if ready && count > 0 {
+        build_overview(ui, count);
         ui.slider
             .set_range(0.0, (count.saturating_sub(1)).max(1) as f64);
         ui.slider.set_value(0.0);
@@ -1823,12 +1862,100 @@ fn set_layer_detail(ui: &Rc<App>, rows: &[(&str, String)]) {
     }
 }
 
+/// Build a sparse set of layers spread across the whole print.
+///
+/// Fast scrubbing shows the nearest already-built layer so the picture keeps
+/// up, but early on nothing is built anywhere near where the slider is, so
+/// there is nothing to show and it appears to freeze. Laying down a coarse
+/// index means any point on the slider has something within a few layers from
+/// the moment the file opens.
+///
+/// One at a time, and only while nothing else is decoding, so it never
+/// competes with the layer actually being looked at.
+fn build_overview(ui: &Rc<App>, count: u32) {
+    /// Roughly how many layers apart the index is. Chosen against the
+    /// stand-in's own reach, so every position has one within range.
+    const SPREAD: u32 = 12;
+
+    if count == 0 {
+        return;
+    }
+    let wanted: Vec<u32> = (0..count).step_by(SPREAD as usize).collect();
+    schedule_overview(ui, wanted, 0);
+}
+
+fn schedule_overview(ui: &Rc<App>, wanted: Vec<u32>, at: usize) {
+    if at >= wanted.len() {
+        return;
+    }
+    let ui = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+        // Abandoned if the file changed underneath.
+        let Some(opened) = ui
+            .files
+            .borrow()
+            .get(*ui.selected.borrow())
+            .and_then(|f| f.opened.clone())
+        else {
+            return;
+        };
+        let count = opened.print.layer_count();
+        if wanted.last().map(|i| *i >= count).unwrap_or(true) {
+            return;
+        }
+
+        // Wait rather than pile on while the user is being served.
+        if !ui.in_flight.borrow().is_empty() {
+            schedule_overview(&ui, wanted, at);
+            return;
+        }
+
+        let index = wanted[at];
+        if ui.textures.borrow().contains_key(&index) {
+            schedule_overview(&ui, wanted, at + 1);
+            return;
+        }
+
+        let pixel = opened
+            .print
+            .geometry
+            .pixel_size_um()
+            .map(|(x_um, y_um)| render::PixelSize { x_um, y_um });
+        ui.in_flight.borrow_mut().insert(index);
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = opened.layers.layer(index).map(|img| {
+                let total = img.width as u64 * img.height as u64;
+                (render::texture_for(&img, pixel), total)
+            });
+            let _ = tx.send_blocking(result);
+        });
+        glib::spawn_future_local(async move {
+            if let Ok(Ok(((texture, factor, exposed), total))) = rx.recv().await {
+                remember_texture(
+                    &ui,
+                    index,
+                    Drawn {
+                        texture,
+                        factor,
+                        exposed,
+                        total,
+                    },
+                );
+            }
+            ui.in_flight.borrow_mut().remove(&index);
+            schedule_overview(&ui, wanted, at + 1);
+        });
+    });
+}
+
 /// The built layer closest to the one asked for, if there is one near enough
 /// to be a useful stand-in.
 fn nearest_built(ui: &Rc<App>, index: u32) -> Option<(u32, Drawn)> {
     /// Beyond this the image on screen has nothing to do with the layer
-    /// selected, and showing it is worse than showing nothing new.
-    const NEAR: u32 = 16;
+    /// selected, and showing it is worse than showing nothing new. Matched to
+    /// the spacing of the overview index, so there is always one in range.
+    const NEAR: u32 = 12;
     let cache = ui.textures.borrow();
     cache
         .iter()

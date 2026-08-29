@@ -233,6 +233,14 @@ Run through this before a release. Tick each line.
 - [ ] Double-clicking the header bar maximises
 - [ ] The window can be dragged by the header bar
 
+### Window sizes
+
+- [ ] Tiles to half the screen without the layout breaking
+- [ ] Tiles to a quarter of the screen
+- [ ] Narrowing drops the information panel beside the preview
+- [ ] Narrowing further leaves the sidebar as icons, still navigable
+- [ ] Nothing overlaps at the smallest size the window will take
+
 ### Appearance
 
 - [ ] Dark by default
