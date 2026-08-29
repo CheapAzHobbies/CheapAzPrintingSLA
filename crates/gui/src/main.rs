@@ -335,6 +335,8 @@ fn build(app: &adw::Application) -> Rc<App> {
     let viewer = viewer::LayerViewer::new();
     let layer_label = gtk::Label::builder().label("Layer — / —").build();
     layer_label.add_css_class("heading");
+    // Tabular figures, so the number does not jitter as digits change.
+    layer_label.add_css_class("cz-value");
     let layer_detail = gtk::Label::builder().label("").build();
     layer_detail.add_css_class("caption");
     layer_detail.add_css_class("cz-dim");
@@ -645,8 +647,17 @@ fn build_preview_page(
     play_btn: &gtk::Button,
     info_panel: &gtk::Box,
 ) -> (gtk::Widget, gtk::Stack) {
+    // A fixed column. The detail text changes length constantly as layers
+    // change, and the slider is the widget that expands, so without this every
+    // caption of a different width resized the slider under the pointer.
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    labels.set_hexpand(true);
+    labels.set_hexpand(false);
+    labels.set_size_request(300, -1);
+    labels.set_halign(gtk::Align::End);
+    layer_label.set_xalign(1.0);
+    layer_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    layer_detail.set_xalign(1.0);
+    layer_detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
     labels.append(layer_label);
     labels.append(layer_detail);
 
