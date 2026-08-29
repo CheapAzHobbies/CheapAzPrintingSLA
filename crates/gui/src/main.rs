@@ -1570,7 +1570,7 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     let cached = ui.textures.borrow().get(&index).cloned();
     if let Some(cached) = cached {
         draw_layer(ui, &cached, square);
-        prefetch_around(ui, index, count, pixel);
+        prefetch_after_settling(ui, index, count, pixel, request);
         ui.last_layer.set(index);
         return;
     }
@@ -1583,21 +1583,52 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let result = opened.layers.layer(index).map(|img| {
-            let exposed = img.exposed_pixels(0);
             let total = img.width as u64 * img.height as u64;
-            (render::texture_for(&img, pixel), exposed, total)
+            (render::texture_for(&img, pixel), total)
         });
         let _ = tx.send_blocking(result);
     });
     ui.in_flight.borrow_mut().insert(index);
     finish_layer(ui, rx, request, square, index);
-    prefetch_around(ui, index, count, pixel);
+    prefetch_after_settling(ui, index, count, pixel, request);
     ui.last_layer.set(index);
 }
 
-/// How many layers to read ahead. Enough to stay in front of a dragged
-/// slider without filling the machine with decode threads.
-const PREFETCH: u32 = 4;
+/// How many layers to read ahead once the user settles.
+const PREFETCH: u32 = 3;
+
+/// Most decodes to have running at once.
+///
+/// Each one walks every pixel of a layer, so on a 12K panel a handful of them
+/// will saturate any machine. Reading ahead is worth nothing if it makes the
+/// layer actually being looked at arrive late.
+const MAX_DECODES: usize = 2;
+
+/// How long to wait before reading ahead.
+///
+/// Prefetching during an active drag is worse than not prefetching at all: it
+/// queues work for layers the slider has already passed and competes with the
+/// decode of the one on screen. Waiting until the user pauses means the work
+/// is both wanted and affordable.
+const SETTLE_MS: u64 = 120;
+
+/// Read ahead after the user stops moving.
+fn prefetch_after_settling(
+    ui: &Rc<App>,
+    index: u32,
+    count: u32,
+    pixel: Option<render::PixelSize>,
+    request: u64,
+) {
+    let ui = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(SETTLE_MS), move || {
+        // Superseded: the user is still moving, so this is not where they are.
+        if ui.layer_request.get() != request {
+            return;
+        }
+        prefetch_around(&ui, index, count, pixel);
+    });
+}
 
 /// Decode the layers the user is about to want.
 ///
@@ -1636,6 +1667,9 @@ fn prefetch_around(ui: &Rc<App>, index: u32, count: u32, pixel: Option<render::P
     }
 
     for i in wanted {
+        if ui.in_flight.borrow().len() >= MAX_DECODES {
+            break;
+        }
         if ui.textures.borrow().contains_key(&i) || ui.in_flight.borrow().contains(&i) {
             continue;
         }
@@ -1644,15 +1678,14 @@ fn prefetch_around(ui: &Rc<App>, index: u32, count: u32, pixel: Option<render::P
         let layers = opened.clone();
         std::thread::spawn(move || {
             let result = layers.layers.layer(i).map(|img| {
-                let exposed = img.exposed_pixels(0);
                 let total = img.width as u64 * img.height as u64;
-                (render::texture_for(&img, pixel), exposed, total)
+                (render::texture_for(&img, pixel), total)
             });
             let _ = tx.send_blocking(result);
         });
         let ui = ui.clone();
         glib::spawn_future_local(async move {
-            if let Ok(Ok(((texture, factor), exposed, total))) = rx.recv().await {
+            if let Ok(Ok(((texture, factor, exposed), total))) = rx.recv().await {
                 remember_texture(
                     &ui,
                     i,
@@ -1698,7 +1731,7 @@ fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool) {
 
 /// Draw a decoded layer, unless a newer one has been asked for since.
 /// A decoded layer on its way to the screen.
-type DecodedLayer = Result<((gdk::Texture, u32), u64, u64), cheapazsla_core::Error>;
+type DecodedLayer = Result<((gdk::Texture, u32, u64), u64), cheapazsla_core::Error>;
 
 fn finish_layer(
     ui: &Rc<App>,
@@ -1711,7 +1744,7 @@ fn finish_layer(
     glib::spawn_future_local(async move {
         let received = rx.recv().await;
         match received {
-            Ok(Ok(((texture, factor), exposed, total))) => {
+            Ok(Ok(((texture, factor, exposed), total))) => {
                 let drawn = Drawn {
                     texture,
                     factor,

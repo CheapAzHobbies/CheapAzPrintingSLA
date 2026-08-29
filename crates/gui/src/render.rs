@@ -20,13 +20,21 @@ const MAX_EDGE: u32 = 2048;
 /// make a user think their layer has holes in it. Averaging rather than
 /// nearest-neighbour matters: thin single-pixel features are common in resin
 /// prints and nearest-neighbour makes them flicker in and out while scrubbing.
-fn downscale(img: &LayerImage, factor: u32) -> (u32, u32, Vec<u8>) {
+/// Downscale, returning the reduced image and how many source pixels were
+/// exposed.
+///
+/// The count comes from this pass rather than a separate walk. Every pixel is
+/// already being read here, and on a 12K panel a second pass is another 59
+/// million reads for a number that is free to accumulate on the way past.
+fn downscale(img: &LayerImage, factor: u32) -> (u32, u32, Vec<u8>, u64) {
     if factor <= 1 {
-        return (img.width, img.height, img.pixels.clone());
+        let exposed = img.pixels.iter().filter(|&&p| p > 0).count() as u64;
+        return (img.width, img.height, img.pixels.clone(), exposed);
     }
     let nw = (img.width / factor).max(1);
     let nh = (img.height / factor).max(1);
     let mut out = vec![0u8; (nw * nh) as usize];
+    let mut exposed: u64 = 0;
     let f = factor as usize;
     let src_w = img.width as usize;
     for y in 0..nh as usize {
@@ -44,14 +52,16 @@ fn downscale(img: &LayerImage, factor: u32) -> (u32, u32, Vec<u8>) {
                     if sx >= src_w {
                         break;
                     }
-                    sum += img.pixels[row + sx] as u32;
+                    let v = img.pixels[row + sx];
+                    sum += v as u32;
+                    exposed += (v > 0) as u64;
                     count += 1;
                 }
             }
             out[y * nw as usize + x] = sum.checked_div(count).unwrap_or(0) as u8;
         }
     }
-    (nw, nh, out)
+    (nw, nh, out, exposed)
 }
 
 /// How a layer's pixels map to millimetres, when the file records it.
@@ -112,10 +122,10 @@ fn correct_aspect(w: u32, h: u32, grey: Vec<u8>, aspect: f32) -> (u32, u32, Vec<
 ///
 /// Returns the texture and the factor it was reduced by, so the interface can
 /// tell the user they are not looking at full resolution.
-pub fn texture_for(img: &LayerImage, pixel: Option<PixelSize>) -> (gdk::Texture, u32) {
+pub fn texture_for(img: &LayerImage, pixel: Option<PixelSize>) -> (gdk::Texture, u32, u64) {
     let longest = img.width.max(img.height);
     let factor = longest.div_ceil(MAX_EDGE).max(1);
-    let (w, h, grey) = downscale(img, factor);
+    let (w, h, grey, exposed) = downscale(img, factor);
     let (w, h, grey) = match pixel {
         Some(p) if !p.is_square() => correct_aspect(w, h, grey, p.aspect()),
         _ => (w, h, grey),
@@ -139,7 +149,7 @@ pub fn texture_for(img: &LayerImage, pixel: Option<PixelSize>) -> (gdk::Texture,
         &Bytes::from_owned(rgb),
         (w * 3) as usize,
     );
-    (texture.upcast(), factor)
+    (texture.upcast(), factor, exposed)
 }
 
 /// Human-readable byte size.
