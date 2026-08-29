@@ -16,6 +16,7 @@ mod theme;
 
 use adw::prelude::*;
 use cheapazsla_core::history::{self, History};
+use cheapazsla_core::remedy::{self, Suggestion};
 use cheapazsla_core::settings::Settings;
 use cheapazsla_core::{convert, registry, OpenedFile};
 use gtk::glib;
@@ -99,6 +100,8 @@ struct Queued {
     warnings: Vec<String>,
     opened: Option<Arc<OpenedFile>>,
     status: Status,
+    /// What the user can try, when something went wrong.
+    suggestions: Vec<Suggestion>,
 }
 
 impl Queued {
@@ -233,8 +236,18 @@ fn build(app: &adw::Application) -> Rc<App> {
     queue_panel.append(&add_more);
     queue_panel.set_visible(false);
 
-    let input_label = gtk::Label::builder().label("—").xalign(0.0).build();
+    let input_label = gtk::Label::builder()
+        .label("—")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
     input_label.add_css_class("cz-value");
+    // Detected rather than chosen, so it must not look clickable, but bare
+    // text beside a boxed dropdown reads as unfinished.
+    let input_field = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    input_field.add_css_class("cz-field");
+    input_field.append(&input_label);
+    input_field.set_tooltip_text(Some("Detected from the file's contents"));
     let output_picker = format_picker::FormatPicker::new(format_picker::Direction::Write);
     let swap_btn = shell::icon_button("media-playlist-repeat-symbolic", "Swap formats");
     let output_info = format_picker::info_button({
@@ -286,7 +299,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     let convert_page = build_convert_page(
         &dropzone,
         &queue_panel,
-        &input_label,
+        &input_field,
         &output_picker,
         &swap_btn,
         &output_info,
@@ -504,7 +517,7 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
 fn build_convert_page(
     dropzone: &gtk::Box,
     queue_panel: &gtk::Box,
-    input_label: &gtk::Label,
+    input_field: &gtk::Box,
     output_picker: &Rc<format_picker::FormatPicker>,
     swap_btn: &gtk::Button,
     output_info: &gtk::MenuButton,
@@ -531,7 +544,7 @@ fn build_convert_page(
     let in_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     in_col.set_hexpand(true);
     in_col.append(&shell::section_label("Input"));
-    in_col.append(input_label);
+    in_col.append(input_field);
 
     let swap_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     swap_col.set_valign(gtk::Align::End);
@@ -772,6 +785,7 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 let _ = s.save();
             }
             suggest_name(&ui);
+            refresh_queue(&ui);
             revalidate(&ui);
         });
     }
@@ -1047,6 +1061,7 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
             warnings: Vec::new(),
             opened: None,
             status: Status::Reading,
+            suggestions: Vec::new(),
         });
         added += 1;
         read_in_background(ui, path);
@@ -1100,7 +1115,10 @@ fn read_in_background(ui: &Rc<App>, path: PathBuf) {
                     Status::Warning(notes.join("\n"))
                 };
             }
-            Err(e) => entry.status = Status::Failed(e),
+            Err((message, suggestions)) => {
+                entry.status = Status::Failed(message);
+                entry.suggestions = suggestions;
+            }
         }
         drop(files);
         refresh_queue(&ui);
@@ -1117,12 +1135,20 @@ struct ReadFile {
     opened: Arc<OpenedFile>,
 }
 
-fn read_file(path: &Path) -> Result<ReadFile, String> {
-    let id = registry::identify(path)
-        .map_err(|e| format!("CheapAzSLA does not recognise this file. {e}"))?;
-    let handler = registry::by_id(id.detection.format_id).ok_or("No handler for this format")?;
+/// A message for the user, and what they can try (§28).
+type ReadFailure = (String, Vec<Suggestion>);
+
+fn read_file(path: &Path) -> Result<ReadFile, ReadFailure> {
+    let facts = remedy::FileFacts::observe(path);
+    let explain = |e: cheapazsla_core::Error| -> ReadFailure {
+        (e.to_string(), remedy::for_error(&e, &facts))
+    };
+
+    let id = registry::identify(path).map_err(explain)?;
+    let handler = registry::by_id(id.detection.format_id)
+        .ok_or_else(|| explain(cheapazsla_core::Error::UnknownFormat))?;
     let warnings = handler.validate(path).unwrap_or_default();
-    let opened = handler.open(path).map_err(|e| e.to_string())?;
+    let opened = handler.open(path).map_err(explain)?;
     Ok(ReadFile {
         format: id.detection.format_id.to_string(),
         detection: id.detection.reason,
@@ -1154,14 +1180,39 @@ fn refresh_queue(ui: &Rc<App>) {
         name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         row.append(&name);
 
-        let fmt = gtk::Label::new(Some(&if f.format.is_empty() {
+        // Source and target on every row. The output format applies to the
+        // whole queue, so without this a file's fate is only visible while it
+        // happens to be the selected one.
+        let from = if f.format.is_empty() {
             "—".to_string()
         } else {
             f.format.to_uppercase()
-        }));
-        fmt.add_css_class("cz-dim");
-        fmt.set_width_chars(5);
-        row.append(&fmt);
+        };
+        let conversion = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
+        conversion.set_width_request(112);
+        let from_label = gtk::Label::new(Some(&from));
+        from_label.add_css_class("cz-dim");
+        conversion.append(&from_label);
+        if let Some(target) = ui.output_picker.selected() {
+            let same = !f.format.is_empty() && f.format == target;
+            let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+            arrow.add_css_class("cz-dim");
+            arrow.set_pixel_size(12);
+            conversion.append(&arrow);
+            let to_label = gtk::Label::new(Some(&target.to_uppercase()));
+            if same {
+                // Already this format: say so rather than implying work.
+                to_label.add_css_class("cz-warn");
+                shell::set_tooltip_deep(
+                    &conversion,
+                    "This file is already in the output format, so converting it would achieve nothing.",
+                );
+            } else {
+                to_label.add_css_class("cz-value");
+            }
+            conversion.append(&to_label);
+        }
+        row.append(&conversion);
 
         let size = gtk::Label::new(Some(&render::human_bytes(f.size)));
         size.add_css_class("cz-dim");
@@ -1187,15 +1238,9 @@ fn refresh_queue(ui: &Rc<App>) {
                     "Worth knowing about this file"
                 };
                 let name = f.name();
+                let suggestions = f.suggestions.clone();
                 details.connect_clicked(move |_| {
-                    let d = adw::MessageDialog::builder()
-                        .transient_for(&win)
-                        .modal(true)
-                        .heading(heading)
-                        .body(format!("{name}\n\n{detail}"))
-                        .build();
-                    d.add_response("ok", "Close");
-                    d.present();
+                    show_details(&win, heading, &name, &detail, &suggestions);
                 });
                 row.append(&details);
             }
@@ -1220,6 +1265,87 @@ fn refresh_queue(ui: &Rc<App>) {
         }
     }
     revalidate(ui);
+}
+
+/// What happened, then what to try, with the technical text last.
+///
+/// The order is deliberate: a person who has just been told their file failed
+/// wants to know what to do about it, not to read a parser message first.
+fn show_details(
+    parent: &adw::ApplicationWindow,
+    heading: &str,
+    name: &str,
+    detail: &str,
+    suggestions: &[Suggestion],
+) {
+    let body = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
+    body.set_margin_top(theme::SPACE_2);
+
+    let what = gtk::Label::builder()
+        .label(detail)
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(56)
+        .build();
+    body.append(&what);
+
+    if !suggestions.is_empty() {
+        let head = shell::section_label("What you can try");
+        head.set_margin_top(theme::SPACE_2);
+        body.append(&head);
+
+        for (i, s) in suggestions.iter().enumerate() {
+            let item = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+            item.set_valign(gtk::Align::Start);
+            let n = gtk::Label::builder()
+                .label(format!("{}.", i + 1))
+                .xalign(1.0)
+                .width_chars(2)
+                .valign(gtk::Align::Start)
+                .build();
+            n.add_css_class("cz-dim");
+            item.append(&n);
+
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let action = gtk::Label::builder()
+                .label(&s.action)
+                .xalign(0.0)
+                .wrap(true)
+                .max_width_chars(50)
+                .build();
+            text.append(&action);
+            if !s.because.is_empty() {
+                let why = gtk::Label::builder()
+                    .label(&s.because)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .max_width_chars(50)
+                    .build();
+                why.add_css_class("caption");
+                why.add_css_class("cz-dim");
+                text.append(&why);
+            }
+            item.append(&text);
+            body.append(&item);
+        }
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .child(&body)
+        .build();
+
+    let d = adw::MessageDialog::builder()
+        .transient_for(parent)
+        .modal(true)
+        .heading(heading)
+        .body(name)
+        .extra_child(&scroller)
+        .build();
+    d.add_response("ok", "Close");
+    d.present();
 }
 
 fn remove_file(ui: &Rc<App>, path: &Path) {

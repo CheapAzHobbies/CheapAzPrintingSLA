@@ -21,6 +21,7 @@ pub mod layers;
 pub mod limits;
 pub mod model;
 pub mod registry;
+pub mod remedy;
 pub mod settings;
 
 pub use error::{Error, FormatError, Result};

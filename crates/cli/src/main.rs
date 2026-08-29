@@ -8,6 +8,7 @@
 //! and stable, and it keeps the engine's dependency tree the only one that
 //! matters.
 
+use cheapazsla_core::remedy;
 use cheapazsla_core::{convert, registry};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -163,8 +164,8 @@ fn list_formats() {
 }
 
 fn show_info(path: &Path) -> Result<(), String> {
-    let id = registry::identify(path).map_err(|e| e.to_string())?;
-    let opened = registry::open(path).map_err(|e| e.to_string())?;
+    let id = registry::identify(path).map_err(|e| explain(path, &e))?;
+    let opened = registry::open(path).map_err(|e| explain(path, &e))?;
     let p = &opened.print;
 
     println!("{}", path.display());
@@ -217,9 +218,9 @@ fn fmt_time(s: u64) -> String {
 }
 
 fn validate(path: &Path) -> Result<(), String> {
-    let id = registry::identify(path).map_err(|e| e.to_string())?;
+    let id = registry::identify(path).map_err(|e| explain(path, &e))?;
     let handler = registry::by_id(id.detection.format_id).ok_or("no handler")?;
-    let warnings = handler.validate(path).map_err(|e| e.to_string())?;
+    let warnings = handler.validate(path).map_err(|e| explain(path, &e))?;
     if warnings.is_empty() {
         println!("{}: ok ({})", path.display(), id.detection.format_id);
     } else {
@@ -252,7 +253,7 @@ fn convert_one(input: &Path, args: &Args) -> Result<(), String> {
             .ok_or("could not work out an output path")?,
     };
 
-    let plan = convert::plan(input, &format, &destination).map_err(|e| e.to_string())?;
+    let plan = convert::plan(input, &format, &destination).map_err(|e| explain(input, &e))?;
 
     if !args.quiet {
         for w in &plan.source_warnings {
@@ -301,7 +302,7 @@ fn convert_one(input: &Path, args: &Args) -> Result<(), String> {
             eprint!("\r  layer {done} of {total}");
         }
     })
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| explain(input, &e))?;
     if verbose {
         eprintln!();
     }
@@ -320,6 +321,26 @@ fn convert_one(input: &Path, args: &Args) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The failure, then what to try, indented under it.
+///
+/// The suggestions come from the engine, so the command line says the same
+/// things the interface does rather than keeping its own list.
+fn explain(path: &Path, error: &cheapazsla_core::Error) -> String {
+    let facts = remedy::FileFacts::observe(path);
+    let suggestions = remedy::for_error(error, &facts);
+    let mut out = error.to_string();
+    if !suggestions.is_empty() {
+        out.push_str("\n  what you can try:");
+        for (i, s) in suggestions.iter().enumerate() {
+            out.push_str(&format!("\n    {}. {}", i + 1, s.action));
+            if !s.because.is_empty() {
+                out.push_str(&format!("\n       {}", s.because));
+            }
+        }
+    }
+    out
 }
 
 fn human_bytes(n: u64) -> String {

@@ -140,6 +140,17 @@ fn sheet(p: &Palette) -> String {
 .cz-value {{ font-feature-settings: "tnum" 1; }}
 .cz-dim {{ color: @cz_dim; }}
 
+/* A read-only field shaped like the controls beside it. The input format is
+   detected rather than chosen, so it must not look clickable, but leaving it
+   as bare text next to a boxed dropdown reads as unfinished. */
+.cz-field {{
+  background-color: alpha(@cz_border, 0.35);
+  border: 1px solid @cz_border;
+  border-radius: 6px;
+  padding: 7px 12px;
+  min-height: 20px;
+}}
+
 /* ---- buttons ---- */
 button.cz-primary {{
   background-image: none;
