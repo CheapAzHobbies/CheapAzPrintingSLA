@@ -28,6 +28,18 @@ Three things, done properly:
 - **Convert** it to another format, keeping every piece of print information
   that both formats can express, and saying plainly what cannot survive.
 
+## Scope
+
+Resin only. CheapAzSLA is for masked stereolithography and DLP printers, the
+kind that cure a photopolymer with a screen or a projector.
+
+Layers are greyscale exposure masks, one byte per pixel, because that is what
+they physically are. There is no colour anywhere in the engine and there will
+not be. Nothing here touches filament printing: no extrusion, no toolpaths, no
+temperatures, no multi-material.
+
+If you have a `.gcode` file, this is the wrong tool.
+
 ## What it is not
 
 CheapAzSLA is not a slicer, and will not become one. It does no model

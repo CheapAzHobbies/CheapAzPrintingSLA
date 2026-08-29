@@ -35,6 +35,7 @@ struct Loaded {
 struct Ui {
     window: adw::ApplicationWindow,
     stack: gtk::Stack,
+    right: gtk::Stack,
     toasts: adw::ToastOverlay,
     // inspect page
     info_group: adw::PreferencesGroup,
@@ -146,12 +147,29 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     prefs_btn.add_css_class("flat");
     header.pack_end(&prefs_btn);
 
-    // ---- empty state (§38) ----
+    // ---- drop target (§38) ----
+    // Lives inside the viewer pane, so clearing a file swaps only the image
+    // area and leaves the rest of the window where it was.
+    // "Sliced" rather than "resin": it names what the file is, and quietly
+    // rules out the STL someone would otherwise try to drop here.
+    let readable: Vec<String> = registry::readable()
+        .iter()
+        .map(|i| i.extension.to_uppercase())
+        .collect();
+    let writable_names: Vec<String> = registry::writable()
+        .iter()
+        .map(|i| i.extension.to_uppercase())
+        .collect();
     let empty = adw::StatusPage::builder()
         .icon_name("document-open-symbolic")
-        .title("Drop a resin file here")
-        .description("CheapAzSLA reads the file, tells you what it actually is, and lets you look through its layers.\n\nCurrently readable:  SL1")
+        .title("Drop a sliced file here")
+        .description(format!(
+            "or browse your computer\n\nOpens {}   ·   Converts to {}",
+            readable.join(", "),
+            writable_names.join(", ")
+        ))
         .build();
+    empty.set_vexpand(true);
     let empty_btn = gtk::Button::builder()
         .label("Browse Files…")
         .halign(gtk::Align::Center)
@@ -162,6 +180,7 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
 
     // ---- inspect page ----
     let info_group = adw::PreferencesGroup::builder().title("File").build();
+    info_group.set_visible(false);
     let warn_group = adw::PreferencesGroup::builder().title("Validation").build();
     warn_group.set_visible(false);
 
@@ -218,11 +237,11 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     convert_btn.add_css_class("pill");
     convert_btn.set_halign(gtk::Align::Fill);
     convert_btn.set_tooltip_text(Some("Convert this file  (Ctrl+Enter)"));
+    convert_btn.set_sensitive(false); // nothing loaded yet
 
     let progress = gtk::ProgressBar::builder().show_text(true).visible(false).build();
 
     let convert_bar = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    convert_bar.set_visible(false);
     convert_bar.append(&convert_group);
     convert_bar.append(&convert_btn);
     convert_bar.append(&progress);
@@ -290,9 +309,16 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     labels.append(&scale_label);
     controls.append(&labels);
 
-    let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    right.append(&frame);
-    right.append(&controls);
+    let viewer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    viewer.append(&frame);
+    viewer.append(&controls);
+
+    let right = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .build();
+    right.add_named(&empty, Some("drop"));
+    right.add_named(&viewer, Some("view"));
+    right.set_visible_child_name("drop");
 
     let split = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     split.append(&side_scroll);
@@ -313,9 +339,9 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .build();
-    stack.add_named(&empty, Some("empty"));
     stack.add_named(&split, Some("inspect"));
     stack.add_named(&convert, Some("convert"));
+    stack.set_visible_child_name("inspect");
 
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&stack));
@@ -328,6 +354,7 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     let ui = Rc::new(Ui {
         window: window.clone(),
         stack,
+        right: right.clone(),
         toasts,
         info_group,
         warn_group,
@@ -582,7 +609,10 @@ fn clear_file(ui: &Rc<Ui>) {
         ui.warn_group.remove(&r);
     }
     ui.warn_group.set_visible(false);
-    ui.convert_bar.set_visible(false);
+    // The convert controls are settings, not file data: the chosen format,
+    // destination and pinned drives should survive clearing a file. Only the
+    // Convert button is disabled, since there is nothing to convert.
+    ui.convert_btn.set_sensitive(false);
     ui.clear_btn.set_visible(false);
     ui.picture.set_paintable(gdk::Paintable::NONE);
     ui.layer_label.set_text("Layer — / —");
@@ -591,7 +621,9 @@ fn clear_file(ui: &Rc<Ui>) {
     ui.play_button.set_icon_name("media-playback-start-symbolic");
     ui.title.set_title("CheapAzSLA");
     ui.title.set_subtitle("Resin print file converter & inspector");
-    ui.stack.set_visible_child_name("empty");
+    // An empty File panel would just be a titled box with nothing in it.
+    ui.info_group.set_visible(false);
+    ui.right.set_visible_child_name("drop");
 }
 
 fn with_loaded<T>(f: impl FnOnce(&Loaded) -> T) -> Option<T> {
@@ -818,6 +850,7 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
     ui.play_button.set_sensitive(count > 1);
 
     ui.convert_bar.set_visible(true);
+    ui.convert_btn.set_sensitive(true);
     ui.clear_btn.set_visible(true);
     LOADED.with(|l| *l.borrow_mut() = Some(loaded));
     suggest_name(ui);

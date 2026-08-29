@@ -189,3 +189,56 @@ fn conversion_reports_progress_for_every_layer() {
     assert_eq!(reported_total.load(Ordering::Relaxed), plan.layer_count, "total is reported");
     println!("  {n} progress reports for {} layers", plan.layer_count);
 }
+
+#[test]
+fn an_sl1_survives_a_round_trip_through_our_own_writer() {
+    use cheapazsla_core::layers::LayerProvider;
+    use cheapazsla_core::registry;
+
+    let Some(src) = real_sl1() else {
+        eprintln!("skipped: set CHEAPAZSLA_REAL_SL1");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("roundtrip.sl1");
+
+    // Read the original, write it back out, read that.
+    let original = registry::open(&src).expect("open original");
+    registry::by_id("sl1")
+        .unwrap()
+        .write(&out, &original.print, original.layers.as_ref())
+        .expect("write sl1");
+    let again = registry::open(&out).expect("open what we wrote");
+
+    // §40: not byte-for-byte, but every value that affects the print.
+    assert_eq!(again.print.layer_count(), original.print.layer_count());
+    assert_eq!(
+        again.print.geometry.resolution_x,
+        original.print.geometry.resolution_x
+    );
+    assert_eq!(
+        again.print.geometry.resolution_y,
+        original.print.geometry.resolution_y
+    );
+    assert_eq!(again.print.geometry.display_width_mm, original.print.geometry.display_width_mm);
+    assert_eq!(again.print.geometry.display_height_mm, original.print.geometry.display_height_mm);
+    assert_eq!(again.print.exposure.layer_height_mm, original.print.exposure.layer_height_mm);
+    assert_eq!(again.print.exposure.exposure_s, original.print.exposure.exposure_s);
+    assert_eq!(again.print.exposure.bottom_exposure_s, original.print.exposure.bottom_exposure_s);
+    assert_eq!(again.print.exposure.bottom_layers, original.print.exposure.bottom_layers);
+    assert_eq!(again.print.print_time_s, original.print.print_time_s);
+    assert_eq!(again.print.machine_name, original.print.machine_name);
+
+    // Every layer bitmap must be identical.
+    for i in 0..original.print.layer_count() {
+        let a = original.layers.layer(i).unwrap();
+        let b = again.layers.layer(i).unwrap();
+        assert_eq!(a.width, b.width, "layer {i} width");
+        assert_eq!(a.height, b.height, "layer {i} height");
+        assert_eq!(a.pixels, b.pixels, "layer {i} pixels changed in the round trip");
+    }
+    println!(
+        "  SL1 -> SL1: {} layers identical, all print settings preserved",
+        original.print.layer_count()
+    );
+}

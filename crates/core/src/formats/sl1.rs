@@ -24,7 +24,7 @@ use crate::limits;
 use crate::model::*;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const ID: &str = "sl1";
@@ -44,11 +44,7 @@ static INFO: FormatInfo = FormatInfo {
     ],
     capabilities: Capabilities {
         reads: true,
-        // Writing SL1 is not implemented. This must stay false until it is:
-        // the interface builds its output format list from these flags, and
-        // claiming a capability the code lacks puts a broken option in front
-        // of the user.
-        writes: false,
+        writes: true,
         per_layer_exposure: false,
         per_layer_lift: false,
         thumbnails: true,
@@ -163,6 +159,44 @@ fn decode_png_grey(bytes: &[u8], index: u32) -> Result<LayerImage> {
         height: h,
         pixels,
     })
+}
+
+/// Job names end up in entry names, so keep them to characters that survive a
+/// round trip through an archive and a printer's file browser.
+fn sanitise_job_name(stem: &str) -> String {
+    let cleaned: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() {
+        "print".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn encode_grey_png(img: &LayerImage) -> std::result::Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, img.width, img.height);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header()?;
+        w.write_image_data(&img.pixels)?;
+    }
+    Ok(out)
+}
+
+fn encode_rgb_png(t: &Thumbnail) -> std::result::Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, t.width, t.height);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header()?;
+        w.write_image_data(&t.rgb)?;
+    }
+    Ok(out)
 }
 
 fn luma(r: u8, g: u8, b: u8) -> u8 {
@@ -417,10 +451,140 @@ impl FormatHandler for Sl1Handler {
         })
     }
 
-    fn write(&self, _path: &Path, _print: &PrintFile, _layers: &dyn LayerProvider) -> Result<()> {
-        // Phase 10. Reporting this plainly rather than writing a broken file
-        // is the point of §47.
-        Err(FormatError::Other("writing SL1 files is not implemented yet".into()).into())
+    fn write(&self, path: &Path, print: &PrintFile, layers: &dyn LayerProvider) -> Result<()> {
+        let count = layers.layer_count();
+        if count == 0 {
+            return Err(FormatError::Other("there are no layers to write".into()).into());
+        }
+        limits::check_layer_count(count as u64)?;
+        let (w, h) = layers.dimensions();
+        limits::check_resolution(w, h)?;
+
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "print".to_string());
+        // PrusaSlicer names layers after jobDir, and the printer matches them
+        // by prefix, so the two must agree.
+        let job = sanitise_job_name(&stem);
+
+        let e = &print.exposure;
+        let bottom_layers = e.bottom_layers.unwrap_or(0);
+        let fast = count.saturating_sub(bottom_layers);
+
+        let file = std::fs::File::create(path).map_err(|err| Error::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+        let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let zerr = |err: zip::result::ZipError| -> Error {
+            FormatError::Other(format!("could not write the archive: {err}")).into()
+        };
+
+        // config.ini. Only values we actually have are written; a field we
+        // cannot fill is left out rather than given an invented default.
+        let mut cfg = String::new();
+        cfg.push_str("action = print\n");
+        cfg.push_str(&format!("jobDir = {job}\n"));
+        cfg.push_str(&format!("expTime = {}\n", e.exposure_s));
+        if let Some(v) = e.bottom_exposure_s {
+            cfg.push_str(&format!("expTimeFirst = {v}\n"));
+        }
+        cfg.push_str(&format!("layerHeight = {}\n", e.layer_height_mm));
+        cfg.push_str(&format!("numFade = {}\n", e.transition_layers.unwrap_or(0)));
+        cfg.push_str(&format!("numFast = {fast}\n"));
+        cfg.push_str(&format!("numSlow = {bottom_layers}\n"));
+        if let Some(t) = print.print_time_s {
+            cfg.push_str(&format!("printTime = {t}\n"));
+        }
+        if let Some(v) = print.material_volume_ml {
+            cfg.push_str(&format!("usedMaterial = {v}\n"));
+        }
+        if let Some(n) = &print.material_name {
+            cfg.push_str(&format!("materialName = {n}\n"));
+        }
+        if let Some(n) = &print.machine_name {
+            cfg.push_str(&format!("printerModel = {n}\n"));
+        }
+        cfg.push_str("prusaSlicerVersion = CheapAzSLA\n");
+        // Values carried from the source that this model has no field for.
+        for (k, v) in &print.extra {
+            if let Some(key) = k.strip_prefix("sl1.") {
+                cfg.push_str(&format!("{key} = {v}\n"));
+            }
+        }
+        zip.start_file("config.ini", opts).map_err(zerr)?;
+        zip.write_all(cfg.as_bytes()).map_err(|err| Error::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+
+        // prusaslicer.ini carries the geometry a reader needs.
+        let mut slicer = String::new();
+        slicer.push_str(&format!("display_pixels_x = {w}\n"));
+        slicer.push_str(&format!("display_pixels_y = {h}\n"));
+        if let Some(v) = print.geometry.display_width_mm {
+            slicer.push_str(&format!("display_width = {v}\n"));
+        }
+        if let Some(v) = print.geometry.display_height_mm {
+            slicer.push_str(&format!("display_height = {v}\n"));
+        }
+        if let Some(v) = print.geometry.machine_z_mm {
+            slicer.push_str(&format!("max_print_height = {v}\n"));
+        }
+        slicer.push_str(&format!("layer_height = {}\n", e.layer_height_mm));
+        slicer.push_str(&format!("exposure_time = {}\n", e.exposure_s));
+        if let Some(v) = e.bottom_exposure_s {
+            slicer.push_str(&format!("initial_exposure_time = {v}\n"));
+        }
+        slicer.push_str("printer_technology = SLA\n");
+        zip.start_file("prusaslicer.ini", opts).map_err(zerr)?;
+        zip.write_all(slicer.as_bytes()).map_err(|err| Error::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+
+        // Thumbnails, at the sizes PrusaSlicer uses.
+        for (i, t) in print.thumbnails.iter().take(2).enumerate() {
+            let name = format!("thumbnail/thumbnail{}x{}.png", t.width, t.height);
+            let _ = i;
+            if let Ok(png) = encode_rgb_png(t) {
+                zip.start_file(name, opts).map_err(zerr)?;
+                zip.write_all(&png).map_err(|err| Error::Io {
+                    path: path.to_path_buf(),
+                    source: err,
+                })?;
+            }
+        }
+
+        // Layers. Zero padded to five digits so lexical order is print order.
+        for index in 0..count {
+            let img = layers.layer(index)?;
+            if img.width != w || img.height != h {
+                return Err(FormatError::Other(format!(
+                    "layer {index} is {}x{} but the print is {w}x{h}",
+                    img.width, img.height
+                ))
+                .into());
+            }
+            let png = encode_grey_png(&img).map_err(|err| {
+                FormatError::Other(format!("layer {index} could not be encoded: {err}"))
+            })?;
+            // Layer PNGs are already deflate-compressed, so storing them
+            // uncompressed avoids paying for a second pass that gains nothing.
+            let store: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file(format!("{job}{index:05}.png"), store).map_err(zerr)?;
+            zip.write_all(&png).map_err(|err| Error::Io {
+                path: path.to_path_buf(),
+                source: err,
+            })?;
+        }
+
+        zip.finish().map_err(zerr)?;
+        Ok(())
     }
 }
 
