@@ -1146,13 +1146,27 @@ fn refresh_queue(ui: &Rc<App>) {
 
         row.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
 
-        let name = gtk::Label::builder()
-            .label(f.name())
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
+        // The reason lives on the row, not in a tooltip. A user looking at
+        // "Failed" should not have to guess that hovering reveals why.
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        text.set_hexpand(true);
+        let name = gtk::Label::builder().label(f.name()).xalign(0.0).build();
         name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        row.append(&name);
+        text.append(&name);
+        if let Some(detail) = f.status.detail() {
+            let first = detail.lines().next().unwrap_or(&detail).to_string();
+            let note = gtk::Label::builder().label(&first).xalign(0.0).build();
+            note.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            note.add_css_class("caption");
+            note.add_css_class(match f.status {
+                Status::Failed(_) => "cz-error",
+                Status::Warning(_) => "cz-warn",
+                _ => "cz-dim",
+            });
+            note.set_tooltip_text(Some(&detail));
+            text.append(&note);
+        }
+        row.append(&text);
 
         let fmt = gtk::Label::new(Some(&if f.format.is_empty() {
             "—".to_string()
@@ -1173,9 +1187,36 @@ fn refresh_queue(ui: &Rc<App>) {
         let chip = f.status.chip();
         chip.set_width_request(104);
         if let Some(detail) = f.status.detail() {
-            chip.set_tooltip_text(Some(&detail));
+            shell::set_tooltip_deep(&chip, &detail);
         }
         row.append(&chip);
+
+        // Full technical text behind Details, as §28 asks.
+        if matches!(f.status, Status::Failed(_) | Status::Warning(_)) {
+            if let Some(detail) = f.status.detail() {
+                let details = gtk::Button::with_label("Details");
+                details.add_css_class("flat");
+                details.set_valign(gtk::Align::Center);
+                let win = ui.window.clone();
+                let heading = if matches!(f.status, Status::Failed(_)) {
+                    "This file could not be opened"
+                } else {
+                    "Worth knowing about this file"
+                };
+                let name = f.name();
+                details.connect_clicked(move |_| {
+                    let d = adw::MessageDialog::builder()
+                        .transient_for(&win)
+                        .modal(true)
+                        .heading(heading)
+                        .body(format!("{name}\n\n{detail}"))
+                        .build();
+                    d.add_response("ok", "Close");
+                    d.present();
+                });
+                row.append(&details);
+            }
+        }
 
         let remove = shell::icon_button("window-close-symbolic", "Remove from list");
         let ui2 = ui.clone();

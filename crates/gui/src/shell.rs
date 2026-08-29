@@ -223,6 +223,22 @@ pub fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     b
 }
 
+/// Apply a tooltip to a widget and everything inside it.
+///
+/// GTK resolves a tooltip against the widget under the pointer. A container
+/// whose children have none does not reliably answer for them, so hovering the
+/// icon in a status chip showed nothing while hovering the gap showed the
+/// text. Setting it throughout removes the dead spots.
+pub fn set_tooltip_deep(widget: &impl IsA<gtk::Widget>, text: &str) {
+    let w = widget.as_ref();
+    w.set_tooltip_text(Some(text));
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        set_tooltip_deep(&c, text);
+        child = c.next_sibling();
+    }
+}
+
 /// Status shown as an icon and a word, never colour alone (§15).
 pub fn status_chip(icon: &str, text: &str, class: &str) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
