@@ -56,6 +56,10 @@ impl FormatPicker {
         content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
 
         let button = gtk::MenuButton::builder().child(&content).build();
+        // Shares its metrics with the read-only input field, so the two
+        // columns line up rather than each taking its own default height.
+        button.add_css_class("cz-format-control");
+        button.set_valign(gtk::Align::Center);
         button.set_tooltip_text(Some(match direction {
             Direction::Write => "Output format",
         }));

@@ -246,6 +246,8 @@ fn build(app: &adw::Application) -> Rc<App> {
     // text beside a boxed dropdown reads as unfinished.
     let input_field = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
     input_field.add_css_class("cz-field");
+    input_field.add_css_class("cz-format-control");
+    input_field.set_valign(gtk::Align::Center);
     input_field.append(&input_label);
     input_field.set_tooltip_text(Some("Detected from the file's contents"));
     let output_picker = format_picker::FormatPicker::new(format_picker::Direction::Write);
@@ -541,19 +543,41 @@ fn build_convert_page(
     let formats = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
     formats.set_homogeneous(false);
 
+    // Both columns use the same header shape, so the controls beneath them
+    // start at the same height.
+    let in_head = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    in_head.set_height_request(22);
+    let in_label = shell::section_label("Input");
+    in_label.set_valign(gtk::Align::Center);
+    in_head.append(&in_label);
+
     let in_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     in_col.set_hexpand(true);
-    in_col.append(&shell::section_label("Input"));
+    in_col.set_valign(gtk::Align::Start);
+    in_col.append(&in_head);
     in_col.append(input_field);
 
-    let swap_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    swap_col.set_valign(gtk::Align::End);
+    let swap_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
+    swap_col.set_valign(gtk::Align::Start);
+    // A spacer the height of the headers, so the button lines up with the
+    // controls rather than floating between the two rows.
+    let swap_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    swap_spacer.set_height_request(22);
+    swap_col.append(&swap_spacer);
+    swap_btn.set_valign(gtk::Align::Center);
+    swap_btn.set_height_request(34);
     swap_col.append(swap_btn);
 
     let out_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     out_col.set_hexpand(true);
+    out_col.set_valign(gtk::Align::Start);
     let out_head = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
-    out_head.append(&shell::section_label("Output"));
+    out_head.set_height_request(22);
+    let out_label = shell::section_label("Output");
+    out_label.set_valign(gtk::Align::Center);
+    out_head.append(&out_label);
+    output_info.add_css_class("cz-inline");
+    output_info.set_valign(gtk::Align::Center);
     out_head.append(output_info);
     out_col.append(&out_head);
     out_col.append(&output_picker.button);
@@ -1196,8 +1220,8 @@ fn refresh_queue(ui: &Rc<App>) {
         if let Some(target) = ui.output_picker.selected() {
             let same = !f.format.is_empty() && f.format == target;
             let arrow = gtk::Image::from_icon_name("go-next-symbolic");
-            arrow.add_css_class("cz-dim");
-            arrow.set_pixel_size(12);
+            arrow.add_css_class(if same { "cz-warn" } else { "cz-arrow" });
+            arrow.set_pixel_size(16);
             conversion.append(&arrow);
             let to_label = gtk::Label::new(Some(&target.to_uppercase()));
             if same {

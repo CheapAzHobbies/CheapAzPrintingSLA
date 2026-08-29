@@ -147,9 +147,32 @@ fn sheet(p: &Palette) -> String {
   background-color: alpha(@cz_border, 0.35);
   border: 1px solid @cz_border;
   border-radius: 6px;
-  padding: 7px 12px;
-  min-height: 20px;
+  padding: 0 12px;
+  min-height: 34px;
 }}
+
+/* The output control is a button and the input is not, so their metrics are
+   set together rather than left to two different defaults. Otherwise the two
+   columns sit at different heights and the row looks misaligned. */
+.cz-format-control {{
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 6px;
+}}
+
+/* A header-sized icon button. A full-height button in a section header makes
+   that header taller than a plain label, so the control beneath it starts
+   lower than its neighbour and the two columns stop lining up. */
+button.cz-inline {{
+  min-height: 18px;
+  min-width: 18px;
+  padding: 0;
+  margin: 0;
+}}
+
+/* The arrow says one format becomes another, which is the meaning of the row.
+   Dimmed at 12px it read as decoration. */
+.cz-arrow {{ color: @cz_accent; }}
 
 /* ---- buttons ---- */
 button.cz-primary {{
