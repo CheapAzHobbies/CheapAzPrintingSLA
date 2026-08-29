@@ -13,6 +13,7 @@ mod penguin;
 mod render;
 mod shell;
 mod theme;
+mod viewer;
 
 use adw::prelude::*;
 use cheapazsla_core::history::{self, History};
@@ -141,7 +142,7 @@ struct App {
     problem_label: gtk::Label,
 
     // preview page
-    picture: gtk::Picture,
+    viewer: Rc<viewer::LayerViewer>,
     preview_stack: gtk::Stack,
     layer_label: gtk::Label,
     layer_detail: gtk::Label,
@@ -317,12 +318,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     shell.add_page(Section::Convert, &convert_page.0);
 
     // --- preview page -----------------------------------------------------
-    let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::Contain)
-        .can_shrink(true)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
+    let viewer = viewer::LayerViewer::new();
     let layer_label = gtk::Label::builder().label("Layer — / —").build();
     layer_label.add_css_class("heading");
     let layer_detail = gtk::Label::builder().label("").build();
@@ -334,7 +330,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     let play_btn = shell::icon_button("media-playback-start-symbolic", "Play  (Space)");
     let info_panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     let (preview_page, preview_stack) = build_preview_page(
-        &picture,
+        &viewer,
         &layer_label,
         &layer_detail,
         &slider,
@@ -382,7 +378,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         penguin,
         problem,
         problem_label,
-        picture,
+        viewer: viewer.clone(),
         preview_stack,
         layer_label,
         layer_detail,
@@ -619,23 +615,13 @@ fn build_convert_page(
 }
 
 fn build_preview_page(
-    picture: &gtk::Picture,
+    viewer: &Rc<viewer::LayerViewer>,
     layer_label: &gtk::Label,
     layer_detail: &gtk::Label,
     slider: &gtk::Scale,
     play_btn: &gtk::Button,
     info_panel: &gtk::Box,
 ) -> (gtk::Widget, gtk::Stack) {
-    // The picture fills the frame and the frame fills the pane. Without the
-    // horizontal expand the frame takes its natural width and the image sits
-    // in the corner with empty space beside it.
-    let frame = gtk::Frame::builder().child(picture).build();
-    frame.add_css_class("cz-panel");
-    frame.set_hexpand(true);
-    frame.set_vexpand(true);
-    frame.set_halign(gtk::Align::Fill);
-    frame.set_valign(gtk::Align::Fill);
-
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.set_hexpand(true);
     labels.append(layer_label);
@@ -662,12 +648,14 @@ fn build_preview_page(
     bar.append(&nav);
     bar.append(slider);
     bar.append(&labels);
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bar.append(&viewer.controls());
 
-    let viewer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    viewer.append(&frame);
-    viewer.append(&bar);
-    viewer.set_hexpand(true);
-    viewer.set_vexpand(true);
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.append(&viewer.widget);
+    column.append(&bar);
+    column.set_hexpand(true);
+    column.set_vexpand(true);
 
     let side = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     side.set_size_request(300, -1);
@@ -679,7 +667,7 @@ fn build_preview_page(
         .build();
 
     let split = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_5);
-    split.append(&viewer);
+    split.append(&column);
     split.append(&side_scroll);
     split.set_hexpand(true);
     split.set_vexpand(true);
@@ -958,6 +946,10 @@ fn wire_keys(ui: &Rc<App>) {
         let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
         let count = layer_count(&ui2);
         let cur = ui2.slider.value() as u32;
+        // Zoom keys belong to the viewer, but only while it is on screen.
+        if ui2.shell.current() == Section::Preview && !ctrl && ui2.viewer.handle_key(key) {
+            return glib::Propagation::Stop;
+        }
         match key {
             gdk::Key::o if ctrl => {
                 choose_files(&ui2);
@@ -1382,6 +1374,10 @@ fn remove_file(ui: &Rc<App>, path: &Path) {
         ui.queue_panel.set_visible(false);
         ui.controls.set_visible(false);
         ui.preview_stack.set_visible_child_name("empty");
+        // Drop the texture as well, so the last layer of a removed file is
+        // not still sitting in memory waiting to reappear.
+        ui.viewer.clear();
+        ui.viewer.fit();
         refresh_queue(ui);
         return;
     }
@@ -1551,7 +1547,7 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     glib::spawn_future_local(async move {
         match rx.recv().await {
             Ok(Ok(((texture, factor), exposed, total))) => {
-                ui.picture.set_paintable(Some(&texture));
+                ui.viewer.set_texture(&texture);
                 let pct = if total > 0 {
                     exposed as f64 / total as f64 * 100.0
                 } else {

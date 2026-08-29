@@ -169,6 +169,12 @@ Run through this before a release. Tick each line.
 - [ ] On a printer with non-square pixels the preview says it has been
       corrected, and the part is not stretched
 - [ ] The preview image fills its pane rather than sitting in a corner
+- [ ] Zoom in and out with the buttons, the wheel, and + and -
+- [ ] The point under the pointer stays put when zooming with the wheel
+- [ ] Click and drag pans once zoomed in, and does nothing while fit
+- [ ] Fit (0) returns to the whole plate, Actual size (1) shows one to one
+- [ ] The zoom stays put when stepping to the next layer
+- [ ] Scrollbars appear only when zoomed past the pane
 - [ ] Scrubbing quickly does not freeze the window
 
 ### Converting

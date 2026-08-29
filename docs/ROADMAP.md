@@ -26,8 +26,6 @@ not a roadmap.
 
 Smaller pieces of the specification still outstanding:
 
-- **Preview zoom and pan** (§16, §18). Layer navigation works; zoom in, zoom
-  out, fit to screen, wheel zoom and click-drag panning do not exist.
 - **Open the converted file** (§27). Only *Open Folder* is offered.
 - **File associations** (§33). The desktop entry declares a MIME type but no
   MIME definitions are installed, so double-clicking an `.sl1` in a file
@@ -123,7 +121,7 @@ worth doing before someone has a printer that needs one.
 2. PNG image stack, because it is nearly free and immediately useful
 3. Packaging, because software nobody can install is not finished
 4. PHZ, riding on CTB
-5. Preview zoom and pan, and the 3D view
+5. The 3D layer view
 6. Anycubic
 7. Everything else, on request
 
