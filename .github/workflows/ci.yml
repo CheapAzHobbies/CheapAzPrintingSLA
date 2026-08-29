@@ -54,6 +54,10 @@ jobs:
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - name: Build everything
         run: cargo build --workspace --verbose
+      # --bins, not --lib: the interface is a binary crate, so --lib finds
+      # nothing and passes without running anything.
+      - name: Test the interface
+        run: cargo test --workspace --bins --verbose
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 

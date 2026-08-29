@@ -114,6 +114,20 @@ independent code paths must produce the same image.
 These two exist because a format once advertised a writer it did not have, and
 the interface built its output list from that claim.
 
+### Interface
+
+Run with `cargo test --workspace --bins`. The interface is a binary crate, so
+`--lib` finds nothing and passes without running a thing.
+
+| Check | Test |
+|---|---|
+| Square pixels are left alone | `square_pixels_are_left_alone` |
+| A taller pixel makes a taller image | `a_taller_pixel_makes_a_taller_image` |
+| Corrected preview matches the panel's physical proportions | `correcting_gets_the_physical_proportions_right` |
+| Resampling keeps hard edges, inventing no grey | `resampling_keeps_hard_edges` |
+| The save indicator sheet slices into every frame | `the_sheet_slices_into_every_frame` |
+| Its frames are not all transparent | `frames_are_not_all_empty` |
+
 ### Settings
 
 | Check | Test |
@@ -152,6 +166,9 @@ Run through this before a release. Tick each line.
 - [ ] Play cycles layers, pause stops it
 - [ ] `Space`, arrows, `Home`, `End` do the same
 - [ ] The label reports the downscale factor on large layers
+- [ ] On a printer with non-square pixels the preview says it has been
+      corrected, and the part is not stretched
+- [ ] The preview image fills its pane rather than sitting in a corner
 - [ ] Scrubbing quickly does not freeze the window
 
 ### Converting
@@ -199,6 +216,12 @@ Run through this before a release. Tick each line.
 - [ ] `Ctrl+W` clears
 - [ ] The default open folder is honoured next time
 - [ ] Settings survive a restart
+
+### Window
+
+- [ ] Minimise, maximise and close are present and work
+- [ ] Double-clicking the header bar maximises
+- [ ] The window can be dragged by the header bar
 
 ### Appearance
 

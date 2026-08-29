@@ -205,6 +205,16 @@ fn build(app: &adw::Application) -> Rc<App> {
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&shell.widget));
 
+    // Without this the window has no titlebar, and therefore no minimise,
+    // maximise or close. A window that can only be shut with a keyboard
+    // shortcut or a kill is broken however good the rest of it looks.
+    let header = adw::HeaderBar::builder()
+        .show_title(false)
+        .css_classes(["flat"])
+        .build();
+    let palette_btn = shell::icon_button("system-search-symbolic", "Commands  (Ctrl+K)");
+    header.pack_start(&palette_btn);
+
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
     let queue_list = gtk::ListBox::new();
@@ -329,7 +339,10 @@ fn build(app: &adw::Application) -> Rc<App> {
     let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     shell.add_page(Section::Settings, &settings_page);
 
-    window.set_content(Some(&toasts));
+    let root = adw::ToolbarView::new();
+    root.add_top_bar(&header);
+    root.set_content(Some(&toasts));
+    window.set_content(Some(&root));
 
     let ui = Rc::new(App {
         window: window.clone(),
@@ -372,6 +385,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         converting: RefCell::new(false),
     });
 
+    {
+        let ui2 = ui.clone();
+        palette_btn.connect_clicked(move |_| palette::show(&ui2));
+    }
     build_settings_page(&ui, &settings_page);
     wire(&ui, &add_more);
     restore_session(&ui);
@@ -574,9 +591,15 @@ fn build_preview_page(
     play_btn: &gtk::Button,
     info_panel: &gtk::Box,
 ) -> (gtk::Widget, gtk::Stack) {
+    // The picture fills the frame and the frame fills the pane. Without the
+    // horizontal expand the frame takes its natural width and the image sits
+    // in the corner with empty space beside it.
     let frame = gtk::Frame::builder().child(picture).build();
     frame.add_css_class("cz-panel");
+    frame.set_hexpand(true);
     frame.set_vexpand(true);
+    frame.set_halign(gtk::Align::Fill);
+    frame.set_valign(gtk::Align::Fill);
 
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.set_hexpand(true);
@@ -609,6 +632,7 @@ fn build_preview_page(
     viewer.append(&frame);
     viewer.append(&bar);
     viewer.set_hexpand(true);
+    viewer.set_vexpand(true);
 
     let side = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     side.set_size_request(300, -1);
@@ -622,6 +646,9 @@ fn build_preview_page(
     let split = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_5);
     split.append(&viewer);
     split.append(&side_scroll);
+    split.set_hexpand(true);
+    split.set_vexpand(true);
+    side_scroll.set_hexpand(false);
     split.set_margin_top(theme::SPACE_5);
     split.set_margin_bottom(theme::SPACE_5);
     split.set_margin_start(theme::SPACE_6);
@@ -1318,16 +1345,28 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     ui.layer_label
         .set_text(&format!("Layer {} / {}", index + 1, count));
 
+    // Panels are often not square-pixelled, so the preview is corrected to the
+    // physical proportions of the build area rather than drawn one bitmap
+    // pixel to one screen pixel.
+    let pixel = opened
+        .print
+        .geometry
+        .pixel_size_um()
+        .map(|(x_um, y_um)| render::PixelSize { x_um, y_um });
+
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let result = opened.layers.layer(index).map(|img| {
             let exposed = img.exposed_pixels(0);
             let total = img.width as u64 * img.height as u64;
-            (render::texture_for(&img), exposed, total)
+            (render::texture_for(&img, pixel), exposed, total)
         });
         let _ = tx.send_blocking(result);
     });
 
+    let square = pixel
+        .map(|p| (p.y_um / p.x_um - 1.0).abs() < 0.01)
+        .unwrap_or(true);
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
@@ -1338,11 +1377,14 @@ fn show_layer(ui: &Rc<App>, index: u32) {
                 } else {
                     0.0
                 };
-                ui.layer_detail.set_text(&if factor > 1 {
-                    format!("{exposed} px exposed ({pct:.3}%)  ·  shown at 1/{factor}")
-                } else {
-                    format!("{exposed} px exposed ({pct:.3}%)")
-                });
+                let mut note = format!("{exposed} px exposed ({pct:.3}%)");
+                if factor > 1 {
+                    note.push_str(&format!("  ·  shown at 1/{factor}"));
+                }
+                if !square {
+                    note.push_str("  ·  corrected for non-square pixels");
+                }
+                ui.layer_detail.set_text(&note);
             }
             Ok(Err(e)) => {
                 ui.layer_detail.set_text("layer could not be decoded");
