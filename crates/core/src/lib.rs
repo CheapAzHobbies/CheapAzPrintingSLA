@@ -16,6 +16,7 @@ pub mod convert;
 pub mod error;
 pub mod format;
 pub mod formats;
+pub mod history;
 pub mod layers;
 pub mod limits;
 pub mod model;

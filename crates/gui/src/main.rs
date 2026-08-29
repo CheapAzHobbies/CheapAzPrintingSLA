@@ -1,20 +1,26 @@
 //! CheapAzSLA desktop application.
 //!
-//! The interface is a thin shell over cheapazsla-core. All parsing, decoding
-//! and validation happens in the engine; this crate decides what to show.
+//! A thin shell over cheapazsla-core. All parsing, decoding, validation and
+//! conversion happen in the engine; this crate decides what to show and when.
 //!
-//! Anything the engine cannot yet do is presented as unavailable rather than
-//! mocked up (§47).
+//! Anything the engine cannot do is presented as unavailable rather than
+//! mocked up (§47 of the product specification).
 
 mod drives;
+mod format_picker;
+mod palette;
 mod penguin;
 mod render;
+mod shell;
+mod theme;
 
 use adw::prelude::*;
+use cheapazsla_core::history::{self, History};
 use cheapazsla_core::settings::Settings;
 use cheapazsla_core::{convert, registry, OpenedFile};
 use gtk::glib;
 use gtk::{gdk, gio};
+use shell::Section;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,55 +28,136 @@ use std::sync::Arc;
 
 const APP_ID: &str = "com.cheapazhobbies.CheapAzSLA";
 
-/// Everything the window needs to know about the file on screen.
-struct Loaded {
-    path: PathBuf,
-    size_bytes: u64,
-    opened: Arc<OpenedFile>,
-    detection: String,
-    confidence: String,
-    warnings: Vec<String>,
-    extension_mismatch: bool,
+/// How a queued file is doing (§15). Every state carries an icon and a word,
+/// never colour alone.
+#[derive(Clone, PartialEq)]
+enum Status {
+    Reading,
+    Ready,
+    Warning(String),
+    Converting,
+    Complete(PathBuf),
+    Failed(String),
 }
 
-struct Ui {
+impl Status {
+    fn chip(&self) -> gtk::Widget {
+        match self {
+            Status::Reading => {
+                let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
+                let s = gtk::Spinner::new();
+                s.start();
+                b.append(&s);
+                let l = gtk::Label::new(Some("Reading"));
+                l.add_css_class("caption");
+                l.add_css_class("cz-dim");
+                b.append(&l);
+                b.upcast()
+            }
+            Status::Ready => {
+                shell::status_chip("object-select-symbolic", "Ready", "cz-ok").upcast()
+            }
+            Status::Warning(_) => {
+                shell::status_chip("dialog-warning-symbolic", "Warning", "cz-warn").upcast()
+            }
+            Status::Converting => {
+                let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
+                let s = gtk::Spinner::new();
+                s.start();
+                b.append(&s);
+                let l = gtk::Label::new(Some("Converting"));
+                l.add_css_class("caption");
+                b.append(&l);
+                b.upcast()
+            }
+            Status::Complete(_) => {
+                shell::status_chip("object-select-symbolic", "Complete", "cz-ok").upcast()
+            }
+            Status::Failed(_) => {
+                shell::status_chip("dialog-error-symbolic", "Failed", "cz-error").upcast()
+            }
+        }
+    }
+
+    /// Extra detail for a tooltip, when there is any.
+    fn detail(&self) -> Option<String> {
+        match self {
+            Status::Warning(w) | Status::Failed(w) => Some(w.clone()),
+            Status::Complete(p) => Some(format!("Saved to {}", p.display())),
+            _ => None,
+        }
+    }
+}
+
+/// One file in the queue.
+struct Queued {
+    path: PathBuf,
+    size: u64,
+    format: String,
+    detection: String,
+    extension_mismatch: bool,
+    warnings: Vec<String>,
+    opened: Option<Arc<OpenedFile>>,
+    status: Status,
+}
+
+impl Queued {
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+}
+
+/// Everything the window owns.
+struct App {
     window: adw::ApplicationWindow,
-    stack: gtk::Stack,
-    right: gtk::Stack,
+    shell: Rc<shell::Shell>,
     toasts: adw::ToastOverlay,
-    // inspect page
-    info_group: adw::PreferencesGroup,
-    warn_group: adw::PreferencesGroup,
-    // AdwPreferencesGroup wraps its children in an internal box, so walking
-    // first_child() does not reach the rows. Track what was added instead.
-    info_rows: RefCell<Vec<adw::ActionRow>>,
-    warn_rows: RefCell<Vec<adw::ActionRow>>,
-    picture: gtk::Picture,
-    layer_label: gtk::Label,
-    scale_label: gtk::Label,
-    slider: gtk::Scale,
-    nav_buttons: Vec<gtk::Button>,
-    play_button: gtk::Button,
-    spinner: gtk::Spinner,
-    clear_btn: gtk::Button,
-    title: adw::WindowTitle,
-    // convert bar
-    convert_bar: gtk::Box,
-    format_row: adw::ComboRow,
-    dest_row: adw::ActionRow,
-    drive_box: gtk::Box,
-    name_row: adw::EntryRow,
+
+    // convert page
+    dropzone: gtk::Box,
+    dropzone_title: gtk::Label,
+    queue_panel: gtk::Box,
+    queue_list: gtk::ListBox,
+    controls: gtk::Box,
+    input_label: gtk::Label,
+    output_picker: Rc<format_picker::FormatPicker>,
+    swap_btn: gtk::Button,
+    dest_button: gtk::MenuButton,
+    dest_label: gtk::Label,
+    dest_detail: gtk::Label,
+    name_entry: gtk::Entry,
+    name_row: gtk::Box,
     convert_btn: gtk::Button,
+    convert_label: gtk::Label,
     progress: gtk::ProgressBar,
     penguin: Rc<penguin::Penguin>,
+    problem: gtk::Box,
+    problem_label: gtk::Label,
+
+    // preview page
+    picture: gtk::Picture,
+    preview_stack: gtk::Stack,
+    layer_label: gtk::Label,
+    layer_detail: gtk::Label,
+    slider: gtk::Scale,
+    play_btn: gtk::Button,
+    info_panel: gtk::Box,
+
+    // history page
+    history_list: gtk::ListBox,
+    history_stack: gtk::Stack,
+
+    // state
+    files: RefCell<Vec<Queued>>,
+    selected: RefCell<usize>,
     out_dir: RefCell<Option<PathBuf>>,
     settings: RefCell<Settings>,
-    writable: RefCell<Vec<&'static str>>,
-}
-
-thread_local! {
-    static LOADED: RefCell<Option<Loaded>> = const { RefCell::new(None) };
-    static PLAYING: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
+    history: RefCell<History>,
+    playing: RefCell<Option<glib::SourceId>>,
+    converting: RefCell<bool>,
 }
 
 fn main() -> glib::ExitCode {
@@ -80,413 +167,565 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|_| {
-        // §36: dark by default. The user can still override in Settings later.
-        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        theme::install();
     });
 
-    let pending: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
-
+    let pending: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
     let p = pending.clone();
     app.connect_open(move |app, files, _| {
-        if let Some(f) = files.first().and_then(|f| f.path()) {
-            *p.borrow_mut() = Some(f);
-        }
+        p.borrow_mut().extend(files.iter().filter_map(|f| f.path()));
         app.activate();
     });
 
     let p = pending.clone();
     app.connect_activate(move |app| {
-        let ui = build_ui(app);
+        let ui = build(app);
         ui.window.present();
-        if let Some(path) = p.borrow_mut().take() {
-            load_file(&ui, &path);
+        let queued: Vec<PathBuf> = p.borrow_mut().drain(..).collect();
+        if !queued.is_empty() {
+            add_files(&ui, queued);
         }
     });
 
     app.run()
 }
 
-fn build_ui(app: &adw::Application) -> Rc<Ui> {
+fn build(app: &adw::Application) -> Rc<App> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("CheapAzSLA")
-        .default_width(1120)
-        .default_height(720)
+        .default_width(1440)
+        .default_height(900)
+        .width_request(1000) // §3: still usable at 1280x720
+        .height_request(640)
         .build();
+    window.add_css_class("cheapazsla");
 
-    let title = adw::WindowTitle::new("CheapAzSLA", "Resin print file converter & inspector");
-    let header = adw::HeaderBar::builder().title_widget(&title).build();
+    let shell = shell::Shell::new();
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&shell.widget));
 
-    let open_btn = gtk::Button::builder()
-        .label("Open File…")
-        .tooltip_text("Open a resin print file  (Ctrl+O)")
+    // --- convert page -----------------------------------------------------
+    let (dropzone, dropzone_title) = build_dropzone();
+    let queue_list = gtk::ListBox::new();
+    queue_list.set_selection_mode(gtk::SelectionMode::Single);
+    queue_list.add_css_class("cz-queue");
+    let queue_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    queue_panel.add_css_class("cz-panel");
+    queue_panel.append(&queue_list);
+    let add_more = gtk::Button::builder()
+        .label("Add Files")
+        .halign(gtk::Align::Start)
         .build();
-    open_btn.add_css_class("suggested-action");
-    header.pack_start(&open_btn);
+    add_more.add_css_class("flat");
+    add_more.set_child(Some(&labelled_icon("list-add-symbolic", "Add Files")));
+    queue_panel.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    queue_panel.append(&add_more);
+    queue_panel.set_visible(false);
 
-    let clear_btn = gtk::Button::builder()
-        .icon_name("edit-clear-all-symbolic")
-        .tooltip_text("Clear the loaded file  (Ctrl+W)")
+    let input_label = gtk::Label::builder().label("—").xalign(0.0).build();
+    input_label.add_css_class("cz-value");
+    let output_picker = format_picker::FormatPicker::new(format_picker::Direction::Write);
+    let swap_btn = shell::icon_button("media-playlist-repeat-symbolic", "Swap formats");
+    let output_info = format_picker::info_button({
+        let picker = output_picker.clone();
+        move || {
+            picker
+                .selected()
+                .and_then(registry::by_id)
+                .map(|h| h.info())
+        }
+    });
+
+    let dest_label = gtk::Label::builder()
+        .label("Beside the original")
+        .xalign(0.0)
         .build();
-    clear_btn.add_css_class("flat");
-    clear_btn.set_visible(false);
-    header.pack_start(&clear_btn);
+    let dest_detail = gtk::Label::builder().label("").xalign(0.0).build();
+    dest_detail.add_css_class("caption");
+    dest_detail.add_css_class("cz-dim");
+    let dest_inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    dest_inner.append(&dest_label);
+    dest_inner.append(&dest_detail);
+    dest_inner.set_hexpand(true);
+    let dest_content = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    dest_content.append(&gtk::Image::from_icon_name("folder-symbolic"));
+    dest_content.append(&dest_inner);
+    dest_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    let dest_button = gtk::MenuButton::builder().child(&dest_content).build();
+    dest_button.set_tooltip_text(Some("Where converted files are saved"));
 
-    let spinner = gtk::Spinner::new();
-    header.pack_end(&spinner);
+    let name_entry = gtk::Entry::builder().hexpand(true).build();
+    name_entry.set_tooltip_text(Some("Name of the converted file"));
 
-    let about_btn = gtk::Button::builder()
-        .icon_name("help-about-symbolic")
-        .tooltip_text("About CheapAzSLA")
-        .build();
-    about_btn.add_css_class("flat");
-    header.pack_end(&about_btn);
-
-    let prefs_btn = gtk::Button::builder()
-        .icon_name("emblem-system-symbolic")
-        .tooltip_text("Settings")
-        .build();
-    prefs_btn.add_css_class("flat");
-    header.pack_end(&prefs_btn);
-
-    // ---- drop target (§38) ----
-    // Lives inside the viewer pane, so clearing a file swaps only the image
-    // area and leaves the rest of the window where it was.
-    // "Sliced" rather than "resin": it names what the file is, and quietly
-    // rules out the STL someone would otherwise try to drop here.
-    let readable: Vec<String> = registry::readable()
-        .iter()
-        .map(|i| i.extension.to_uppercase())
-        .collect();
-    let writable_names: Vec<String> = registry::writable()
-        .iter()
-        .map(|i| i.extension.to_uppercase())
-        .collect();
-    let empty = adw::StatusPage::builder()
-        .icon_name("document-open-symbolic")
-        .title("Drop a sliced file here")
-        .description(format!(
-            "or browse your computer\n\nOpens {}   ·   Converts to {}",
-            readable.join(", "),
-            writable_names.join(", ")
-        ))
-        .build();
-    empty.set_vexpand(true);
-    let empty_btn = gtk::Button::builder()
-        .label("Browse Files…")
-        .halign(gtk::Align::Center)
-        .build();
-    empty_btn.add_css_class("pill");
-    empty_btn.add_css_class("suggested-action");
-    empty.set_child(Some(&empty_btn));
-
-    // ---- inspect page ----
-    let info_group = adw::PreferencesGroup::builder().title("File").build();
-    info_group.set_visible(false);
-    let warn_group = adw::PreferencesGroup::builder().title("Validation").build();
-    warn_group.set_visible(false);
-
-    // ---- convert controls (§21, §27) ----
-    let convert_group = adw::PreferencesGroup::builder().title("Convert").build();
-    let format_row = adw::ComboRow::builder()
-        .title("Output format")
-        .subtitle("What to write")
-        .build();
-    let fmt_model = gtk::StringList::new(&[]);
-    let mut writable_ids: Vec<&'static str> = Vec::new();
-    for info in registry::writable() {
-        fmt_model.append(&format!("{}  ·  .{}", info.name, info.extension));
-        writable_ids.push(info.id);
-    }
-    format_row.set_model(Some(&fmt_model));
-    convert_group.add(&format_row);
-
-    let dest_row = adw::ActionRow::builder()
-        .title("Save to")
-        .subtitle("Beside the original")
-        .build();
-    let pick_dir = gtk::Button::builder()
-        .label("Choose…")
-        .valign(gtk::Align::Center)
-        .tooltip_text("Pick a folder, including a USB drive or SD card")
-        .build();
-    let reset_dir = gtk::Button::builder()
-        .icon_name("edit-undo-symbolic")
-        .valign(gtk::Align::Center)
-        .tooltip_text("Back to saving beside the original")
-        .build();
-    reset_dir.add_css_class("flat");
-    dest_row.add_suffix(&pick_dir);
-    dest_row.add_suffix(&reset_dir);
-    convert_group.add(&dest_row);
-
-    // Quick access to pinned drives. Rebuilt whenever the pin list changes or
-    // a drive is plugged in or out.
-    let drive_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    drive_box.set_margin_top(4);
-    drive_box.set_margin_start(12);
-    drive_box.set_margin_end(12);
-    drive_box.set_margin_bottom(4);
-    drive_box.set_visible(false);
-    convert_group.add(&drive_box);
-
-    let name_row = adw::EntryRow::builder().title("Save as").build();
-    name_row.set_show_apply_button(false);
-    convert_group.add(&name_row);
-
-    let convert_btn = gtk::Button::with_label("Convert");
-    convert_btn.add_css_class("suggested-action");
-    convert_btn.add_css_class("pill");
-    convert_btn.set_halign(gtk::Align::Fill);
-    convert_btn.set_tooltip_text(Some("Convert this file  (Ctrl+Enter)"));
-    convert_btn.set_sensitive(false); // nothing loaded yet
+    let convert_label = gtk::Label::new(Some("Convert"));
+    let convert_btn = gtk::Button::builder().child(&convert_label).build();
+    convert_btn.add_css_class("cz-primary");
+    convert_btn.set_sensitive(false);
+    convert_btn.set_tooltip_text(Some("Convert  (Ctrl+Enter)"));
 
     let progress = gtk::ProgressBar::builder()
         .show_text(true)
         .visible(false)
         .build();
+    let penguin = penguin::Penguin::new(76);
 
-    // Save indicator, carried over from CheapAzHobbies' lens.
-    let penguin = penguin::Penguin::new(88);
+    // Problems are stated beside the control rather than in a modal (§30).
+    let (problem, problem_label) = build_problem_bar();
 
-    let convert_bar = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    convert_bar.append(&convert_group);
-    convert_bar.append(&convert_btn);
-    if penguin.is_available() {
-        convert_bar.append(&penguin.widget);
-    }
-    convert_bar.append(&progress);
+    let convert_page = build_convert_page(
+        &dropzone,
+        &queue_panel,
+        &input_label,
+        &output_picker,
+        &swap_btn,
+        &output_info,
+        &dest_button,
+        &name_entry,
+        &convert_btn,
+        &progress,
+        &penguin,
+        &problem,
+    );
+    let controls = convert_page.1;
+    let name_row = convert_page.2;
+    shell.add_page(Section::Convert, &convert_page.0);
 
-    let side = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    side.set_margin_top(12);
-    side.set_margin_bottom(12);
-    side.set_margin_start(12);
-    side.set_margin_end(6);
-    side.append(&convert_bar);
-    side.append(&info_group);
-    side.append(&warn_group);
-    let side_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .width_request(340)
-        .hexpand(false)
-        .vexpand(true)
-        .child(&side)
-        .build();
-
+    // --- preview page -----------------------------------------------------
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
         .hexpand(true)
         .vexpand(true)
         .build();
-    let frame = gtk::Frame::builder().child(&picture).build();
-    frame.add_css_class("view");
-    frame.set_margin_top(12);
-    frame.set_margin_bottom(6);
-    frame.set_margin_start(6);
-    frame.set_margin_end(12);
-
-    let layer_label = gtk::Label::new(Some("Layer — / —"));
+    let layer_label = gtk::Label::builder().label("Layer — / —").build();
     layer_label.add_css_class("heading");
-    let scale_label = gtk::Label::new(None);
-    scale_label.add_css_class("dim-label");
-    scale_label.add_css_class("caption");
-
+    let layer_detail = gtk::Label::builder().label("").build();
+    layer_detail.add_css_class("caption");
+    layer_detail.add_css_class("cz-dim");
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 1.0);
     slider.set_hexpand(true);
     slider.set_draw_value(false);
-
-    let mk = |icon: &str, tip: &str| {
-        let b = gtk::Button::builder()
-            .icon_name(icon)
-            .tooltip_text(tip)
-            .build();
-        b.add_css_class("flat");
-        b
-    };
-    let first = mk("go-first-symbolic", "First layer  (Home)");
-    let prev = mk("go-previous-symbolic", "Previous layer  (Left)");
-    let play_button = mk(
-        "media-playback-start-symbolic",
-        "Play through layers  (Space)",
+    let play_btn = shell::icon_button("media-playback-start-symbolic", "Play  (Space)");
+    let info_panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
+    let (preview_page, preview_stack) = build_preview_page(
+        &picture,
+        &layer_label,
+        &layer_detail,
+        &slider,
+        &play_btn,
+        &info_panel,
     );
-    let next = mk("go-next-symbolic", "Next layer  (Right)");
-    let last = mk("go-last-symbolic", "Last layer  (End)");
+    shell.add_page(Section::Preview, &preview_page);
 
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    controls.set_margin_start(6);
-    controls.set_margin_end(12);
-    controls.set_margin_bottom(12);
-    for b in [&first, &prev, &play_button, &next, &last] {
-        controls.append(b);
+    // --- history page -----------------------------------------------------
+    let history_list = gtk::ListBox::new();
+    history_list.set_selection_mode(gtk::SelectionMode::None);
+    history_list.add_css_class("cz-queue");
+    let (history_page, history_stack) = build_history_page(&history_list);
+    shell.add_page(Section::History, &history_page);
+
+    // --- settings page ----------------------------------------------------
+    let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    shell.add_page(Section::Settings, &settings_page);
+
+    window.set_content(Some(&toasts));
+
+    let ui = Rc::new(App {
+        window: window.clone(),
+        shell: shell.clone(),
+        toasts,
+        dropzone,
+        dropzone_title,
+        queue_panel,
+        queue_list,
+        controls,
+        input_label,
+        output_picker: output_picker.clone(),
+        swap_btn: swap_btn.clone(),
+        dest_button: dest_button.clone(),
+        dest_label,
+        dest_detail,
+        name_entry: name_entry.clone(),
+        name_row,
+        convert_btn: convert_btn.clone(),
+        convert_label,
+        progress,
+        penguin,
+        problem,
+        problem_label,
+        picture,
+        preview_stack,
+        layer_label,
+        layer_detail,
+        slider: slider.clone(),
+        play_btn: play_btn.clone(),
+        info_panel,
+        history_list,
+        history_stack,
+        files: RefCell::new(Vec::new()),
+        selected: RefCell::new(0),
+        out_dir: RefCell::new(None),
+        settings: RefCell::new(Settings::load()),
+        history: RefCell::new(History::load()),
+        playing: RefCell::new(None),
+        converting: RefCell::new(false),
+    });
+
+    build_settings_page(&ui, &settings_page);
+    wire(&ui, &add_more);
+    restore_session(&ui);
+    refresh_history(&ui);
+    ui
+}
+
+/// An icon and a label side by side, for buttons that deserve both (§6).
+fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    b.set_margin_top(theme::SPACE_2);
+    b.set_margin_bottom(theme::SPACE_2);
+    b.set_margin_start(theme::SPACE_3);
+    b.set_margin_end(theme::SPACE_3);
+    b.append(&gtk::Image::from_icon_name(icon));
+    b.append(&gtk::Label::new(Some(text)));
+    b
+}
+
+fn build_dropzone() -> (gtk::Box, gtk::Label) {
+    let zone = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
+    zone.add_css_class("cz-dropzone");
+    zone.set_valign(gtk::Align::Center);
+    zone.set_halign(gtk::Align::Fill);
+    zone.set_margin_top(theme::SPACE_5);
+    zone.set_margin_bottom(theme::SPACE_5);
+    zone.set_size_request(-1, 240);
+
+    let icon = gtk::Image::from_icon_name("document-open-symbolic");
+    icon.set_pixel_size(48);
+    icon.add_css_class("cz-dim");
+    icon.set_margin_top(theme::SPACE_5);
+
+    let title = gtk::Label::new(Some("Drop files here"));
+    title.add_css_class("cz-title");
+
+    let sub = gtk::Label::new(Some("or browse your computer"));
+    sub.add_css_class("cz-subtitle");
+
+    let browse = gtk::Button::with_label("Browse Files");
+    browse.set_halign(gtk::Align::Center);
+    browse.add_css_class("pill");
+    browse.set_margin_bottom(theme::SPACE_5);
+    browse.set_widget_name("dropzone-browse");
+
+    let readable: Vec<String> = registry::readable()
+        .iter()
+        .map(|i| i.extension.to_uppercase())
+        .collect();
+    let formats = gtk::Label::new(Some(&format!("Opens {}", readable.join(" · "))));
+    formats.add_css_class("caption");
+    formats.add_css_class("cz-dim");
+
+    zone.append(&icon);
+    zone.append(&title);
+    zone.append(&sub);
+    zone.append(&browse);
+    zone.append(&formats);
+    (zone, title)
+}
+
+fn build_problem_bar() -> (gtk::Box, gtk::Label) {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    bar.set_visible(false);
+    let icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+    icon.add_css_class("cz-warn");
+    let label = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .hexpand(true)
+        .build();
+    label.add_css_class("cz-warn");
+    label.add_css_class("caption");
+    bar.append(&icon);
+    bar.append(&label);
+    (bar, label)
+}
+
+/// A page with a heading, a subtitle and content, at a readable measure.
+fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> gtk::Widget {
+    let head = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
+    let t = gtk::Label::builder().label(title).xalign(0.0).build();
+    t.add_css_class("cz-title");
+    let s = gtk::Label::builder().label(subtitle).xalign(0.0).build();
+    s.add_css_class("cz-subtitle");
+    head.append(&t);
+    head.append(&s);
+    head.set_margin_bottom(theme::SPACE_5);
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&head);
+    body.append(content);
+    body.set_margin_top(theme::SPACE_6);
+    body.set_margin_bottom(theme::SPACE_6);
+    body.set_margin_start(theme::SPACE_6);
+    body.set_margin_end(theme::SPACE_6);
+
+    // Clamped so text never runs to an uncomfortable measure on a wide screen,
+    // while the workspace still takes the extra width (§25).
+    let clamp = adw::Clamp::builder()
+        .maximum_size(900)
+        .tightening_threshold(700)
+        .child(&body)
+        .build();
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&clamp)
+        .build()
+        .upcast()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_convert_page(
+    dropzone: &gtk::Box,
+    queue_panel: &gtk::Box,
+    input_label: &gtk::Label,
+    output_picker: &Rc<format_picker::FormatPicker>,
+    swap_btn: &gtk::Button,
+    output_info: &gtk::MenuButton,
+    dest_button: &gtk::MenuButton,
+    name_entry: &gtk::Entry,
+    convert_btn: &gtk::Button,
+    progress: &gtk::ProgressBar,
+    penguin: &Rc<penguin::Penguin>,
+    problem: &gtk::Box,
+) -> (gtk::Widget, gtk::Box, gtk::Box) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
+    content.append(dropzone);
+    content.append(queue_panel);
+
+    // Controls stay hidden until there is a file, so a new user sees one
+    // instruction rather than a form (§2, §36).
+    let controls = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
+    controls.set_visible(false);
+
+    // INPUT  ⇄  OUTPUT
+    let formats = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
+    formats.set_homogeneous(false);
+
+    let in_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
+    in_col.set_hexpand(true);
+    in_col.append(&shell::section_label("Input"));
+    in_col.append(input_label);
+
+    let swap_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    swap_col.set_valign(gtk::Align::End);
+    swap_col.append(swap_btn);
+
+    let out_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
+    out_col.set_hexpand(true);
+    let out_head = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    out_head.append(&shell::section_label("Output"));
+    out_head.append(output_info);
+    out_col.append(&out_head);
+    out_col.append(&output_picker.button);
+
+    formats.append(&in_col);
+    formats.append(&swap_col);
+    formats.append(&out_col);
+    controls.append(&formats);
+
+    // Destination and filename.
+    let dest_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
+    dest_col.append(&shell::section_label("Save to"));
+    dest_col.append(dest_button);
+    controls.append(&dest_col);
+
+    let name_row = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
+    name_row.append(&shell::section_label("Save as"));
+    name_row.append(name_entry);
+    controls.append(&name_row);
+
+    controls.append(problem);
+
+    let action = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
+    action.append(convert_btn);
+    if penguin.is_available() {
+        action.append(&penguin.widget);
     }
-    controls.append(&slider);
+    action.append(progress);
+    controls.append(&action);
+
+    content.append(&controls);
+    (
+        page_frame(
+            "Convert",
+            "Convert resin print files between formats.",
+            &content,
+        ),
+        controls,
+        name_row,
+    )
+}
+
+fn build_preview_page(
+    picture: &gtk::Picture,
+    layer_label: &gtk::Label,
+    layer_detail: &gtk::Label,
+    slider: &gtk::Scale,
+    play_btn: &gtk::Button,
+    info_panel: &gtk::Box,
+) -> (gtk::Widget, gtk::Stack) {
+    let frame = gtk::Frame::builder().child(picture).build();
+    frame.add_css_class("cz-panel");
+    frame.set_vexpand(true);
 
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    labels.set_halign(gtk::Align::End);
-    labels.append(&layer_label);
-    labels.append(&scale_label);
-    controls.append(&labels);
+    labels.set_hexpand(true);
+    labels.append(layer_label);
+    labels.append(layer_detail);
+
+    let nav = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
+    nav.append(&shell::icon_button(
+        "go-first-symbolic",
+        "First layer  (Home)",
+    ));
+    nav.append(&shell::icon_button(
+        "go-previous-symbolic",
+        "Previous layer  (Left)",
+    ));
+    nav.append(play_btn);
+    nav.append(&shell::icon_button(
+        "go-next-symbolic",
+        "Next layer  (Right)",
+    ));
+    nav.append(&shell::icon_button("go-last-symbolic", "Last layer  (End)"));
+
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+    bar.set_margin_top(theme::SPACE_3);
+    bar.append(&nav);
+    bar.append(slider);
+    bar.append(&labels);
 
     let viewer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     viewer.append(&frame);
-    viewer.append(&controls);
+    viewer.append(&bar);
+    viewer.set_hexpand(true);
 
-    let right = gtk::Stack::builder()
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .hexpand(true)
-        .vexpand(true)
+    let side = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
+    side.set_size_request(300, -1);
+    side.append(&shell::section_label("File information"));
+    side.append(info_panel);
+    let side_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&side)
         .build();
-    right.add_named(&empty, Some("drop"));
-    right.add_named(&viewer, Some("view"));
-    right.set_visible_child_name("drop");
 
-    let split = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let split = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_5);
+    split.append(&viewer);
     split.append(&side_scroll);
-    split.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    split.append(&right);
+    split.set_margin_top(theme::SPACE_5);
+    split.set_margin_bottom(theme::SPACE_5);
+    split.set_margin_start(theme::SPACE_6);
+    split.set_margin_end(theme::SPACE_6);
 
-    // ---- convert page: honest about not existing yet (§47) ----
-    let convert = adw::StatusPage::builder()
-        .icon_name("emblem-synchronizing-symbolic")
-        .title("Conversion is not available yet")
-        .description(
-            "The engine can read files but cannot write any format yet, so there is \
-             nothing to convert to. This screen will list output formats as soon as \
-             the first writer exists.\n\nReading and inspection work now.",
-        )
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
+    empty.set_valign(gtk::Align::Center);
+    empty.set_halign(gtk::Align::Center);
+    let icon = gtk::Image::from_icon_name("view-reveal-symbolic");
+    icon.set_pixel_size(48);
+    icon.add_css_class("cz-dim");
+    let t = gtk::Label::new(Some("Nothing to preview yet"));
+    t.add_css_class("cz-title");
+    let s = gtk::Label::new(Some(
+        "Add a file on the Convert page to look through its layers.",
+    ));
+    s.add_css_class("cz-subtitle");
+    empty.append(&icon);
+    empty.append(&t);
+    empty.append(&s);
+
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(160)
         .build();
+    stack.add_named(&empty, Some("empty"));
+    stack.add_named(&split, Some("view"));
+    stack.set_visible_child_name("empty");
+    (stack.clone().upcast(), stack)
+}
+
+fn build_history_page(list: &gtk::ListBox) -> (gtk::Widget, gtk::Stack) {
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panel.add_css_class("cz-panel");
+    panel.append(list);
+
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
+    empty.set_valign(gtk::Align::Center);
+    empty.set_halign(gtk::Align::Center);
+    empty.set_margin_top(theme::SPACE_6);
+    let icon = gtk::Image::from_icon_name("document-open-recent-symbolic");
+    icon.set_pixel_size(48);
+    icon.add_css_class("cz-dim");
+    let t = gtk::Label::new(Some("No conversions yet"));
+    t.add_css_class("cz-title");
+    let s = gtk::Label::new(Some("Files you convert will be listed here."));
+    s.add_css_class("cz-subtitle");
+    empty.append(&icon);
+    empty.append(&t);
+    empty.append(&s);
 
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .build();
-    stack.add_named(&split, Some("inspect"));
-    stack.add_named(&convert, Some("convert"));
-    stack.set_visible_child_name("inspect");
+    stack.add_named(&empty, Some("empty"));
+    stack.add_named(&panel, Some("list"));
 
-    let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&stack));
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&toasts));
-    window.set_content(Some(&toolbar));
-
-    let ui = Rc::new(Ui {
-        window: window.clone(),
+    (
+        page_frame(
+            "History",
+            "Conversions from this and previous sessions.",
+            &stack,
+        ),
         stack,
-        right: right.clone(),
-        toasts,
-        info_group,
-        warn_group,
-        info_rows: RefCell::new(Vec::new()),
-        warn_rows: RefCell::new(Vec::new()),
-        picture,
-        layer_label,
-        scale_label,
-        slider,
-        nav_buttons: vec![first.clone(), prev.clone(), next.clone(), last.clone()],
-        play_button: play_button.clone(),
-        spinner,
-        clear_btn: clear_btn.clone(),
-        title,
-        convert_bar,
-        format_row,
-        dest_row,
-        drive_box: drive_box.clone(),
-        name_row: name_row.clone(),
-        convert_btn: convert_btn.clone(),
-        progress,
-        penguin: penguin.clone(),
-        out_dir: RefCell::new(None),
-        settings: RefCell::new(Settings::load()),
-        writable: RefCell::new(writable_ids),
-    });
-
-    wire(
-        &ui,
-        &open_btn,
-        &empty_btn,
-        &about_btn,
-        &first,
-        &prev,
-        &next,
-        &last,
-        &play_button,
-    );
-    wire_convert(&ui, &convert_btn, &pick_dir, &reset_dir);
-    {
-        let ui2 = ui.clone();
-        clear_btn.connect_clicked(move |_| clear_file(&ui2));
-    }
-    {
-        let ui2 = ui.clone();
-        prefs_btn.connect_clicked(move |_| show_settings(&ui2));
-    }
-
-    // Restore last session's choices, but only if they are still valid: a USB
-    // drive that has since been unplugged must not silently become the target.
-    refresh_drive_buttons(&ui);
-
-    // Rebuild the quick buttons when a drive appears or disappears, so a stick
-    // plugged in after launch shows up without restarting.
-    {
-        let monitor = gio::VolumeMonitor::get();
-        for signal in ["mount-added", "mount-removed"] {
-            let ui2 = ui.clone();
-            monitor.connect_local(signal, false, move |_| {
-                refresh_drive_buttons(&ui2);
-                None
-            });
-        }
-        // Keep the monitor alive for the life of the window.
-        unsafe { ui.window.set_data("volume-monitor", monitor) };
-    }
-
-    {
-        let saved = ui.settings.borrow().clone();
-        if let Some(dir) = saved.last_output_dir.filter(|d| d.is_dir()) {
-            set_out_dir(&ui, Some(dir));
-        }
-        if let Some(fmt) = saved.last_output_format {
-            if let Some(idx) = ui.writable.borrow().iter().position(|id| *id == fmt) {
-                ui.format_row.set_selected(idx as u32);
-            }
-        }
-    }
-    ui
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn wire(
-    ui: &Rc<Ui>,
-    open_btn: &gtk::Button,
-    empty_btn: &gtk::Button,
-    about_btn: &gtk::Button,
-    first: &gtk::Button,
-    prev: &gtk::Button,
-    next: &gtk::Button,
-    last: &gtk::Button,
-    play: &gtk::Button,
-) {
-    for b in [open_btn, empty_btn] {
-        let ui = ui.clone();
-        b.connect_clicked(move |_| choose_file(&ui));
-    }
+// ---------------------------------------------------------------------------
+// wiring
+// ---------------------------------------------------------------------------
 
+fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
+    // Browse, from either entry point.
+    if let Some(browse) = find_named(&ui.dropzone, "dropzone-browse") {
+        let ui = ui.clone();
+        browse.connect_clicked(move |_| choose_files(&ui));
+    }
     {
         let ui = ui.clone();
-        about_btn.connect_clicked(move |_| show_about(&ui));
+        add_more.connect_clicked(move |_| choose_files(&ui));
     }
 
-    // Drag and drop from the file manager, desktop, or a mounted drive.
+    // Drag and drop, with the accent feedback §13 asks for.
     let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
     {
         let ui = ui.clone();
+        drop.connect_enter(move |_, _, _| {
+            ui.dropzone.add_css_class("active");
+            ui.dropzone_title.set_text("Release to add");
+            gdk::DragAction::COPY
+        });
+    }
+    {
+        let ui = ui.clone();
+        drop.connect_leave(move |_| reset_dropzone(&ui));
+    }
+    {
+        let ui = ui.clone();
         drop.connect_drop(move |_, value, _, _| {
+            reset_dropzone(&ui);
             if let Ok(list) = value.get::<gdk::FileList>() {
-                if let Some(path) = list.files().first().and_then(|f| f.path()) {
-                    load_file(&ui, &path);
+                let paths: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+                if !paths.is_empty() {
+                    add_files(&ui, paths);
                     return true;
                 }
             }
@@ -495,180 +734,226 @@ fn wire(
     }
     ui.window.add_controller(drop);
 
-    // Layer navigation.
-    let jump = |ui: &Rc<Ui>, f: Box<dyn Fn(u32, u32) -> u32>| {
-        let count = with_loaded(|l| l.opened.print.layer_count()).unwrap_or(0);
-        if count == 0 {
-            return;
-        }
-        let cur = ui.slider.value() as u32;
-        ui.slider.set_value(f(cur, count) as f64);
-    };
+    // Output format.
     {
+        let picker = ui.output_picker.clone();
         let ui = ui.clone();
-        first.connect_clicked(move |_| jump(&ui, Box::new(|_, _| 0)));
+        picker.connect_changed(move |id| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.last_output_format = Some(id.to_string());
+                let _ = s.save();
+            }
+            suggest_name(&ui);
+            revalidate(&ui);
+        });
     }
     {
+        // Swapping puts the current input format in the output slot, which is
+        // what "convert it back" means in practice.
+        let swap = ui.swap_btn.clone();
         let ui = ui.clone();
-        prev.connect_clicked(move |_| jump(&ui, Box::new(|c, _| c.saturating_sub(1))));
+        swap.connect_clicked(move |_| {
+            let input = ui
+                .files
+                .borrow()
+                .get(*ui.selected.borrow())
+                .map(|f| f.format.clone());
+            if let Some(id) = input {
+                if registry::by_id(&id).map(|h| h.info().capabilities.writes) == Some(true) {
+                    ui.output_picker.set_selected(&id);
+                    suggest_name(&ui);
+                    revalidate(&ui);
+                } else {
+                    ui.toasts.add_toast(adw::Toast::new(
+                        "That format cannot be written yet, so there is nothing to swap to",
+                    ));
+                }
+            }
+        });
     }
+
+    // Destination menu.
+    build_destination_menu(ui);
+
+    // Filename edits revalidate as you type.
     {
+        let entry = ui.name_entry.clone();
         let ui = ui.clone();
-        next.connect_clicked(move |_| jump(&ui, Box::new(|c, n| (c + 1).min(n - 1))));
+        entry.connect_changed(move |_| revalidate(&ui));
     }
+
     {
+        let button = ui.convert_btn.clone();
         let ui = ui.clone();
-        last.connect_clicked(move |_| jump(&ui, Box::new(|_, n| n - 1)));
+        button.connect_clicked(move |_| start_convert(&ui));
     }
+
+    // Queue selection drives the preview.
     {
+        let list = ui.queue_list.clone();
         let ui = ui.clone();
-        play.connect_clicked(move |_| toggle_play(&ui));
+        list.connect_row_selected(move |_, row| {
+            if let Some(r) = row {
+                let idx = r.index();
+                if idx >= 0 {
+                    select_file(&ui, idx as usize);
+                }
+            }
+        });
     }
+
+    // Preview navigation.
     {
+        let slider = ui.slider.clone();
         let ui = ui.clone();
-        ui.slider.clone().connect_value_changed(move |s| {
+        slider.connect_value_changed(move |s| {
             show_layer(&ui, s.value() as u32);
         });
     }
-
-    // Keyboard (§34).
-    let keys = gtk::EventControllerKey::new();
     {
+        let play = ui.play_btn.clone();
         let ui = ui.clone();
-        keys.connect_key_pressed(move |_, key, _, state| {
-            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-            let count = with_loaded(|l| l.opened.print.layer_count()).unwrap_or(0);
-            let cur = ui.slider.value() as u32;
-            match key {
-                gdk::Key::o if ctrl => {
-                    choose_file(&ui);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Return if ctrl => {
-                    start_convert(&ui);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::w if ctrl => {
-                    clear_file(&ui);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Left if count > 0 => {
-                    ui.slider.set_value(cur.saturating_sub(1) as f64);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Right if count > 0 => {
-                    ui.slider.set_value((cur + 1).min(count - 1) as f64);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Home if count > 0 => {
-                    ui.slider.set_value(0.0);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::End if count > 0 => {
-                    ui.slider.set_value((count - 1) as f64);
-                    glib::Propagation::Stop
-                }
-                gdk::Key::space if count > 0 => {
-                    toggle_play(&ui);
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
-            }
-        });
+        play.connect_clicked(move |_| toggle_play(&ui));
     }
+    wire_preview_nav(ui);
+    wire_keys(ui);
+}
+
+/// Find a child by widget name, so the drop zone's button can be reached
+/// without threading it through several constructors.
+fn find_named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Button> {
+    let mut child = root.as_ref().first_child();
+    while let Some(c) = child {
+        if c.widget_name() == name {
+            return c.downcast::<gtk::Button>().ok();
+        }
+        if let Some(found) = find_named(&c, name) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+fn reset_dropzone(ui: &Rc<App>) {
+    ui.dropzone.remove_css_class("active");
+    ui.dropzone_title.set_text("Drop files here");
+}
+
+fn wire_preview_nav(ui: &Rc<App>) {
+    // The navigation buttons live inside the preview bar; wire them by tooltip
+    // so the layout can be rearranged without rewiring.
+    type Jump = Box<dyn Fn(u32, u32) -> u32>;
+    let jump: Vec<(&str, Jump)> = vec![
+        ("First layer  (Home)", Box::new(|_, _| 0)),
+        (
+            "Previous layer  (Left)",
+            Box::new(|c, _| c.saturating_sub(1)),
+        ),
+        (
+            "Next layer  (Right)",
+            Box::new(|c, n| (c + 1).min(n.saturating_sub(1))),
+        ),
+        ("Last layer  (End)", Box::new(|_, n| n.saturating_sub(1))),
+    ];
+    for (tooltip, f) in jump {
+        if let Some(button) = find_by_tooltip(&ui.preview_stack, tooltip) {
+            let ui = ui.clone();
+            button.connect_clicked(move |_| {
+                let count = layer_count(&ui);
+                if count == 0 {
+                    return;
+                }
+                let cur = ui.slider.value() as u32;
+                ui.slider.set_value(f(cur, count) as f64);
+            });
+        }
+    }
+}
+
+fn find_by_tooltip(root: &impl IsA<gtk::Widget>, tooltip: &str) -> Option<gtk::Button> {
+    let mut child = root.as_ref().first_child();
+    while let Some(c) = child {
+        if c.tooltip_text().map(|t| t == tooltip).unwrap_or(false) {
+            if let Ok(b) = c.clone().downcast::<gtk::Button>() {
+                return Some(b);
+            }
+        }
+        if let Some(found) = find_by_tooltip(&c, tooltip) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+fn wire_keys(ui: &Rc<App>) {
+    let keys = gtk::EventControllerKey::new();
+    let ui2 = ui.clone();
+    keys.connect_key_pressed(move |_, key, _, state| {
+        let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+        let count = layer_count(&ui2);
+        let cur = ui2.slider.value() as u32;
+        match key {
+            gdk::Key::o if ctrl => {
+                choose_files(&ui2);
+                glib::Propagation::Stop
+            }
+            gdk::Key::k if ctrl => {
+                palette::show(&ui2);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Return if ctrl => {
+                start_convert(&ui2);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Delete => {
+                remove_selected(&ui2);
+                glib::Propagation::Stop
+            }
+            gdk::Key::space if count > 0 && ui2.shell.current() == Section::Preview => {
+                toggle_play(&ui2);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Left if count > 0 && ui2.shell.current() == Section::Preview => {
+                ui2.slider.set_value(cur.saturating_sub(1) as f64);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Right if count > 0 && ui2.shell.current() == Section::Preview => {
+                ui2.slider.set_value((cur + 1).min(count - 1) as f64);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Home if count > 0 && ui2.shell.current() == Section::Preview => {
+                ui2.slider.set_value(0.0);
+                glib::Propagation::Stop
+            }
+            gdk::Key::End if count > 0 && ui2.shell.current() == Section::Preview => {
+                ui2.slider.set_value((count - 1) as f64);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
     ui.window.add_controller(keys);
 }
 
-/// Rebuild the row of pinned drive shortcuts.
-///
-/// A pinned drive that is not plugged in stays visible but disabled, so the
-/// user can see it is expected and simply absent rather than wondering where
-/// the button went.
-fn refresh_drive_buttons(ui: &Rc<Ui>) {
-    while let Some(child) = ui.drive_box.first_child() {
-        ui.drive_box.remove(&child);
-    }
-    let (pinned, sub) = {
-        let s = ui.settings.borrow();
-        (s.pinned_volumes.clone(), s.pinned_subfolder.clone())
-    };
-    if pinned.is_empty() {
-        ui.drive_box.set_visible(false);
-        return;
-    }
-    for name in pinned {
-        let target = drives::target_dir(&name, &sub);
-        let btn = gtk::Button::builder()
-            .label(&name)
-            .sensitive(target.is_some())
-            .build();
-        btn.add_css_class("pill");
-        match &target {
-            Some(dir) => {
-                let space = drives::space(dir)
-                    .map(|(free, total)| {
-                        format!(
-                            "\n{} free of {}",
-                            render::human_bytes(free),
-                            render::human_bytes(total)
-                        )
-                    })
-                    .unwrap_or_default();
-                btn.set_tooltip_text(Some(&format!("Save to {}{space}", dir.display())));
-                btn.add_css_class("suggested-action");
-                let ui2 = ui.clone();
-                let d = dir.clone();
-                btn.connect_clicked(move |_| set_out_dir(&ui2, Some(d.clone())));
-            }
-            None => {
-                btn.set_tooltip_text(Some(&format!("{name} is not connected")));
-                btn.add_css_class("dim-label");
-            }
-        }
-        ui.drive_box.append(&btn);
-    }
-    ui.drive_box.set_visible(true);
+fn layer_count(ui: &Rc<App>) -> u32 {
+    ui.files
+        .borrow()
+        .get(*ui.selected.borrow())
+        .and_then(|f| f.opened.as_ref())
+        .map(|o| o.print.layer_count())
+        .unwrap_or(0)
 }
 
-/// Unload the current file and go back to the drop target.
-fn clear_file(ui: &Rc<Ui>) {
-    stop_play();
-    LOADED.with(|l| *l.borrow_mut() = None);
-    for r in ui.info_rows.borrow_mut().drain(..) {
-        ui.info_group.remove(&r);
-    }
-    for r in ui.warn_rows.borrow_mut().drain(..) {
-        ui.warn_group.remove(&r);
-    }
-    ui.warn_group.set_visible(false);
-    // The convert controls are settings, not file data: the chosen format,
-    // destination and pinned drives should survive clearing a file. Only the
-    // Convert button is disabled, since there is nothing to convert.
-    ui.convert_btn.set_sensitive(false);
-    ui.clear_btn.set_visible(false);
-    ui.picture.set_paintable(gdk::Paintable::NONE);
-    ui.layer_label.set_text("Layer — / —");
-    ui.scale_label.set_text("");
-    ui.name_row.set_text("");
-    ui.play_button
-        .set_icon_name("media-playback-start-symbolic");
-    ui.title.set_title("CheapAzSLA");
-    ui.title
-        .set_subtitle("Resin print file converter & inspector");
-    // An empty File panel would just be a titled box with nothing in it.
-    ui.info_group.set_visible(false);
-    ui.right.set_visible_child_name("drop");
-}
+// ---------------------------------------------------------------------------
+// files
+// ---------------------------------------------------------------------------
 
-fn with_loaded<T>(f: impl FnOnce(&Loaded) -> T) -> Option<T> {
-    LOADED.with(|l| l.borrow().as_ref().map(f))
-}
-
-fn choose_file(ui: &Rc<Ui>) {
-    // Native picker: it handles USB, SD cards and network shares through the
-    // desktop portal, so there is nothing here to hardcode.
+fn choose_files(ui: &Rc<App>) {
     let filter = gtk::FileFilter::new();
-    filter.set_name(Some("Resin print files"));
+    filter.set_name(Some("Sliced resin files"));
     for info in registry::readable() {
         filter.add_pattern(&format!("*.{}", info.extension));
         filter.add_pattern(&format!("*.{}", info.extension.to_uppercase()));
@@ -685,274 +970,347 @@ fn choose_file(ui: &Rc<Ui>) {
     filters.append(&all);
 
     let dialog = gtk::FileDialog::builder()
-        .title("Open a resin print file")
+        .title("Add sliced files")
         .filters(&filters)
         .modal(true)
         .build();
     if let Some(dir) = ui.settings.borrow().open_start_dir() {
         dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
     }
-
     let ui = ui.clone();
-    dialog.open(
+    dialog.open_multiple(
         Some(&ui.window.clone()),
         gio::Cancellable::NONE,
         move |res| {
-            if let Ok(file) = res {
-                if let Some(path) = file.path() {
-                    load_file(&ui, &path);
+            if let Ok(files) = res {
+                let paths: Vec<PathBuf> = (0..files.n_items())
+                    .filter_map(|i| files.item(i))
+                    .filter_map(|o| o.downcast::<gio::File>().ok())
+                    .filter_map(|f| f.path())
+                    .collect();
+                if !paths.is_empty() {
+                    add_files(&ui, paths);
                 }
             }
         },
     );
 }
 
-/// Open a file on a worker thread so the interface never blocks (§17).
-fn load_file(ui: &Rc<Ui>, path: &Path) {
-    stop_play();
-    ui.spinner.set_spinning(true);
-    ui.spinner.set_visible(true);
-    ui.title.set_subtitle("Reading…");
-    ui.penguin.start();
+fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
+    let existing: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
+    let mut added = 0;
+    for path in paths {
+        if existing.contains(&path) || !path.is_file() {
+            continue;
+        }
+        if let Some(dir) = path.parent() {
+            let mut s = ui.settings.borrow_mut();
+            if s.last_open_dir.as_deref() != Some(dir) {
+                s.last_open_dir = Some(dir.to_path_buf());
+                let _ = s.save();
+            }
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        ui.files.borrow_mut().push(Queued {
+            path: path.clone(),
+            size,
+            format: String::new(),
+            detection: String::new(),
+            extension_mismatch: false,
+            warnings: Vec::new(),
+            opened: None,
+            status: Status::Reading,
+        });
+        added += 1;
+        read_in_background(ui, path);
+    }
+    if added > 0 {
+        refresh_queue(ui);
+        // Morph rather than jump: the drop zone gives way to the queue (§24).
+        ui.dropzone.set_visible(false);
+        ui.queue_panel.set_visible(true);
+        ui.controls.set_visible(true);
+        if ui.files.borrow().len() == added {
+            select_file(ui, 0);
+        }
+    }
+}
 
+fn read_in_background(ui: &Rc<App>, path: PathBuf) {
+    ui.penguin.start();
     let (tx, rx) = async_channel::bounded(1);
-    let p = path.to_path_buf();
+    let p = path.clone();
     std::thread::spawn(move || {
-        let result = read_file(&p);
-        let _ = tx.send_blocking(result);
+        let _ = tx.send_blocking(read_file(&p));
     });
 
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        match rx.recv().await {
-            Ok(Ok(loaded)) => {
-                ui.penguin.stop();
-                present(&ui, loaded);
+        let result = rx.recv().await;
+        ui.penguin.stop();
+        let Ok(result) = result else { return };
+        let mut files = ui.files.borrow_mut();
+        let Some(entry) = files.iter_mut().find(|f| f.path == path) else {
+            return;
+        };
+        match result {
+            Ok(read) => {
+                entry.format = read.format.clone();
+                entry.detection = read.detection;
+                entry.extension_mismatch = read.extension_mismatch;
+                entry.warnings = read.warnings.clone();
+                entry.opened = Some(read.opened);
+                entry.status = if read.warnings.is_empty() && !read.extension_mismatch {
+                    Status::Ready
+                } else {
+                    let mut notes = read.warnings;
+                    if read.extension_mismatch {
+                        notes.push(
+                            "The file extension disagrees with the contents; the contents were used."
+                                .into(),
+                        );
+                    }
+                    Status::Warning(notes.join("\n"))
+                };
             }
-            Ok(Err(msg)) => {
-                ui.penguin.stop();
-                ui.spinner.set_spinning(false);
-                ui.spinner.set_visible(false);
-                ui.title
-                    .set_subtitle("Resin print file converter & inspector");
-                error_dialog(&ui, &msg.0, &msg.1);
-            }
-            Err(_) => {}
+            Err(e) => entry.status = Status::Failed(e),
         }
+        drop(files);
+        refresh_queue(&ui);
+        let sel = *ui.selected.borrow();
+        select_file(&ui, sel);
     });
 }
 
-/// Message shown to the user, plus the technical detail behind it (§28).
-struct Failure(String, String);
+struct ReadFile {
+    format: String,
+    detection: String,
+    extension_mismatch: bool,
+    warnings: Vec<String>,
+    opened: Arc<OpenedFile>,
+}
 
-fn read_file(path: &Path) -> Result<Loaded, Failure> {
-    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-    let id = registry::identify(path).map_err(|e| {
-        Failure(
-            format!("CheapAzSLA does not recognise {}.", name_of(path)),
-            e.to_string(),
-        )
-    })?;
-
-    let handler = registry::by_id(id.detection.format_id)
-        .ok_or_else(|| Failure("No handler for this format.".into(), String::new()))?;
-
+fn read_file(path: &Path) -> Result<ReadFile, String> {
+    let id = registry::identify(path)
+        .map_err(|e| format!("CheapAzSLA does not recognise this file. {e}"))?;
+    let handler = registry::by_id(id.detection.format_id).ok_or("No handler for this format")?;
     let warnings = handler.validate(path).unwrap_or_default();
-
-    let opened = handler.open(path).map_err(|e| {
-        Failure(
-            format!("{} could not be opened.", name_of(path)),
-            e.to_string(),
-        )
-    })?;
-
-    Ok(Loaded {
-        path: path.to_path_buf(),
-        size_bytes,
-        opened: Arc::new(opened),
-        detection: id.detection.reason.clone(),
-        confidence: format!("{:?}", id.detection.confidence),
-        warnings,
+    let opened = handler.open(path).map_err(|e| e.to_string())?;
+    Ok(ReadFile {
+        format: id.detection.format_id.to_string(),
+        detection: id.detection.reason,
         extension_mismatch: id.extension_mismatch,
+        warnings,
+        opened: Arc::new(opened),
     })
 }
 
-fn name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
+fn refresh_queue(ui: &Rc<App>) {
+    let selected = *ui.selected.borrow();
+    while let Some(row) = ui.queue_list.first_child() {
+        ui.queue_list.remove(&row);
+    }
+    for (i, f) in ui.files.borrow().iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+        row.set_margin_top(theme::SPACE_2);
+        row.set_margin_bottom(theme::SPACE_2);
+        row.set_margin_start(theme::SPACE_3);
+        row.set_margin_end(theme::SPACE_2);
 
-/// Build a labelled row. Values the file did not record are shown as such
-/// rather than filled with a plausible-looking default (§13, §24).
-fn row(title: &str, value: Option<String>) -> adw::ActionRow {
-    let r = adw::ActionRow::builder().title(title).build();
-    match value {
-        Some(v) => r.set_subtitle(&v),
-        None => {
-            r.set_subtitle("not recorded");
-            r.add_css_class("dim-label");
+        row.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
+
+        let name = gtk::Label::builder()
+            .label(f.name())
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        row.append(&name);
+
+        let fmt = gtk::Label::new(Some(&if f.format.is_empty() {
+            "—".to_string()
+        } else {
+            f.format.to_uppercase()
+        }));
+        fmt.add_css_class("cz-dim");
+        fmt.set_width_chars(5);
+        row.append(&fmt);
+
+        let size = gtk::Label::new(Some(&render::human_bytes(f.size)));
+        size.add_css_class("cz-dim");
+        size.add_css_class("cz-value");
+        size.set_width_chars(9);
+        size.set_xalign(1.0);
+        row.append(&size);
+
+        let chip = f.status.chip();
+        chip.set_width_request(104);
+        if let Some(detail) = f.status.detail() {
+            chip.set_tooltip_text(Some(&detail));
+        }
+        row.append(&chip);
+
+        let remove = shell::icon_button("window-close-symbolic", "Remove from list");
+        let ui2 = ui.clone();
+        let path = f.path.clone();
+        remove.connect_clicked(move |_| remove_file(&ui2, &path));
+        row.append(&remove);
+
+        let list_row = gtk::ListBoxRow::builder().child(&row).build();
+        ui.queue_list.append(&list_row);
+        if i == selected {
+            ui.queue_list.select_row(Some(&list_row));
         }
     }
-    r
+    revalidate(ui);
 }
 
-/// Add a row to the file panel and remember it so it can be removed later.
-fn add_info(ui: &Rc<Ui>, r: adw::ActionRow) {
-    ui.info_group.add(&r);
-    ui.info_rows.borrow_mut().push(r);
+fn remove_file(ui: &Rc<App>, path: &Path) {
+    ui.files.borrow_mut().retain(|f| f.path != path);
+    let len = ui.files.borrow().len();
+    if len == 0 {
+        stop_play(ui);
+        *ui.selected.borrow_mut() = 0;
+        ui.dropzone.set_visible(true);
+        ui.queue_panel.set_visible(false);
+        ui.controls.set_visible(false);
+        ui.preview_stack.set_visible_child_name("empty");
+        refresh_queue(ui);
+        return;
+    }
+    let sel = (*ui.selected.borrow()).min(len - 1);
+    *ui.selected.borrow_mut() = sel;
+    refresh_queue(ui);
+    select_file(ui, sel);
 }
 
-fn present(ui: &Rc<Ui>, loaded: Loaded) {
-    ui.spinner.set_spinning(false);
-    ui.spinner.set_visible(false);
-
-    let p = &loaded.opened.print;
-    let count = p.layer_count();
-
-    // --- file panel ---
-    for r in ui.info_rows.borrow_mut().drain(..) {
-        ui.info_group.remove(&r);
+fn remove_selected(ui: &Rc<App>) {
+    let path = ui
+        .files
+        .borrow()
+        .get(*ui.selected.borrow())
+        .map(|f| f.path.clone());
+    if let Some(p) = path {
+        remove_file(ui, &p);
     }
-    ui.info_group.set_title(&name_of(&loaded.path));
-    add_info(ui, row("Format", Some(p.source_format.to_uppercase())));
-    add_info(ui, row("Detected by", Some(loaded.detection.clone())));
-    add_info(ui, row("Confidence", Some(loaded.confidence.clone())));
-    add_info(
-        ui,
-        row("Size", Some(render::human_bytes(loaded.size_bytes))),
-    );
-    add_info(
-        ui,
-        row(
-            "Location",
-            loaded.path.parent().map(|d| d.display().to_string()),
-        ),
-    );
-    add_info(
-        ui,
-        row(
-            "Resolution",
-            Some(format!(
-                "{} x {} px",
-                p.geometry.resolution_x, p.geometry.resolution_y
-            )),
-        ),
-    );
-    add_info(
-        ui,
-        row(
-            "Pixel size",
-            p.geometry
-                .pixel_size_um()
-                .map(|(x, y)| format!("{x:.2} x {y:.2} um")),
-        ),
-    );
-    add_info(ui, row("Layers", Some(count.to_string())));
-    add_info(
-        ui,
-        row(
-            "Layer height",
-            Some(format!("{} mm", p.exposure.layer_height_mm)),
-        ),
-    );
-    add_info(
-        ui,
-        row("Height", p.height_mm().map(|h| format!("{h:.2} mm"))),
-    );
-    add_info(
-        ui,
-        row("Exposure", Some(format!("{} s", p.exposure.exposure_s))),
-    );
-    add_info(
-        ui,
-        row(
-            "Bottom exposure",
-            p.exposure.bottom_exposure_s.map(|v| format!("{v} s")),
-        ),
-    );
-    add_info(
-        ui,
-        row(
-            "Bottom layers",
-            p.exposure.bottom_layers.map(|v| v.to_string()),
-        ),
-    );
-    add_info(
-        ui,
-        row("Print time", p.print_time_s.map(render::human_time)),
-    );
-    add_info(
-        ui,
-        row("Material", p.material_volume_ml.map(|v| format!("{v} ml"))),
-    );
-    add_info(ui, row("Material name", p.material_name.clone()));
-    add_info(ui, row("Printer", p.machine_name.clone()));
+}
 
-    // --- validation panel ---
-    for r in ui.warn_rows.borrow_mut().drain(..) {
-        ui.warn_group.remove(&r);
+// ---------------------------------------------------------------------------
+// selection, preview
+// ---------------------------------------------------------------------------
+
+fn select_file(ui: &Rc<App>, index: usize) {
+    let len = ui.files.borrow().len();
+    if len == 0 {
+        return;
     }
-    let mut notes: Vec<String> = loaded.warnings.clone();
-    if loaded.extension_mismatch {
-        notes
-            .push("The file extension disagrees with the contents. The contents were used.".into());
-    }
-    if notes.is_empty() {
-        ui.warn_group.set_visible(false);
+    let index = index.min(len - 1);
+    *ui.selected.borrow_mut() = index;
+    stop_play(ui);
+
+    let (input, count, ready) = {
+        let files = ui.files.borrow();
+        let f = &files[index];
+        let count = f
+            .opened
+            .as_ref()
+            .map(|o| o.print.layer_count())
+            .unwrap_or(0);
+        (
+            if f.format.is_empty() {
+                "—".to_string()
+            } else {
+                f.format.to_uppercase()
+            },
+            count,
+            f.opened.is_some(),
+        )
+    };
+    ui.input_label.set_text(&input);
+
+    if ready && count > 0 {
+        ui.slider
+            .set_range(0.0, (count.saturating_sub(1)).max(1) as f64);
+        ui.slider.set_value(0.0);
+        ui.preview_stack.set_visible_child_name("view");
+        show_layer(ui, 0);
     } else {
-        for n in &notes {
-            let r = adw::ActionRow::builder().title(n.as_str()).build();
-            r.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
-            r.set_title_lines(0);
-            ui.warn_group.add(&r);
-            ui.warn_rows.borrow_mut().push(r);
-        }
-        ui.warn_group.set_visible(true);
+        ui.preview_stack.set_visible_child_name("empty");
     }
-
-    if let Some(dir) = loaded.path.parent() {
-        let mut st = ui.settings.borrow_mut();
-        if st.last_open_dir.as_deref() != Some(dir) {
-            st.last_open_dir = Some(dir.to_path_buf());
-            let _ = st.save();
-        }
-    }
-
-    ui.title.set_title(&name_of(&loaded.path));
-    ui.title.set_subtitle(&format!(
-        "{}  ·  {} layers  ·  {}",
-        p.source_format.to_uppercase(),
-        count,
-        render::human_bytes(loaded.size_bytes)
-    ));
-
-    ui.slider
-        .set_range(0.0, (count.saturating_sub(1)).max(1) as f64);
-    ui.slider.set_value(0.0);
-    for b in &ui.nav_buttons {
-        b.set_sensitive(count > 1);
-    }
-    ui.play_button.set_sensitive(count > 1);
-
-    ui.convert_bar.set_visible(true);
-    ui.convert_btn.set_sensitive(true);
-    ui.clear_btn.set_visible(true);
-    LOADED.with(|l| *l.borrow_mut() = Some(loaded));
+    refresh_info_panel(ui);
     suggest_name(ui);
-    ui.info_group.set_visible(true);
-    ui.right.set_visible_child_name("view");
-    ui.stack.set_visible_child_name("inspect");
-    show_layer(ui, 0);
+    revalidate(ui);
 }
 
-/// Decode and display one layer, off the main thread.
-fn show_layer(ui: &Rc<Ui>, index: u32) {
-    let Some((layers, count)) = with_loaded(|l| (l.opened.clone(), l.opened.print.layer_count()))
-    else {
+fn refresh_info_panel(ui: &Rc<App>) {
+    while let Some(c) = ui.info_panel.first_child() {
+        ui.info_panel.remove(&c);
+    }
+    let files = ui.files.borrow();
+    let Some(f) = files.get(*ui.selected.borrow()) else {
         return;
     };
+    let Some(opened) = f.opened.as_ref() else {
+        ui.info_panel
+            .append(&shell::info_row("Status", "Not readable", true));
+        return;
+    };
+    let p = &opened.print;
+    let add = |label: &str, value: Option<String>| {
+        // §13 and §24: absent is stated, never filled with a plausible zero.
+        let (text, dim) = match value {
+            Some(v) => (v, false),
+            None => ("not recorded".to_string(), true),
+        };
+        ui.info_panel.append(&shell::info_row(label, &text, dim));
+    };
+    add("Format", Some(p.source_format.to_uppercase()));
+    add("Detected by", Some(f.detection.clone()));
+    add("File size", Some(render::human_bytes(f.size)));
+    add(
+        "Resolution",
+        Some(format!(
+            "{} × {}",
+            p.geometry.resolution_x, p.geometry.resolution_y
+        )),
+    );
+    add(
+        "Pixel size",
+        p.geometry
+            .pixel_size_um()
+            .map(|(x, y)| format!("{x:.2} × {y:.2} µm")),
+    );
+    add("Layers", Some(p.layer_count().to_string()));
+    add(
+        "Layer height",
+        Some(format!("{} mm", p.exposure.layer_height_mm)),
+    );
+    add("Print height", p.height_mm().map(|h| format!("{h:.2} mm")));
+    add("Exposure", Some(format!("{} s", p.exposure.exposure_s)));
+    add(
+        "Bottom exposure",
+        p.exposure.bottom_exposure_s.map(|v| format!("{v} s")),
+    );
+    add(
+        "Bottom layers",
+        p.exposure.bottom_layers.map(|v| v.to_string()),
+    );
+    add("Print time", p.print_time_s.map(render::human_time));
+    add(
+        "Resin volume",
+        p.material_volume_ml.map(|v| format!("{v} ml")),
+    );
+    add("Printer", p.machine_name.clone());
+}
+
+fn show_layer(ui: &Rc<App>, index: u32) {
+    let opened = ui
+        .files
+        .borrow()
+        .get(*ui.selected.borrow())
+        .and_then(|f| f.opened.clone());
+    let Some(opened) = opened else { return };
+    let count = opened.print.layer_count();
     if count == 0 {
         return;
     }
@@ -962,7 +1320,7 @@ fn show_layer(ui: &Rc<Ui>, index: u32) {
 
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let result = layers.layers.layer(index).map(|img| {
+        let result = opened.layers.layer(index).map(|img| {
             let exposed = img.exposed_pixels(0);
             let total = img.width as u64 * img.height as u64;
             (render::texture_for(&img), exposed, total)
@@ -980,15 +1338,14 @@ fn show_layer(ui: &Rc<Ui>, index: u32) {
                 } else {
                     0.0
                 };
-                let scale = if factor > 1 {
-                    format!("shown at 1/{factor}  ·  {exposed} px exposed ({pct:.3}%)")
+                ui.layer_detail.set_text(&if factor > 1 {
+                    format!("{exposed} px exposed ({pct:.3}%)  ·  shown at 1/{factor}")
                 } else {
                     format!("{exposed} px exposed ({pct:.3}%)")
-                };
-                ui.scale_label.set_text(&scale);
+                });
             }
             Ok(Err(e)) => {
-                ui.scale_label.set_text("layer could not be decoded");
+                ui.layer_detail.set_text("layer could not be decoded");
                 ui.toasts.add_toast(adw::Toast::new(&e.to_string()));
             }
             Err(_) => {}
@@ -996,552 +1353,327 @@ fn show_layer(ui: &Rc<Ui>, index: u32) {
     });
 }
 
-fn toggle_play(ui: &Rc<Ui>) {
-    let running = PLAYING.with(|p| p.borrow().is_some());
-    if running {
-        stop_play();
-        ui.play_button
-            .set_icon_name("media-playback-start-symbolic");
+fn toggle_play(ui: &Rc<App>) {
+    if ui.playing.borrow().is_some() {
+        stop_play(ui);
         return;
     }
-    ui.play_button
-        .set_icon_name("media-playback-pause-symbolic");
+    ui.play_btn.set_icon_name("media-playback-pause-symbolic");
+    ui.play_btn.set_tooltip_text(Some("Pause  (Space)"));
     let ui2 = ui.clone();
-    let id = glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
-        let count = with_loaded(|l| l.opened.print.layer_count()).unwrap_or(0);
+    let id = glib::timeout_add_local(std::time::Duration::from_millis(110), move || {
+        let count = layer_count(&ui2);
         if count == 0 {
             return glib::ControlFlow::Break;
         }
         let cur = ui2.slider.value() as u32;
-        if cur + 1 >= count {
-            ui2.slider.set_value(0.0);
+        ui2.slider.set_value(if cur + 1 >= count {
+            0.0
         } else {
-            ui2.slider.set_value((cur + 1) as f64);
-        }
+            (cur + 1) as f64
+        });
         glib::ControlFlow::Continue
     });
-    PLAYING.with(|p| *p.borrow_mut() = Some(id));
+    *ui.playing.borrow_mut() = Some(id);
 }
 
-fn stop_play() {
-    PLAYING.with(|p| {
-        if let Some(id) = p.borrow_mut().take() {
-            id.remove();
+fn stop_play(ui: &Rc<App>) {
+    if let Some(id) = ui.playing.borrow_mut().take() {
+        id.remove();
+    }
+    ui.play_btn.set_icon_name("media-playback-start-symbolic");
+    ui.play_btn.set_tooltip_text(Some("Play  (Space)"));
+}
+
+// ---------------------------------------------------------------------------
+// destination and validation
+// ---------------------------------------------------------------------------
+
+fn build_destination_menu(ui: &Rc<App>) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.set_size_request(340, -1);
+    let popover = gtk::Popover::builder()
+        .child(&content)
+        .has_arrow(false)
+        .build();
+    ui.dest_button.set_popover(Some(&popover));
+
+    let ui2 = ui.clone();
+    let content2 = content.clone();
+    let pop2 = popover.clone();
+    popover.connect_show(move |_| {
+        while let Some(c) = content2.first_child() {
+            content2.remove(&c);
         }
-    });
-}
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("navigation-sidebar");
 
-/// A readable message with the technical detail tucked behind Details (§28).
-fn error_dialog(ui: &Rc<Ui>, message: &str, detail: &str) {
-    let dialog = adw::MessageDialog::builder()
-        .transient_for(&ui.window)
-        .modal(true)
-        .heading("Could not open this file")
-        .body(message)
-        .build();
-    if !detail.is_empty() {
-        let expander = gtk::Expander::builder().label("Details").build();
-        let label = gtk::Label::builder()
-            .label(detail)
-            .wrap(true)
-            .selectable(true)
-            .xalign(0.0)
-            .margin_top(8)
-            .build();
-        label.add_css_class("monospace");
-        label.add_css_class("caption");
-        expander.set_child(Some(&label));
-        dialog.set_extra_child(Some(&expander));
-    }
-    dialog.add_response("ok", "Close");
-    dialog.present();
-}
-
-/// Settings (§31). Deliberately short: only choices that change behaviour.
-fn show_settings(ui: &Rc<Ui>) {
-    let win = adw::PreferencesWindow::builder()
-        .transient_for(&ui.window)
-        .modal(true)
-        .title("Settings")
-        .search_enabled(false)
-        .build();
-
-    let page = adw::PreferencesPage::new();
-    let group = adw::PreferencesGroup::builder()
-        .title("Conversion")
-        .description("What CheapAzSLA checks before writing a file")
-        .build();
-
-    let current = ui.settings.borrow().clone();
-
-    let warn = adw::SwitchRow::builder()
-        .title("Warn before dropping information")
-        .subtitle("Ask first when the output format cannot hold everything the source has")
-        .active(current.warn_on_information_loss)
-        .build();
-    {
-        let ui = ui.clone();
-        warn.connect_active_notify(move |row| {
-            let mut s = ui.settings.borrow_mut();
-            s.warn_on_information_loss = row.is_active();
-            let _ = s.save();
-        });
-    }
-    group.add(&warn);
-
-    let overwrite = adw::SwitchRow::builder()
-        .title("Confirm before replacing a file")
-        .subtitle("Ask when a file of the same name is already there")
-        .active(current.confirm_overwrite)
-        .build();
-    {
-        let ui = ui.clone();
-        overwrite.connect_active_notify(move |row| {
-            let mut s = ui.settings.borrow_mut();
-            s.confirm_overwrite = row.is_active();
-            let _ = s.save();
-        });
-    }
-    group.add(&overwrite);
-    page.add(&group);
-
-    // Recent output folders, filtered to those still present, so a drive that
-    // has been unplugged is not offered.
-    let recent = current.available_recent_dirs();
-    if !recent.is_empty() {
-        let rg = adw::PreferencesGroup::builder()
-            .title("Recent output folders")
-            .description("Folders converted files were saved to")
-            .build();
-        for dir in recent {
-            let row = adw::ActionRow::builder()
-                .title(dir.display().to_string())
+        let add = |icon: &str, title: String, sub: Option<String>, dir: Option<PathBuf>| {
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+            row_box.set_margin_top(theme::SPACE_2);
+            row_box.set_margin_bottom(theme::SPACE_2);
+            row_box.set_margin_start(theme::SPACE_3);
+            row_box.set_margin_end(theme::SPACE_3);
+            row_box.append(&gtk::Image::from_icon_name(icon));
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            text.set_hexpand(true);
+            text.append(&gtk::Label::builder().label(&title).xalign(0.0).build());
+            if let Some(s) = &sub {
+                let l = gtk::Label::builder().label(s).xalign(0.0).build();
+                l.add_css_class("caption");
+                l.add_css_class("cz-dim");
+                text.append(&l);
+            }
+            row_box.append(&text);
+            let row = gtk::ListBoxRow::builder()
+                .child(&row_box)
                 .activatable(true)
                 .build();
-            let ui2 = ui.clone();
-            let d = dir.clone();
-            let w = win.clone();
-            row.connect_activated(move |_| {
-                set_out_dir(&ui2, Some(d.clone()));
-                w.close();
-            });
-            rg.add(&row);
-        }
-        page.add(&rg);
-    }
-
-    let og = adw::PreferencesGroup::builder()
-        .title("Opening files")
-        .description("Where the Open dialog starts")
-        .build();
-    let open_dir_row = adw::ActionRow::builder()
-        .title("Default folder")
-        .subtitle(
-            current
-                .default_open_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "Wherever the last file was opened from".into()),
-        )
-        .build();
-    let choose = gtk::Button::builder()
-        .label("Choose…")
-        .valign(gtk::Align::Center)
-        .build();
-    let clear_default = gtk::Button::builder()
-        .icon_name("edit-undo-symbolic")
-        .valign(gtk::Align::Center)
-        .tooltip_text("Go back to using the last folder used")
-        .build();
-    clear_default.add_css_class("flat");
-    {
-        let ui = ui.clone();
-        let row = open_dir_row.clone();
-        let parent = win.clone();
-        choose.connect_clicked(move |_| {
-            let dlg = gtk::FileDialog::builder()
-                .title("Default folder for opening files")
-                .build();
-            let ui2 = ui.clone();
-            let row2 = row.clone();
-            dlg.select_folder(Some(&parent), gio::Cancellable::NONE, move |res| {
-                if let Ok(f) = res {
-                    if let Some(path) = f.path() {
-                        row2.set_subtitle(&path.display().to_string());
-                        let mut st = ui2.settings.borrow_mut();
-                        st.default_open_dir = Some(path);
-                        let _ = st.save();
-                    }
+            list.append(&row);
+            let ui3 = ui2.clone();
+            let pop3 = pop2.clone();
+            row.connect_activate(move |_| {
+                match &dir {
+                    Some(d) => set_out_dir(&ui3, Some(d.clone())),
+                    None => choose_folder(&ui3),
                 }
+                pop3.popdown();
             });
-        });
-    }
-    {
-        let ui = ui.clone();
-        let row = open_dir_row.clone();
-        clear_default.connect_clicked(move |_| {
-            let mut st = ui.settings.borrow_mut();
-            st.default_open_dir = None;
-            let _ = st.save();
-            row.set_subtitle("Wherever the last file was opened from");
-        });
-    }
-    open_dir_row.add_suffix(&choose);
-    open_dir_row.add_suffix(&clear_default);
-    og.add(&open_dir_row);
-    page.add(&og);
+        };
 
-    let dg = adw::PreferencesGroup::builder()
-        .title("Drives")
-        .description(
-            "Pin a drive to get a one-click shortcut when converting. Drives are \
-             remembered by name, so it still works when the mount point changes.",
-        )
-        .build();
+        add(
+            "folder-symbolic",
+            "Beside the original".into(),
+            Some("Same folder as each source file".into()),
+            None,
+        );
 
-    let sub_row = adw::EntryRow::builder()
-        .title("Subfolder on pinned drives")
-        .build();
-    sub_row.set_text(&current.pinned_subfolder);
-    {
-        let ui = ui.clone();
-        sub_row.connect_changed(move |row| {
-            let mut st = ui.settings.borrow_mut();
-            st.pinned_subfolder = row.text().trim().trim_matches('/').to_string();
-            let _ = st.save();
-            drop(st);
-            refresh_drive_buttons(&ui);
-        });
-    }
-    dg.add(&sub_row);
+        let recents = ui2.settings.borrow().available_recent_dirs();
+        for dir in recents {
+            add(
+                "document-open-recent-symbolic",
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.display().to_string()),
+                Some(dir.display().to_string()),
+                Some(dir.clone()),
+            );
+        }
 
-    let mounted = drives::mounted();
-    if mounted.is_empty() {
-        let row = adw::ActionRow::builder()
-            .title("No drives detected")
-            .subtitle("Connect a USB drive or SD card and it will appear here")
-            .build();
-        dg.add(&row);
-    } else {
-        for d in &mounted {
-            let space = drives::space(&d.path)
+        let sub = ui2.settings.borrow().pinned_subfolder.clone();
+        for d in drives::mounted() {
+            let icon = if d.removable {
+                "drive-removable-media-symbolic"
+            } else {
+                "drive-harddisk-symbolic"
+            };
+            // A pinned drive with a subfolder set targets that folder, creating
+            // it if needed, rather than the drive root.
+            let target = if ui2.settings.borrow().is_pinned(&d.name) {
+                drives::target_dir(&d.name, &sub).unwrap_or_else(|| d.path.clone())
+            } else {
+                d.path.clone()
+            };
+            let space = drives::space(&target)
                 .map(|(free, total)| {
                     format!(
-                        "{}  ·  {} free of {}",
-                        d.path.display(),
+                        "{} free of {}",
                         render::human_bytes(free),
                         render::human_bytes(total)
                     )
                 })
-                .unwrap_or_else(|| d.path.display().to_string());
-            let row = adw::SwitchRow::builder()
-                .title(&d.name)
-                .subtitle(&space)
-                .active(current.is_pinned(&d.name))
-                .build();
-            if d.removable {
-                row.add_prefix(&gtk::Image::from_icon_name(
-                    "drive-removable-media-symbolic",
-                ));
-            } else {
-                row.add_prefix(&gtk::Image::from_icon_name("drive-harddisk-symbolic"));
-            }
-            let ui2 = ui.clone();
-            let name = d.name.clone();
-            row.connect_active_notify(move |r| {
-                {
-                    let mut st = ui2.settings.borrow_mut();
-                    if r.is_active() {
-                        st.pin_volume(&name);
-                    } else {
-                        st.unpin_volume(&name);
-                    }
-                    let _ = st.save();
+                .unwrap_or_else(|| target.display().to_string());
+            add(icon, d.name.clone(), Some(space), Some(target));
+        }
+
+        add(
+            "folder-open-symbolic",
+            "Choose another location…".into(),
+            None,
+            None,
+        );
+        content2.append(&list);
+    });
+
+    // The default "beside the original" entry is a no-op path; wire the real
+    // chooser separately for the last row.
+    let _ = ui;
+}
+
+fn choose_folder(ui: &Rc<App>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Save converted files to")
+        .modal(true)
+        .build();
+    let ui = ui.clone();
+    dialog.select_folder(
+        Some(&ui.window.clone()),
+        gio::Cancellable::NONE,
+        move |res| {
+            if let Ok(folder) = res {
+                if let Some(path) = folder.path() {
+                    set_out_dir(&ui, Some(path));
                 }
-                refresh_drive_buttons(&ui2);
-            });
-            dg.add(&row);
-        }
-    }
-
-    // Drives pinned earlier that are not connected now.
-    for name in &current.pinned_volumes {
-        if mounted.iter().any(|d| &d.name == name) {
-            continue;
-        }
-        let row = adw::ActionRow::builder()
-            .title(name.as_str())
-            .subtitle("Not connected")
-            .build();
-        row.add_prefix(&gtk::Image::from_icon_name(
-            "drive-removable-media-symbolic",
-        ));
-        row.add_css_class("dim-label");
-        let unpin = gtk::Button::builder()
-            .icon_name("list-remove-symbolic")
-            .valign(gtk::Align::Center)
-            .tooltip_text("Forget this drive")
-            .build();
-        unpin.add_css_class("flat");
-        let ui2 = ui.clone();
-        let n = name.clone();
-        let w = win.clone();
-        unpin.connect_clicked(move |_| {
-            {
-                let mut st = ui2.settings.borrow_mut();
-                st.unpin_volume(&n);
-                let _ = st.save();
             }
-            refresh_drive_buttons(&ui2);
-            w.close();
-        });
-        row.add_suffix(&unpin);
-        dg.add(&row);
-    }
-    page.add(&dg);
-
-    let sg = adw::PreferencesGroup::builder().title("Storage").build();
-    let loc = adw::ActionRow::builder()
-        .title("Settings file")
-        .subtitle(
-            Settings::path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "not available".into()),
-        )
-        .build();
-    sg.add(&loc);
-    page.add(&sg);
-
-    win.add(&page);
-    win.present();
+        },
+    );
 }
 
-fn show_about(ui: &Rc<Ui>) {
-    let formats: Vec<String> = registry::readable()
-        .iter()
-        .map(|i| format!("{} (.{})", i.name, i.extension))
-        .collect();
-    let about = adw::AboutWindow::builder()
-        .transient_for(&ui.window)
-        .application_name("CheapAzSLA")
-        .application_icon("document-open-symbolic")
-        .developer_name("CheapAzHobbies")
-        .version(cheapazsla_core::VERSION)
-        .comments(format!(
-            "Resin print file converter and inspector.\n\nReadable formats: {}\n\nWriting is not implemented yet.",
-            formats.join(", ")
-        ))
-        .website("https://github.com/CheapAzHobbies/CheapAzSLA")
-        .license_type(gtk::License::Gpl30)
-        .build();
-    about.present();
-}
-
-/// Wire up the conversion controls.
-fn wire_convert(
-    ui: &Rc<Ui>,
-    convert_btn: &gtk::Button,
-    pick_dir: &gtk::Button,
-    reset_dir: &gtk::Button,
-) {
-    {
-        let ui = ui.clone();
-        convert_btn.connect_clicked(move |_| start_convert(&ui));
-    }
-    {
-        let ui = ui.clone();
-        pick_dir.connect_clicked(move |_| {
-            // Native folder picker: USB drives, SD cards and network shares
-            // all appear through the desktop portal, so nothing is hardcoded.
-            let dialog = gtk::FileDialog::builder()
-                .title("Save converted files to")
-                .modal(true)
-                .build();
-            let ui2 = ui.clone();
-            dialog.select_folder(
-                Some(&ui.window.clone()),
-                gio::Cancellable::NONE,
-                move |res| {
-                    if let Ok(folder) = res {
-                        if let Some(path) = folder.path() {
-                            set_out_dir(&ui2, Some(path));
-                        }
-                    }
-                },
-            );
-        });
-    }
-    {
-        let ui = ui.clone();
-        reset_dir.connect_clicked(move |_| set_out_dir(&ui, None));
-    }
-    {
-        // Changing the output format re-suggests the filename, unless the user
-        // has already typed something of their own.
-        let ui = ui.clone();
-        ui.format_row.clone().connect_selected_notify(move |_| {
-            let current = ui.name_row.text().to_string();
-            let untouched = with_loaded(|l| l.path.clone())
-                .and_then(|src| {
-                    let idx_ids = ui.writable.borrow();
-                    idx_ids
-                        .iter()
-                        .filter_map(|id| convert::destination_for(&src, id, None))
-                        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                        .find(|n| *n == current)
-                        .map(|_| ())
-                })
-                .is_some();
-            if current.is_empty() || untouched {
-                suggest_name(&ui);
-            }
-        });
-    }
-}
-
-/// Fill the filename box with a name derived from the source and the chosen
-/// output format. Only the extension changes; the stem is preserved (§27).
-fn suggest_name(ui: &Rc<Ui>) {
-    let Some(source) = with_loaded(|l| l.path.clone()) else {
-        return;
-    };
-    let idx = ui.format_row.selected() as usize;
-    let Some(&format_id) = ui.writable.borrow().get(idx) else {
-        return;
-    };
-    if let Some(p) = convert::destination_for(&source, format_id, None) {
-        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            ui.name_row.set_text(name);
-        }
-    }
-}
-
-fn set_out_dir(ui: &Rc<Ui>, dir: Option<PathBuf>) {
+fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
     match &dir {
         Some(d) => {
-            let free = free_space(d)
-                .map(|b| format!("  ·  {} free", render::human_bytes(b)))
-                .unwrap_or_default();
-            ui.dest_row.set_subtitle(&format!("{}{free}", d.display()));
+            ui.dest_label.set_text(
+                &d.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| d.display().to_string()),
+            );
+            let detail = drives::space(d)
+                .map(|(free, _)| {
+                    format!(
+                        "{}  ·  {} available",
+                        d.display(),
+                        render::human_bytes(free)
+                    )
+                })
+                .unwrap_or_else(|| d.display().to_string());
+            ui.dest_detail.set_text(&detail);
         }
-        None => ui.dest_row.set_subtitle("Beside the original"),
+        None => {
+            ui.dest_label.set_text("Beside the original");
+            ui.dest_detail.set_text("Same folder as each source file");
+        }
     }
     *ui.out_dir.borrow_mut() = dir;
+    suggest_name(ui);
+    revalidate(ui);
 }
 
-/// Free space on the filesystem holding `dir`, when the OS will say.
-fn free_space(dir: &Path) -> Option<u64> {
-    let info = gio::File::for_path(dir)
-        .query_filesystem_info("filesystem::free", gio::Cancellable::NONE)
-        .ok()?;
-    Some(info.attribute_uint64("filesystem::free"))
+fn suggest_name(ui: &Rc<App>) {
+    let files = ui.files.borrow();
+    let Some(f) = files.get(*ui.selected.borrow()) else {
+        return;
+    };
+    let Some(format) = ui.output_picker.selected() else {
+        return;
+    };
+    // A single file gets an editable name; a batch is named per source, so the
+    // field would be meaningless (§17).
+    let single = files.len() == 1;
+    ui.name_row.set_visible(single);
+    if !single {
+        return;
+    }
+    if let Some(p) = convert::destination_for(&f.path, format, None) {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            ui.name_entry.set_text(name);
+        }
+    }
 }
 
-fn start_convert(ui: &Rc<Ui>) {
-    let Some(source) = with_loaded(|l| l.path.clone()) else {
-        return;
-    };
-    let idx = ui.format_row.selected() as usize;
-    let Some(&format_id) = ui.writable.borrow().get(idx) else {
-        return;
-    };
-
+/// Work out the destination for one queued file.
+fn destination_for(ui: &Rc<App>, file: &Queued, format: &str) -> Option<PathBuf> {
     let out_dir = ui.out_dir.borrow().clone();
-    let Some(generated) = convert::destination_for(&source, format_id, out_dir.as_deref()) else {
-        ui.toasts
-            .add_toast(adw::Toast::new("Could not work out a destination filename"));
-        return;
-    };
-    // Whatever the user typed wins, but a name is required and it must stay a
-    // filename rather than becoming a path.
-    let typed = ui.name_row.text().trim().to_string();
-    let desired = if typed.is_empty() || typed.contains('/') {
-        if typed.contains('/') {
-            ui.toasts
-                .add_toast(adw::Toast::new("The file name cannot contain a slash"));
-            return;
-        }
-        generated
+    let generated = convert::destination_for(&file.path, format, out_dir.as_deref())?;
+    if ui.files.borrow().len() != 1 {
+        return Some(generated);
+    }
+    let typed = ui.name_entry.text().trim().to_string();
+    if typed.is_empty() {
+        return Some(generated);
+    }
+    let want = registry::by_id(format)?.info().extension;
+    let name = if Path::new(&typed)
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case(want))
+        .unwrap_or(false)
+    {
+        typed
     } else {
-        let dir = generated
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        // Keep the extension matching the chosen format if the user dropped it.
-        let want_ext = registry::by_id(format_id)
-            .map(|h| h.info().extension)
-            .unwrap_or("");
-        let name = if Path::new(&typed)
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case(want_ext))
-            .unwrap_or(false)
-        {
-            typed
-        } else {
-            format!("{typed}.{want_ext}")
-        };
-        dir.join(name)
+        format!("{typed}.{want}")
     };
+    Some(generated.parent()?.join(name))
+}
 
-    // Destination must exist and be writable before anything else (§ storage).
-    let dir = desired.parent().unwrap_or(Path::new("."));
-    if !dir.exists() {
-        unavailable_dialog(ui, dir);
+/// Check everything that could stop a conversion and say so beside the
+/// control, rather than waiting for the user to press Convert (§30).
+fn revalidate(ui: &Rc<App>) {
+    if *ui.converting.borrow() {
         return;
     }
-    if !writable(dir) {
-        let d = adw::MessageDialog::builder()
-            .transient_for(&ui.window)
-            .modal(true)
-            .heading("Cannot write to this location")
-            .body(format!(
-                "CheapAzSLA does not have permission to save files in {}.\n\nChoose another location.",
-                dir.display()
-            ))
-            .build();
-        d.add_response("ok", "Close");
-        d.present();
-        return;
-    }
-
-    let plan = match convert::plan(&source, format_id, &desired) {
-        Ok(p) => p,
-        Err(e) => {
-            error_dialog(ui, "This conversion is not possible.", &e.to_string());
-            return;
+    let problem = check(ui);
+    match &problem {
+        Some(msg) => {
+            ui.problem_label.set_text(msg);
+            ui.problem.set_visible(true);
+            ui.convert_btn.set_sensitive(false);
         }
-    };
+        None => {
+            ui.problem.set_visible(false);
+            ui.convert_btn.set_sensitive(true);
+        }
+    }
+    let n = ui.files.borrow().len();
+    ui.convert_label.set_text(&if n > 1 {
+        format!("Convert {n} Files")
+    } else {
+        "Convert".to_string()
+    });
+}
 
-    // Existing file: replace, keep both, or cancel (§27).
-    if desired.exists() {
-        let d = adw::MessageDialog::builder()
-            .transient_for(&ui.window)
-            .modal(true)
-            .heading("File already exists")
-            .body(format!("{} is already in that folder.", name_of(&desired)))
-            .build();
-        d.add_response("cancel", "Cancel");
-        d.add_response("both", "Keep Both");
-        d.add_response("replace", "Replace");
-        d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
-        d.set_default_response(Some("both"));
-        let ui2 = ui.clone();
-        let plan2 = plan.clone();
-        d.connect_response(None, move |dlg, resp| {
-            dlg.close();
-            let mut p = plan2.clone();
-            match resp {
-                "replace" => {}
-                "both" => p.destination = convert::unique_path(&p.destination),
-                _ => return,
-            }
-            confirm_losses_then_run(&ui2, p);
-        });
-        d.present();
-        return;
+fn check(ui: &Rc<App>) -> Option<String> {
+    let files = ui.files.borrow();
+    if files.is_empty() {
+        return Some("Add a file to convert.".into());
+    }
+    if files.iter().all(|f| f.opened.is_none()) {
+        return Some("Waiting for the file to be read.".into());
+    }
+    let format = ui.output_picker.selected()?;
+
+    let typed = ui.name_entry.text();
+    if files.len() == 1 && typed.contains('/') {
+        return Some("The file name cannot contain a slash.".into());
     }
 
-    confirm_losses_then_run(ui, plan);
+    // Where would the output go, and can it?
+    let first = files.iter().find(|f| f.opened.is_some())?;
+    let dest = destination_for(ui, first, format)?;
+    let dir = dest.parent()?.to_path_buf();
+    if !dir.is_dir() {
+        return Some(format!(
+            "{} is not available. If it is a removable drive, reconnect it or choose another location.",
+            dir.display()
+        ));
+    }
+    if !writable(&dir) {
+        return Some(format!(
+            "Cannot write to {}. Choose another location.",
+            dir.display()
+        ));
+    }
+
+    // Rough size estimate: an output is broadly the size of its input, so this
+    // catches the obviously impossible without pretending to be exact.
+    if let Some((free, _)) = drives::space(&dir) {
+        let needed: u64 = files.iter().map(|f| f.size).sum();
+        if needed > free {
+            return Some(format!(
+                "Not enough space: about {} needed, {} available.",
+                render::human_bytes(needed),
+                render::human_bytes(free)
+            ));
+        }
+    }
+
+    // Same format in and out is not an error, but it is almost never intended.
+    if files.len() == 1 && first.format == format {
+        return Some(format!(
+            "This file is already {}. Choose a different output format.",
+            format.to_uppercase()
+        ));
+    }
+    None
 }
 
 fn writable(dir: &Path) -> bool {
@@ -1555,175 +1687,698 @@ fn writable(dir: &Path) -> bool {
     }
 }
 
-fn unavailable_dialog(ui: &Rc<Ui>, dir: &Path) {
+// ---------------------------------------------------------------------------
+// conversion
+// ---------------------------------------------------------------------------
+
+fn start_convert(ui: &Rc<App>) {
+    if *ui.converting.borrow() || check(ui).is_some() {
+        return;
+    }
+    let Some(format) = ui.output_picker.selected() else {
+        return;
+    };
+
+    // Build every plan up front so information loss and existing files can be
+    // dealt with once, rather than interrupting halfway through a batch.
+    let mut plans = Vec::new();
+    let mut losses: Vec<String> = Vec::new();
+    let mut existing: Vec<PathBuf> = Vec::new();
+    {
+        let files = ui.files.borrow();
+        for f in files.iter() {
+            if f.opened.is_none() {
+                continue;
+            }
+            let Some(dest) = destination_for(ui, f, format) else {
+                continue;
+            };
+            match convert::plan(&f.path, format, &dest) {
+                Ok(p) => {
+                    for l in &p.losses {
+                        let line = format!("{} — {}", l.what, l.because);
+                        if !losses.contains(&line) {
+                            losses.push(line);
+                        }
+                    }
+                    if dest.exists() {
+                        existing.push(dest.clone());
+                    }
+                    plans.push((f.path.clone(), p));
+                }
+                Err(e) => {
+                    ui.toasts
+                        .add_toast(adw::Toast::new(&format!("{}: {e}", f.name())));
+                }
+            }
+        }
+    }
+    if plans.is_empty() {
+        return;
+    }
+
+    let warn = ui.settings.borrow().warn_on_information_loss;
+    let ui2 = ui.clone();
+    let proceed = move |plans: Vec<(PathBuf, convert::Plan)>| run_batch(&ui2, plans);
+
+    if !existing.is_empty() && ui.settings.borrow().confirm_overwrite {
+        ask_overwrite(ui, plans, existing, losses, warn, Box::new(proceed));
+    } else if warn && !losses.is_empty() {
+        ask_losses(ui, plans, losses, Box::new(proceed));
+    } else {
+        proceed(plans);
+    }
+}
+
+type Proceed = Box<dyn Fn(Vec<(PathBuf, convert::Plan)>)>;
+
+fn ask_overwrite(
+    ui: &Rc<App>,
+    plans: Vec<(PathBuf, convert::Plan)>,
+    existing: Vec<PathBuf>,
+    losses: Vec<String>,
+    warn: bool,
+    proceed: Proceed,
+) {
+    let body = if existing.len() == 1 {
+        format!("{} is already in that folder.", name_of(&existing[0]))
+    } else {
+        format!("{} files are already in that folder.", existing.len())
+    };
     let d = adw::MessageDialog::builder()
         .transient_for(&ui.window)
         .modal(true)
-        .heading("Output location unavailable")
-        .body(format!(
-            "{} is not there any more. If it was a removable drive, reconnect it or choose another location.",
-            dir.display()
-        ))
+        .heading("Some files already exist")
+        .body(body)
         .build();
-    d.add_response("ok", "Close");
+    d.add_response("cancel", "Cancel");
+    d.add_response("both", "Keep Both");
+    d.add_response("replace", "Replace");
+    d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("both"));
+
+    let ui2 = ui.clone();
+    let proceed = Rc::new(proceed);
+    d.connect_response(None, move |dlg, resp| {
+        dlg.close();
+        let mut plans = plans.clone();
+        match resp {
+            "replace" => {}
+            "both" => {
+                for (_, p) in plans.iter_mut() {
+                    p.destination = convert::unique_path(&p.destination);
+                }
+            }
+            _ => return,
+        }
+        if warn && !losses.is_empty() {
+            ask_losses(
+                &ui2,
+                plans,
+                losses.clone(),
+                Box::new({
+                    let p = proceed.clone();
+                    move |plans| p(plans)
+                }),
+            );
+        } else {
+            proceed(plans);
+        }
+    });
     d.present();
 }
 
-/// Show what the destination format cannot carry, then convert (§14, §29).
-fn confirm_losses_then_run(ui: &Rc<Ui>, plan: convert::Plan) {
-    // Lossless, or the user has said they do not want to be asked again.
-    if plan.is_lossless() || !ui.settings.borrow().warn_on_information_loss {
-        run_convert(ui, plan);
-        return;
-    }
-    let body = plan
-        .losses
+fn ask_losses(
+    ui: &Rc<App>,
+    plans: Vec<(PathBuf, convert::Plan)>,
+    losses: Vec<String>,
+    proceed: Proceed,
+) {
+    let body = losses
         .iter()
-        .map(|l| format!("• {}\n   {}", l.what, l.because))
+        .map(|l| format!("• {l}"))
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n");
     let d = adw::MessageDialog::builder()
         .transient_for(&ui.window)
         .modal(true)
         .heading("Some information cannot be preserved")
-        .body(format!(
-            "Converting {} to {} will drop:\n\n{body}",
-            plan.from.name, plan.to.name
-        ))
+        .body(format!("Converting will drop:\n\n{body}"))
         .build();
-
     let dont_ask = gtk::CheckButton::with_label("Do not ask me again");
-    dont_ask.set_tooltip_text(Some(
-        "Future conversions will go ahead without this warning. \
-         You can turn it back on in Settings.",
-    ));
-    dont_ask.set_margin_top(12);
+    dont_ask.set_tooltip_text(Some("You can turn this back on in Settings."));
+    dont_ask.set_margin_top(theme::SPACE_3);
     d.set_extra_child(Some(&dont_ask));
-
     d.add_response("cancel", "Cancel");
     d.add_response("go", "Convert Anyway");
     d.set_response_appearance("go", adw::ResponseAppearance::Suggested);
     d.set_default_response(Some("go"));
+
     let ui2 = ui.clone();
-    let check = dont_ask.clone();
     d.connect_response(None, move |dlg, resp| {
         dlg.close();
         if resp != "go" {
             return;
         }
-        // Only remember the choice when the user actually proceeded. Ticking
-        // the box and then cancelling should not silence future warnings.
-        if check.is_active() {
+        // Only remembered when the user actually proceeded: ticking the box
+        // then cancelling should not silence future warnings.
+        if dont_ask.is_active() {
             let mut s = ui2.settings.borrow_mut();
             s.warn_on_information_loss = false;
             let _ = s.save();
         }
-        run_convert(&ui2, plan.clone());
+        proceed(plans.clone());
     });
     d.present();
 }
 
-fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
-    let format_id = plan.to.id;
+fn name_of(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+fn run_batch(ui: &Rc<App>, plans: Vec<(PathBuf, convert::Plan)>) {
+    *ui.converting.borrow_mut() = true;
     ui.convert_btn.set_sensitive(false);
+    ui.convert_label.set_text("Converting…");
+    ui.problem.set_visible(false);
     ui.progress.set_visible(true);
     ui.progress.set_fraction(0.0);
-    ui.progress
-        .set_text(Some(&format!("Preparing {} layers…", plan.layer_count)));
-
-    // Progress arrives from the worker as (done, total). The channel is
-    // unbounded and sent to without blocking, so reporting can never slow the
-    // conversion down; dropping an update just means one fewer redraw.
-    let (ptx, prx) = async_channel::unbounded::<(u32, u32)>();
-    let (dtx, drx) = async_channel::bounded(1);
-
     ui.penguin.start();
 
-    let dest = plan.destination.clone();
-    let total = plan.layer_count;
+    let total_files = plans.len();
+    {
+        // Mark everything queued as in progress, so the list reflects what is
+        // happening rather than staying on "Ready" throughout.
+        let sources: Vec<PathBuf> = plans.iter().map(|(s, _)| s.clone()).collect();
+        let mut files = ui.files.borrow_mut();
+        for f in files.iter_mut() {
+            if sources.contains(&f.path) {
+                f.status = Status::Converting;
+            }
+        }
+    }
+    refresh_queue(ui);
+    let (ptx, prx) = async_channel::unbounded::<(usize, String, u32, u32)>();
+    let (dtx, drx) = async_channel::bounded(1);
+
     std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let result = convert::run_with_progress(&plan, move |done, total| {
-            let _ = ptx.try_send((done, total));
-        })
-        .map(|_| started.elapsed());
-        let _ = dtx.send_blocking(result);
+        let mut results: Vec<(PathBuf, convert::Plan, Result<std::time::Duration, String>)> =
+            Vec::new();
+        for (i, (source, plan)) in plans.into_iter().enumerate() {
+            let name = plan
+                .destination
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let tx = ptx.clone();
+            let n = name.clone();
+            let started = std::time::Instant::now();
+            let outcome = convert::run_with_progress(&plan, move |done, total| {
+                let _ = tx.try_send((i, n.clone(), done, total));
+            })
+            .map(|_| started.elapsed())
+            .map_err(|e| e.to_string());
+            results.push((source, plan, outcome));
+        }
+        drop(ptx);
+        let _ = dtx.send_blocking(results);
     });
 
-    // Progress updates.
     {
         let ui = ui.clone();
         let started = std::time::Instant::now();
         glib::spawn_future_local(async move {
-            while let Ok((done, total)) = prx.recv().await {
+            while let Ok((index, name, done, total)) = prx.recv().await {
                 if total == 0 {
                     continue;
                 }
-                let fraction = done as f64 / total as f64;
-                ui.progress.set_fraction(fraction);
+                let within = done as f64 / total as f64;
+                let overall = (index as f64 + within) / total_files as f64;
+                ui.progress.set_fraction(overall);
                 let elapsed = started.elapsed().as_secs_f64();
-                // Only estimate once there is enough signal to be worth
-                // showing; an estimate from one layer is noise.
-                let text = if done >= 3 && fraction > 0.0 {
-                    let remaining = elapsed / fraction - elapsed;
+                let text = if overall > 0.02 {
+                    let remaining = elapsed / overall - elapsed;
                     format!(
-                        "Layer {done} of {total}  ·  {:.0}%  ·  about {} left",
-                        fraction * 100.0,
+                        "{name}  ·  layer {done} of {total}  ·  about {} left",
                         render::human_time(remaining.max(0.0).round() as u64)
                     )
                 } else {
-                    format!("Layer {done} of {total}  ·  {:.0}%", fraction * 100.0)
+                    format!("{name}  ·  layer {done} of {total}")
                 };
                 ui.progress.set_text(Some(&text));
+                if total_files > 1 {
+                    ui.convert_label
+                        .set_text(&format!("Converting {} of {total_files}…", index + 1));
+                }
             }
         });
     }
 
-    // Completion.
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let outcome = drx.recv().await;
+        let Ok(results) = drx.recv().await else {
+            return;
+        };
         ui.penguin.stop();
         ui.progress.set_visible(false);
-        ui.convert_btn.set_sensitive(true);
-        match outcome {
-            Ok(Ok(elapsed)) => {
-                {
-                    let mut s = ui.settings.borrow_mut();
-                    if let Some(parent) = dest.parent() {
-                        s.remember_output_dir(parent);
+        *ui.converting.borrow_mut() = false;
+
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        let mut last_dest: Option<PathBuf> = None;
+        {
+            let mut files = ui.files.borrow_mut();
+            let mut hist = ui.history.borrow_mut();
+            for (source, plan, outcome) in &results {
+                let entry_status = match outcome {
+                    Ok(_) => {
+                        ok += 1;
+                        last_dest = Some(plan.destination.clone());
+                        Status::Complete(plan.destination.clone())
                     }
-                    s.last_output_format = Some(format_id.to_string());
-                    let _ = s.save();
-                }
-                let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                let rate = if elapsed.as_secs_f32() > 0.0 {
-                    format!(", {:.0} layers/s", total as f32 / elapsed.as_secs_f32())
-                } else {
-                    String::new()
+                    Err(e) => {
+                        failed += 1;
+                        Status::Failed(e.clone())
+                    }
                 };
-                let toast = adw::Toast::builder()
-                    .title(format!(
-                        "Converted to {} ({}, {:.1}s{rate})",
-                        name_of(&dest),
-                        render::human_bytes(size),
-                        elapsed.as_secs_f32()
-                    ))
-                    .button_label("Open Folder")
-                    .timeout(8)
-                    .build();
-                let d = dest.clone();
-                toast.connect_button_clicked(move |_| {
-                    if let Some(parent) = d.parent() {
-                        let uri = gio::File::for_path(parent).uri();
-                        let _ =
-                            gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
-                    }
+                if let Some(f) = files.iter_mut().find(|f| &f.path == source) {
+                    f.status = entry_status;
+                }
+                hist.record(history::Entry {
+                    when: history::now(),
+                    source: source.clone(),
+                    destination: plan.destination.clone(),
+                    from_format: plan.from.id.to_string(),
+                    to_format: plan.to.id.to_string(),
+                    layers: plan.layer_count,
+                    outcome: match outcome {
+                        Ok(_) => history::Outcome::Complete,
+                        Err(_) => history::Outcome::Failed,
+                    },
+                    detail: outcome.as_ref().err().cloned().unwrap_or_default(),
                 });
-                ui.toasts.add_toast(toast);
             }
-            Ok(Err(e)) => error_dialog(&ui, "The conversion failed.", &e.to_string()),
-            Err(_) => {}
         }
+
+        if let Some(dest) = last_dest.as_ref().and_then(|d| d.parent()) {
+            let mut s = ui.settings.borrow_mut();
+            s.remember_output_dir(dest);
+            let _ = s.save();
+        }
+
+        refresh_queue(&ui);
+        refresh_history(&ui);
+        ui.convert_label.set_text("Convert");
+        revalidate(&ui);
+
+        let title = match (ok, failed) {
+            (1, 0) => "Conversion complete".to_string(),
+            (n, 0) => format!("{n} files converted"),
+            (0, n) => format!("{n} failed"),
+            (a, b) => format!("{a} converted, {b} failed"),
+        };
+        let toast = adw::Toast::builder().title(title).timeout(6).build();
+        if let Some(dest) = last_dest {
+            toast.set_button_label(Some("Open Folder"));
+            toast.connect_button_clicked(move |_| {
+                if let Some(parent) = dest.parent() {
+                    let uri = gio::File::for_path(parent).uri();
+                    let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                }
+            });
+        }
+        ui.toasts.add_toast(toast);
     });
+}
+
+// ---------------------------------------------------------------------------
+// history
+// ---------------------------------------------------------------------------
+
+fn refresh_history(ui: &Rc<App>) {
+    while let Some(row) = ui.history_list.first_child() {
+        ui.history_list.remove(&row);
+    }
+    let entries = ui.history.borrow().entries.clone();
+    if entries.is_empty() {
+        ui.history_stack.set_visible_child_name("empty");
+        return;
+    }
+    ui.history_stack.set_visible_child_name("list");
+
+    for (i, e) in entries.iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+        row.set_margin_top(theme::SPACE_2);
+        row.set_margin_bottom(theme::SPACE_2);
+        row.set_margin_start(theme::SPACE_3);
+        row.set_margin_end(theme::SPACE_2);
+
+        let icon = gtk::Image::from_icon_name(match e.outcome {
+            history::Outcome::Complete => "object-select-symbolic",
+            history::Outcome::Failed => "dialog-error-symbolic",
+        });
+        icon.add_css_class(match e.outcome {
+            history::Outcome::Complete => "cz-ok",
+            history::Outcome::Failed => "cz-error",
+        });
+        row.append(&icon);
+
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        text.set_hexpand(true);
+        let title = gtk::Label::builder()
+            .label(format!("{} → {}", e.source_name(), e.destination_name()))
+            .xalign(0.0)
+            .build();
+        title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        let sub = gtk::Label::builder()
+            .label(format!(
+                "{} → {}  ·  {} layers  ·  {}",
+                e.from_format.to_uppercase(),
+                e.to_format.to_uppercase(),
+                e.layers,
+                ago(e.when)
+            ))
+            .xalign(0.0)
+            .build();
+        sub.add_css_class("caption");
+        sub.add_css_class("cz-dim");
+        text.append(&title);
+        text.append(&sub);
+        row.append(&text);
+
+        // A deleted output is stated rather than offered and then failing.
+        if e.output_exists() {
+            let open = shell::icon_button("folder-open-symbolic", "Open containing folder");
+            let dest = e.destination.clone();
+            open.connect_clicked(move |_| {
+                if let Some(parent) = dest.parent() {
+                    let uri = gio::File::for_path(parent).uri();
+                    let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                }
+            });
+            row.append(&open);
+        } else {
+            let missing = shell::status_chip("dialog-warning-symbolic", "Moved", "cz-dim");
+            missing.set_tooltip_text(Some(&format!(
+                "{} is not there any more",
+                e.destination.display()
+            )));
+            row.append(&missing);
+        }
+
+        let remove = shell::icon_button("window-close-symbolic", "Remove from history");
+        let ui2 = ui.clone();
+        remove.connect_clicked(move |_| {
+            ui2.history.borrow_mut().remove(i);
+            refresh_history(&ui2);
+        });
+        row.append(&remove);
+
+        ui.history_list
+            .append(&gtk::ListBoxRow::builder().child(&row).build());
+    }
+
+    let clear = gtk::Button::builder().halign(gtk::Align::Start).build();
+    clear.set_child(Some(&labelled_icon("user-trash-symbolic", "Clear History")));
+    clear.add_css_class("flat");
+    clear.add_css_class("cz-destructive");
+    let ui2 = ui.clone();
+    clear.connect_clicked(move |_| {
+        ui2.history.borrow_mut().clear();
+        refresh_history(&ui2);
+    });
+    ui.history_list.append(
+        &gtk::ListBoxRow::builder()
+            .child(&clear)
+            .selectable(false)
+            .build(),
+    );
+}
+
+/// Rough, readable relative time. Exactness is not the point here.
+fn ago(when: u64) -> String {
+    let now = history::now();
+    let d = now.saturating_sub(when);
+    match d {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86399 => format!("{}h ago", d / 3600),
+        86400..=172_799 => "yesterday".to_string(),
+        _ => format!("{} days ago", d / 86400),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// settings page
+// ---------------------------------------------------------------------------
+
+fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
+    let page = adw::PreferencesPage::new();
+
+    let conversion = adw::PreferencesGroup::builder()
+        .title("Conversion")
+        .description("What CheapAzSLA checks before writing a file")
+        .build();
+    let current = ui.settings.borrow().clone();
+
+    let warn = adw::SwitchRow::builder()
+        .title("Warn before dropping information")
+        .subtitle("Ask first when the output format cannot hold everything the source has")
+        .active(current.warn_on_information_loss)
+        .build();
+    {
+        let ui = ui.clone();
+        warn.connect_active_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.warn_on_information_loss = r.is_active();
+            let _ = s.save();
+        });
+    }
+    conversion.add(&warn);
+
+    let overwrite = adw::SwitchRow::builder()
+        .title("Confirm before replacing a file")
+        .subtitle("Ask when a file of the same name is already there")
+        .active(current.confirm_overwrite)
+        .build();
+    {
+        let ui = ui.clone();
+        overwrite.connect_active_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.confirm_overwrite = r.is_active();
+            let _ = s.save();
+        });
+    }
+    conversion.add(&overwrite);
+    page.add(&conversion);
+
+    let opening = adw::PreferencesGroup::builder()
+        .title("Opening files")
+        .description("Where the file chooser starts")
+        .build();
+    let open_row = adw::ActionRow::builder()
+        .title("Default folder")
+        .subtitle(
+            current
+                .default_open_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Wherever the last file was opened from".into()),
+        )
+        .build();
+    let choose = gtk::Button::builder()
+        .label("Choose…")
+        .valign(gtk::Align::Center)
+        .build();
+    let reset = shell::icon_button("edit-undo-symbolic", "Use the last folder instead");
+    {
+        let ui = ui.clone();
+        let row = open_row.clone();
+        choose.connect_clicked(move |_| {
+            let dlg = gtk::FileDialog::builder().title("Default folder").build();
+            let ui2 = ui.clone();
+            let row2 = row.clone();
+            dlg.select_folder(
+                Some(&ui.window.clone()),
+                gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(f) = res {
+                        if let Some(p) = f.path() {
+                            row2.set_subtitle(&p.display().to_string());
+                            let mut s = ui2.settings.borrow_mut();
+                            s.default_open_dir = Some(p);
+                            let _ = s.save();
+                        }
+                    }
+                },
+            );
+        });
+    }
+    {
+        let ui = ui.clone();
+        let row = open_row.clone();
+        reset.connect_clicked(move |_| {
+            let mut s = ui.settings.borrow_mut();
+            s.default_open_dir = None;
+            let _ = s.save();
+            row.set_subtitle("Wherever the last file was opened from");
+        });
+    }
+    open_row.add_suffix(&choose);
+    open_row.add_suffix(&reset);
+    opening.add(&open_row);
+    page.add(&opening);
+
+    let drives_group = adw::PreferencesGroup::builder()
+        .title("Drives")
+        .description(
+            "Pinned drives appear in the Save to menu. They are remembered by name, \
+             so they still work when the mount point changes.",
+        )
+        .build();
+    let sub_row = adw::EntryRow::builder()
+        .title("Subfolder on pinned drives")
+        .build();
+    sub_row.set_text(&current.pinned_subfolder);
+    {
+        let ui = ui.clone();
+        sub_row.connect_changed(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.pinned_subfolder = r.text().trim().trim_matches('/').to_string();
+            let _ = s.save();
+        });
+    }
+    drives_group.add(&sub_row);
+
+    let mounted = drives::mounted();
+    if mounted.is_empty() {
+        drives_group.add(
+            &adw::ActionRow::builder()
+                .title("No drives detected")
+                .subtitle("Connect a USB drive or SD card and it will appear here")
+                .build(),
+        );
+    }
+    for d in &mounted {
+        let space = drives::space(&d.path)
+            .map(|(free, total)| {
+                format!(
+                    "{}  ·  {} free of {}",
+                    d.path.display(),
+                    render::human_bytes(free),
+                    render::human_bytes(total)
+                )
+            })
+            .unwrap_or_else(|| d.path.display().to_string());
+        let row = adw::SwitchRow::builder()
+            .title(&d.name)
+            .subtitle(&space)
+            .active(current.is_pinned(&d.name))
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name(if d.removable {
+            "drive-removable-media-symbolic"
+        } else {
+            "drive-harddisk-symbolic"
+        }));
+        let ui2 = ui.clone();
+        let name = d.name.clone();
+        row.connect_active_notify(move |r| {
+            let mut s = ui2.settings.borrow_mut();
+            if r.is_active() {
+                s.pin_volume(&name);
+            } else {
+                s.unpin_volume(&name);
+            }
+            let _ = s.save();
+        });
+        drives_group.add(&row);
+    }
+    page.add(&drives_group);
+
+    let about = adw::PreferencesGroup::builder().title("About").build();
+    about.add(
+        &adw::ActionRow::builder()
+            .title("CheapAzSLA")
+            .subtitle(format!("Version {}", cheapazsla_core::VERSION))
+            .build(),
+    );
+    let formats: Vec<String> = registry::handlers()
+        .iter()
+        .map(|h| {
+            let i = h.info();
+            let mut caps = Vec::new();
+            if i.capabilities.reads {
+                caps.push("read");
+            }
+            if i.capabilities.writes {
+                caps.push("write");
+            }
+            format!("{} ({})", i.name, caps.join(", "))
+        })
+        .collect();
+    about.add(
+        &adw::ActionRow::builder()
+            .title("Supported formats")
+            .subtitle(formats.join("\n"))
+            .build(),
+    );
+    let repo = adw::ActionRow::builder()
+        .title("Source code")
+        .subtitle("github.com/CheapAzHobbies/CheapAzSLA")
+        .activatable(true)
+        .build();
+    repo.connect_activated(|_| {
+        let _ = gio::AppInfo::launch_default_for_uri(
+            "https://github.com/CheapAzHobbies/CheapAzSLA",
+            gio::AppLaunchContext::NONE,
+        );
+    });
+    about.add(&repo);
+    let settings_file = adw::ActionRow::builder()
+        .title("Settings file")
+        .subtitle(
+            Settings::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not available".into()),
+        )
+        .build();
+    about.add(&settings_file);
+    page.add(&about);
+
+    container.append(&page);
+}
+
+/// Restore what the last session was doing (§37: does it remember?).
+fn restore_session(ui: &Rc<App>) {
+    let saved = ui.settings.borrow().clone();
+
+    // Recently used formats feed the picker's own section.
+    let mut recents: Vec<String> = Vec::new();
+    if let Some(f) = saved.last_output_format.clone() {
+        recents.push(f);
+    }
+    for e in ui.history.borrow().entries.iter().take(12) {
+        if !recents.contains(&e.to_format) {
+            recents.push(e.to_format.clone());
+        }
+    }
+    ui.output_picker.set_recents(recents);
+
+    let chosen = saved
+        .last_output_format
+        .filter(|id| registry::by_id(id).map(|h| h.info().capabilities.writes) == Some(true))
+        .or_else(|| registry::writable().first().map(|i| i.id.to_string()));
+    if let Some(id) = chosen {
+        ui.output_picker.set_selected(&id);
+    }
+
+    // A remembered folder is only restored if it is still there.
+    if let Some(dir) = saved.last_output_dir.filter(|d| d.is_dir()) {
+        set_out_dir(ui, Some(dir));
+    } else {
+        set_out_dir(ui, None);
+    }
+    revalidate(ui);
 }
