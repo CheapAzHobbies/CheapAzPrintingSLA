@@ -169,9 +169,14 @@ sudo zypper install gtk4-devel libadwaita-devel
 Then:
 
 ```bash
+git clone https://github.com/CheapAzHobbies/CheapAzPrintingSLA.git
+cd CheapAzPrintingSLA
 cargo build --release
 cargo test
 ```
+
+The application is `CheapAzSLA`; the repository is `CheapAzPrintingSLA`, which
+keeps it beside the other CheapAzPrinting work.
 
 Tests that need a real slicer file are skipped unless you point at one:
 

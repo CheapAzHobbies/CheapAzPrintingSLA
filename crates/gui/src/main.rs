@@ -2368,12 +2368,12 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     );
     let repo = adw::ActionRow::builder()
         .title("Source code")
-        .subtitle("github.com/CheapAzHobbies/CheapAzSLA")
+        .subtitle("github.com/CheapAzHobbies/CheapAzPrintingSLA")
         .activatable(true)
         .build();
     repo.connect_activated(|_| {
         let _ = gio::AppInfo::launch_default_for_uri(
-            "https://github.com/CheapAzHobbies/CheapAzSLA",
+            "https://github.com/CheapAzHobbies/CheapAzPrintingSLA",
             gio::AppLaunchContext::NONE,
         );
     });
