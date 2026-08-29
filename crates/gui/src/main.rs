@@ -167,6 +167,11 @@ struct App {
     /// Built layer textures, so revisiting a layer is immediate.
     textures: RefCell<std::collections::HashMap<u32, Drawn>>,
     texture_order: RefCell<std::collections::VecDeque<u32>>,
+    /// Layers currently being decoded, so the same one is not queued twice.
+    in_flight: RefCell<std::collections::HashSet<u32>>,
+    /// Which way the user is scrubbing, so prefetching reads ahead rather
+    /// than behind.
+    last_layer: Cell<u32>,
     converting: RefCell<bool>,
 }
 
@@ -405,6 +410,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         layer_request: Cell::new(0),
         textures: RefCell::new(std::collections::HashMap::new()),
         texture_order: RefCell::new(std::collections::VecDeque::new()),
+        in_flight: RefCell::new(std::collections::HashSet::new()),
+        last_layer: Cell::new(0),
         converting: RefCell::new(false),
     });
 
@@ -1424,6 +1431,7 @@ fn select_file(ui: &Rc<App>, index: usize) {
     // the wrong image is shown instantly and convincingly.
     ui.textures.borrow_mut().clear();
     ui.texture_order.borrow_mut().clear();
+    ui.in_flight.borrow_mut().clear();
 
     let (input, count, ready) = {
         let files = ui.files.borrow();
@@ -1559,8 +1567,11 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     // Already built: draw it now. Scrubbing revisits layers constantly, and
     // rebuilding a texture still in hand makes the slider feel like it is
     // dragging something heavy.
-    if let Some(cached) = ui.textures.borrow().get(&index).cloned() {
+    let cached = ui.textures.borrow().get(&index).cloned();
+    if let Some(cached) = cached {
         draw_layer(ui, &cached, square);
+        prefetch_around(ui, index, count, pixel);
+        ui.last_layer.set(index);
         return;
     }
 
@@ -1578,7 +1589,84 @@ fn show_layer(ui: &Rc<App>, index: u32) {
         });
         let _ = tx.send_blocking(result);
     });
+    ui.in_flight.borrow_mut().insert(index);
     finish_layer(ui, rx, request, square, index);
+    prefetch_around(ui, index, count, pixel);
+    ui.last_layer.set(index);
+}
+
+/// How many layers to read ahead. Enough to stay in front of a dragged
+/// slider without filling the machine with decode threads.
+const PREFETCH: u32 = 4;
+
+/// Decode the layers the user is about to want.
+///
+/// Scrubbing stutters wherever the cache runs out, because a cached layer
+/// draws immediately and an uncached one costs a multi-megapixel decode.
+/// Reading ahead in the direction of travel keeps that boundary in front of
+/// where the slider actually is.
+fn prefetch_around(ui: &Rc<App>, index: u32, count: u32, pixel: Option<render::PixelSize>) {
+    let Some(opened) = ui
+        .files
+        .borrow()
+        .get(*ui.selected.borrow())
+        .and_then(|f| f.opened.clone())
+    else {
+        return;
+    };
+    let forward = index >= ui.last_layer.get();
+    let mut wanted: Vec<u32> = Vec::new();
+    for step in 1..=PREFETCH {
+        let ahead = if forward {
+            index.checked_add(step)
+        } else {
+            index.checked_sub(step)
+        };
+        if let Some(i) = ahead.filter(|i| *i < count) {
+            wanted.push(i);
+        }
+    }
+    // One behind as well, so reversing direction is not a cliff.
+    if let Some(i) = if forward {
+        index.checked_sub(1)
+    } else {
+        index.checked_add(1).filter(|i| *i < count)
+    } {
+        wanted.push(i);
+    }
+
+    for i in wanted {
+        if ui.textures.borrow().contains_key(&i) || ui.in_flight.borrow().contains(&i) {
+            continue;
+        }
+        ui.in_flight.borrow_mut().insert(i);
+        let (tx, rx) = async_channel::bounded(1);
+        let layers = opened.clone();
+        std::thread::spawn(move || {
+            let result = layers.layers.layer(i).map(|img| {
+                let exposed = img.exposed_pixels(0);
+                let total = img.width as u64 * img.height as u64;
+                (render::texture_for(&img, pixel), exposed, total)
+            });
+            let _ = tx.send_blocking(result);
+        });
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Ok(((texture, factor), exposed, total))) = rx.recv().await {
+                remember_texture(
+                    &ui,
+                    i,
+                    Drawn {
+                        texture,
+                        factor,
+                        exposed,
+                        total,
+                    },
+                );
+            }
+            ui.in_flight.borrow_mut().remove(&i);
+        });
+    }
 }
 
 /// A built layer, ready to draw.
@@ -1633,6 +1721,7 @@ fn finish_layer(
                 // Cached whether or not it is still wanted: the work is done,
                 // and the user is very likely to scrub back over it.
                 remember_texture(&ui, index, drawn.clone());
+                ui.in_flight.borrow_mut().remove(&index);
                 if ui.layer_request.get() == request {
                     draw_layer(&ui, &drawn, square);
                 }
@@ -1648,10 +1737,19 @@ fn finish_layer(
     });
 }
 
-/// How many built layers to keep. Sized in layers rather than bytes because a
-/// layer's size is fixed for a given file, so a count is a predictable proxy
-/// for memory.
-const TEXTURE_CACHE: usize = 48;
+/// Memory the layer cache may use.
+///
+/// Counted in bytes rather than layers because a layer is not a fixed size: a
+/// preview of a 12K panel is around 6 MB while a small printer's is a
+/// fraction of that, so a fixed count would mean a few hundred megabytes on
+/// one machine and almost nothing on another.
+const TEXTURE_BUDGET: usize = 192 * 1024 * 1024;
+
+/// Roughly what a texture costs, from its dimensions. Three bytes a pixel,
+/// which is what the renderer builds.
+fn texture_bytes(d: &Drawn) -> usize {
+    (d.texture.width() as usize) * (d.texture.height() as usize) * 3
+}
 
 fn remember_texture(ui: &Rc<App>, index: u32, drawn: Drawn) {
     let mut cache = ui.textures.borrow_mut();
@@ -1659,9 +1757,15 @@ fn remember_texture(ui: &Rc<App>, index: u32, drawn: Drawn) {
     if cache.insert(index, drawn).is_none() {
         order.push_back(index);
     }
-    while order.len() > TEXTURE_CACHE {
-        if let Some(oldest) = order.pop_front() {
-            cache.remove(&oldest);
+    let mut used: usize = cache.values().map(texture_bytes).sum();
+    // Always keep at least a few, so a printer with an enormous panel does not
+    // end up with a cache that holds nothing and stutters on every layer.
+    while used > TEXTURE_BUDGET && order.len() > 4 {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        if let Some(removed) = cache.remove(&oldest) {
+            used -= texture_bytes(&removed).min(used);
         }
     }
 }

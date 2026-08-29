@@ -20,7 +20,7 @@ use crate::theme;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Zoom limits. Below the lower bound the layer is a speck; above the upper
@@ -39,6 +39,15 @@ pub struct LayerViewer {
     zoom_label: gtk::Label,
     /// None means fit to the pane.
     zoom: Cell<Option<f64>>,
+    /// Where the zoom is heading. The displayed zoom eases toward this rather
+    /// than jumping, which turns a burst of wheel notches into one motion
+    /// instead of a stack of separate relayouts.
+    target: Cell<Option<f64>>,
+    /// The point being held still, as (image x, image y, view x, view y).
+    /// Kept in image coordinates so it stays correct across every frame of the
+    /// animation rather than being recomputed from a moving scroll position.
+    anchor: Cell<Option<(f64, f64, f64, f64)>>,
+    animation: RefCell<Option<gtk::TickCallbackId>>,
     /// Natural size of the texture on show.
     natural: Cell<(i32, i32)>,
 }
@@ -77,6 +86,9 @@ impl LayerViewer {
             picture: picture.clone(),
             zoom_label,
             zoom: Cell::new(None),
+            target: Cell::new(None),
+            anchor: Cell::new(None),
+            animation: RefCell::new(None),
             natural: Cell::new((0, 0)),
         });
         me.widget.append(&frame);
@@ -136,6 +148,12 @@ impl LayerViewer {
     /// Show a texture. Keeps the current zoom, so stepping through layers does
     /// not throw away the magnification you set to look at something.
     pub fn set_texture(self: &Rc<Self>, texture: &gdk::Texture) {
+        let changed = self.natural.get() != (texture.width(), texture.height());
+        if changed {
+            // A different size means the anchor no longer refers to anything.
+            self.stop_animation();
+            self.anchor.set(None);
+        }
         self.natural.set((texture.width(), texture.height()));
         self.picture.set_paintable(Some(texture));
         self.apply();
@@ -147,8 +165,17 @@ impl LayerViewer {
     }
 
     pub fn fit(self: &Rc<Self>) {
+        self.stop_animation();
         self.zoom.set(None);
+        self.anchor.set(None);
         self.apply();
+    }
+
+    fn stop_animation(&self) {
+        if let Some(id) = self.animation.borrow_mut().take() {
+            id.remove();
+        }
+        self.target.set(None);
     }
 
     pub fn is_fit(&self) -> bool {
@@ -165,16 +192,73 @@ impl LayerViewer {
 
     pub fn set_zoom(self: &Rc<Self>, zoom: f64, anchor: Option<(f64, f64)>) {
         let clamped = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        let previous = self.effective_zoom();
-        self.zoom.set(Some(clamped));
-        self.apply();
-        if let Some((ax, ay)) = anchor {
-            self.keep_anchor(ax, ay, previous, clamped);
+        // Record the anchor in image coordinates once, at the start. Deriving
+        // it from the scroll position each frame would chase a value the
+        // animation is itself moving.
+        if let Some((vx, vy)) = anchor {
+            let now = self.effective_zoom();
+            let h = self.scroller.hadjustment().value();
+            let v = self.scroller.vadjustment().value();
+            self.anchor
+                .set(Some(((h + vx) / now, (v + vy) / now, vx, vy)));
+        } else {
+            self.anchor.set(None);
         }
+        self.target.set(Some(clamped));
+        self.start_animation();
+    }
+
+    /// Ease the displayed zoom toward the target, one frame at a time.
+    ///
+    /// Exponential rather than a fixed duration: a burst of wheel notches
+    /// keeps moving the target and the motion simply continues, where a
+    /// timed tween would restart and stutter on every notch.
+    fn start_animation(self: &Rc<Self>) {
+        if self.animation.borrow().is_some() {
+            return;
+        }
+        let me = self.clone();
+        let id = self.scroller.add_tick_callback(move |_, _| {
+            let Some(target) = me.target.get() else {
+                return glib::ControlFlow::Break;
+            };
+            let current = me.zoom.get().unwrap_or_else(|| me.fit_zoom());
+            // About 150ms to settle at 60fps, which reads as movement without
+            // feeling like a wait (§23).
+            let next = current + (target - current) * 0.28;
+            let done = (target / next).ln().abs() < 0.002;
+            let value = if done { target } else { next };
+            me.zoom.set(Some(value));
+            me.apply();
+            me.hold_anchor(value);
+            if done {
+                me.target.set(None);
+                *me.animation.borrow_mut() = None;
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.animation.borrow_mut() = Some(id);
+    }
+
+    /// Put the anchored image point back under the pointer at this zoom.
+    fn hold_anchor(&self, zoom: f64) {
+        let Some((ix, iy, vx, vy)) = self.anchor.get() else {
+            return;
+        };
+        let h = self.scroller.hadjustment();
+        let v = self.scroller.vadjustment();
+        let nx = ix * zoom - vx;
+        let ny = iy * zoom - vy;
+        h.set_value(nx.clamp(h.lower(), (h.upper() - h.page_size()).max(h.lower())));
+        v.set_value(ny.clamp(v.lower(), (v.upper() - v.page_size()).max(v.lower())));
     }
 
     fn zoom_by(self: &Rc<Self>, factor: f64, anchor: Option<(f64, f64)>) {
-        let target = self.effective_zoom() * factor;
+        // From where it is going, not where it is, so a quick second notch
+        // adds to the first instead of restarting from a half-finished value.
+        let from = self.target.get().unwrap_or_else(|| self.effective_zoom());
+        let target = from * factor;
         // Zooming out lands on Fit and stops there. The whole plate is the
         // view people return to after examining something, and stepping past
         // it into a postage stamp helps nobody. Fit is also the state the
@@ -196,26 +280,6 @@ impl LayerViewer {
         let aw = self.scroller.width().max(1) as f64;
         let ah = self.scroller.height().max(1) as f64;
         (aw / w as f64).min(ah / h as f64).min(1.0)
-    }
-
-    /// Hold the point under the pointer still across a zoom.
-    fn keep_anchor(&self, ax: f64, ay: f64, from: f64, to: f64) {
-        if from <= 0.0 {
-            return;
-        }
-        let h = self.scroller.hadjustment();
-        let v = self.scroller.vadjustment();
-        let ratio = to / from;
-        // Where the anchor sits in the image, then where it must sit after.
-        let nx = (h.value() + ax) * ratio - ax;
-        let ny = (v.value() + ay) * ratio - ay;
-        // Applied after the size request has been acted on, or the adjustment
-        // is still clamped to the old extent and the anchor drifts.
-        let (h2, v2) = (h.clone(), v.clone());
-        glib::idle_add_local_once(move || {
-            h2.set_value(nx.clamp(h2.lower(), (h2.upper() - h2.page_size()).max(h2.lower())));
-            v2.set_value(ny.clamp(v2.lower(), (v2.upper() - v2.page_size()).max(v2.lower())));
-        });
     }
 
     fn apply(self: &Rc<Self>) {
