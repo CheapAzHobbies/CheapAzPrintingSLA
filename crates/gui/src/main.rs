@@ -145,7 +145,7 @@ struct App {
     viewer: Rc<viewer::LayerViewer>,
     preview_stack: gtk::Stack,
     layer_label: gtk::Label,
-    layer_detail: gtk::Label,
+    layer_detail: gtk::Box,
     slider: gtk::Scale,
     play_btn: gtk::Button,
     info_panel: gtk::Box,
@@ -337,24 +337,27 @@ fn build(app: &adw::Application) -> Rc<App> {
     layer_label.add_css_class("heading");
     // Tabular figures, so the number does not jitter as digits change.
     layer_label.add_css_class("cz-value");
-    let layer_detail = gtk::Label::builder().label("").build();
-    layer_detail.add_css_class("caption");
-    layer_detail.add_css_class("cz-dim");
+    let layer_detail = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 1.0);
     slider.set_hexpand(true);
     slider.set_draw_value(false);
-    // Wide enough to be usable even in a narrow window; scrubbing a
-    // thousand-layer print through a stub of a slider is no use.
-    slider.set_size_request(200, -1);
+    // With the caption gone the slider has the row almost to itself. Scrubbing
+    // a thousand-layer print is a job for a long control: every pixel of width
+    // is roughly two layers of precision.
+    slider.set_size_request(360, -1);
+    // Clicking anywhere jumps straight there rather than stepping one page,
+    // which on a long print means several clicks to reach where you pointed.
+    slider.set_round_digits(0);
+    slider.set_increments(1.0, 10.0);
     let play_btn = shell::icon_button("media-playback-start-symbolic", "Play  (Space)");
     let info_panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     let (preview_page, preview_stack) = build_preview_page(
         &viewer,
         &layer_label,
-        &layer_detail,
         &slider,
         &play_btn,
         &info_panel,
+        &layer_detail,
     );
     shell.add_page(Section::Preview, &preview_page);
 
@@ -642,24 +645,22 @@ fn build_convert_page(
 fn build_preview_page(
     viewer: &Rc<viewer::LayerViewer>,
     layer_label: &gtk::Label,
-    layer_detail: &gtk::Label,
     slider: &gtk::Scale,
     play_btn: &gtk::Button,
     info_panel: &gtk::Box,
+    layer_detail: &gtk::Box,
 ) -> (gtk::Widget, gtk::Stack) {
-    // A fixed column. The detail text changes length constantly as layers
-    // change, and the slider is the widget that expands, so without this every
-    // caption of a different width resized the slider under the pointer.
+    // Only the layer number sits beside the slider, in a cell wide enough for
+    // the largest count it will ever show. Anything whose width follows its
+    // content cannot share a row with the widget that expands.
+    layer_label.set_xalign(1.0);
+    layer_label.set_width_chars(16);
+    layer_label.set_max_width_chars(16);
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.set_hexpand(false);
-    labels.set_size_request(300, -1);
     labels.set_halign(gtk::Align::End);
-    layer_label.set_xalign(1.0);
-    layer_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    layer_detail.set_xalign(1.0);
-    layer_detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    labels.set_valign(gtk::Align::Center);
     labels.append(layer_label);
-    labels.append(layer_detail);
 
     let nav = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
     nav.append(&shell::icon_button(
@@ -693,6 +694,10 @@ fn build_preview_page(
     side.set_size_request(300, -1);
     side.append(&shell::section_label("File information"));
     side.append(info_panel);
+    let layer_head = shell::section_label("This layer");
+    layer_head.set_margin_top(theme::SPACE_4);
+    side.append(&layer_head);
+    side.append(layer_detail);
     let side_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&side)
@@ -1780,8 +1785,9 @@ fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool, shown: u32, count: u32, app
         .set_text(&format!("Layer {} / {}", shown + 1, count));
 
     if approximate {
-        ui.layer_detail
-            .set_text("nearest built layer, still loading…");
+        // Dimming the number says "not settled yet" without changing any
+        // width, which is what caused the slider to move about before.
+        set_layer_detail(ui, &[("Status", "still loading…".into())]);
         ui.layer_label.add_css_class("cz-dim");
         return;
     }
@@ -1792,14 +1798,29 @@ fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool, shown: u32, count: u32, app
     } else {
         0.0
     };
-    let mut note = format!("{} px exposed ({pct:.3}%)", d.exposed);
+    let mut rows: Vec<(&str, String)> = vec![
+        ("Exposed", format!("{} px", d.exposed)),
+        ("Coverage", format!("{pct:.3}%")),
+    ];
     if d.factor > 1 {
-        note.push_str(&format!("  ·  shown at 1/{}", d.factor));
+        rows.push(("Preview scale", format!("1/{}", d.factor)));
     }
     if !square {
-        note.push_str("  ·  corrected for non-square pixels");
+        rows.push(("Aspect", "corrected for non-square pixels".into()));
     }
-    ui.layer_detail.set_text(&note);
+    set_layer_detail(ui, &rows);
+}
+
+/// Fill the per-layer panel. Rows rather than one long caption, so nothing
+/// here can change the width of anything beside it.
+fn set_layer_detail(ui: &Rc<App>, rows: &[(&str, String)]) {
+    while let Some(c) = ui.layer_detail.first_child() {
+        ui.layer_detail.remove(&c);
+    }
+    for (label, value) in rows {
+        ui.layer_detail
+            .append(&shell::info_row(label, value, false));
+    }
 }
 
 /// The built layer closest to the one asked for, if there is one near enough
@@ -1855,7 +1876,7 @@ fn finish_layer(
             }
             Ok(Err(e)) => {
                 if ui.layer_request.get() == request {
-                    ui.layer_detail.set_text("layer could not be decoded");
+                    set_layer_detail(&ui, &[("Status", "could not be decoded".into())]);
                     ui.toasts.add_toast(adw::Toast::new(&e.to_string()));
                 }
             }
