@@ -239,7 +239,10 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     convert_btn.set_tooltip_text(Some("Convert this file  (Ctrl+Enter)"));
     convert_btn.set_sensitive(false); // nothing loaded yet
 
-    let progress = gtk::ProgressBar::builder().show_text(true).visible(false).build();
+    let progress = gtk::ProgressBar::builder()
+        .show_text(true)
+        .visible(false)
+        .build();
 
     let convert_bar = gtk::Box::new(gtk::Orientation::Vertical, 8);
     convert_bar.append(&convert_group);
@@ -257,6 +260,8 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     let side_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .width_request(340)
+        .hexpand(false)
+        .vexpand(true)
         .child(&side)
         .build();
 
@@ -284,13 +289,19 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
     slider.set_draw_value(false);
 
     let mk = |icon: &str, tip: &str| {
-        let b = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
+        let b = gtk::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(tip)
+            .build();
         b.add_css_class("flat");
         b
     };
     let first = mk("go-first-symbolic", "First layer  (Home)");
     let prev = mk("go-previous-symbolic", "Previous layer  (Left)");
-    let play_button = mk("media-playback-start-symbolic", "Play through layers  (Space)");
+    let play_button = mk(
+        "media-playback-start-symbolic",
+        "Play through layers  (Space)",
+    );
     let next = mk("go-next-symbolic", "Next layer  (Right)");
     let last = mk("go-last-symbolic", "Last layer  (End)");
 
@@ -315,6 +326,8 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
 
     let right = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
+        .hexpand(true)
+        .vexpand(true)
         .build();
     right.add_named(&empty, Some("drop"));
     right.add_named(&viewer, Some("view"));
@@ -381,7 +394,17 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         writable: RefCell::new(writable_ids),
     });
 
-    wire(&ui, &open_btn, &empty_btn, &about_btn, &first, &prev, &next, &last, &play_button);
+    wire(
+        &ui,
+        &open_btn,
+        &empty_btn,
+        &about_btn,
+        &first,
+        &prev,
+        &next,
+        &last,
+        &play_button,
+    );
     wire_convert(&ui, &convert_btn, &pick_dir, &reset_dir);
     {
         let ui2 = ui.clone();
@@ -618,9 +641,11 @@ fn clear_file(ui: &Rc<Ui>) {
     ui.layer_label.set_text("Layer — / —");
     ui.scale_label.set_text("");
     ui.name_row.set_text("");
-    ui.play_button.set_icon_name("media-playback-start-symbolic");
+    ui.play_button
+        .set_icon_name("media-playback-start-symbolic");
     ui.title.set_title("CheapAzSLA");
-    ui.title.set_subtitle("Resin print file converter & inspector");
+    ui.title
+        .set_subtitle("Resin print file converter & inspector");
     // An empty File panel would just be a titled box with nothing in it.
     ui.info_group.set_visible(false);
     ui.right.set_visible_child_name("drop");
@@ -660,13 +685,17 @@ fn choose_file(ui: &Rc<Ui>) {
     }
 
     let ui = ui.clone();
-    dialog.open(Some(&ui.window.clone()), gio::Cancellable::NONE, move |res| {
-        if let Ok(file) = res {
-            if let Some(path) = file.path() {
-                load_file(&ui, &path);
+    dialog.open(
+        Some(&ui.window.clone()),
+        gio::Cancellable::NONE,
+        move |res| {
+            if let Ok(file) = res {
+                if let Some(path) = file.path() {
+                    load_file(&ui, &path);
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 /// Open a file on a worker thread so the interface never blocks (§17).
@@ -690,7 +719,8 @@ fn load_file(ui: &Rc<Ui>, path: &Path) {
             Ok(Err(msg)) => {
                 ui.spinner.set_spinning(false);
                 ui.spinner.set_visible(false);
-                ui.title.set_subtitle("Resin print file converter & inspector");
+                ui.title
+                    .set_subtitle("Resin print file converter & inspector");
                 error_dialog(&ui, &msg.0, &msg.1);
             }
             Err(_) => {}
@@ -775,33 +805,74 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
     add_info(ui, row("Format", Some(p.source_format.to_uppercase())));
     add_info(ui, row("Detected by", Some(loaded.detection.clone())));
     add_info(ui, row("Confidence", Some(loaded.confidence.clone())));
-    add_info(ui, row("Size", Some(render::human_bytes(loaded.size_bytes))));
-    add_info(ui, row(
-        "Location",
-        loaded.path.parent().map(|d| d.display().to_string()),
-    ));
-    add_info(ui, row(
-        "Resolution",
-        Some(format!("{} x {} px", p.geometry.resolution_x, p.geometry.resolution_y)),
-    ));
-    add_info(ui, row(
-        "Pixel size",
-        p.geometry.pixel_size_um().map(|(x, y)| format!("{x:.2} x {y:.2} um")),
-    ));
+    add_info(
+        ui,
+        row("Size", Some(render::human_bytes(loaded.size_bytes))),
+    );
+    add_info(
+        ui,
+        row(
+            "Location",
+            loaded.path.parent().map(|d| d.display().to_string()),
+        ),
+    );
+    add_info(
+        ui,
+        row(
+            "Resolution",
+            Some(format!(
+                "{} x {} px",
+                p.geometry.resolution_x, p.geometry.resolution_y
+            )),
+        ),
+    );
+    add_info(
+        ui,
+        row(
+            "Pixel size",
+            p.geometry
+                .pixel_size_um()
+                .map(|(x, y)| format!("{x:.2} x {y:.2} um")),
+        ),
+    );
     add_info(ui, row("Layers", Some(count.to_string())));
-    add_info(ui, row(
-        "Layer height",
-        Some(format!("{} mm", p.exposure.layer_height_mm)),
-    ));
-    add_info(ui, row("Height", p.height_mm().map(|h| format!("{h:.2} mm"))));
-    add_info(ui, row("Exposure", Some(format!("{} s", p.exposure.exposure_s))));
-    add_info(ui, row(
-        "Bottom exposure",
-        p.exposure.bottom_exposure_s.map(|v| format!("{v} s")),
-    ));
-    add_info(ui, row("Bottom layers", p.exposure.bottom_layers.map(|v| v.to_string())));
-    add_info(ui, row("Print time", p.print_time_s.map(render::human_time)));
-    add_info(ui, row("Material", p.material_volume_ml.map(|v| format!("{v} ml"))));
+    add_info(
+        ui,
+        row(
+            "Layer height",
+            Some(format!("{} mm", p.exposure.layer_height_mm)),
+        ),
+    );
+    add_info(
+        ui,
+        row("Height", p.height_mm().map(|h| format!("{h:.2} mm"))),
+    );
+    add_info(
+        ui,
+        row("Exposure", Some(format!("{} s", p.exposure.exposure_s))),
+    );
+    add_info(
+        ui,
+        row(
+            "Bottom exposure",
+            p.exposure.bottom_exposure_s.map(|v| format!("{v} s")),
+        ),
+    );
+    add_info(
+        ui,
+        row(
+            "Bottom layers",
+            p.exposure.bottom_layers.map(|v| v.to_string()),
+        ),
+    );
+    add_info(
+        ui,
+        row("Print time", p.print_time_s.map(render::human_time)),
+    );
+    add_info(
+        ui,
+        row("Material", p.material_volume_ml.map(|v| format!("{v} ml"))),
+    );
     add_info(ui, row("Material name", p.material_name.clone()));
     add_info(ui, row("Printer", p.machine_name.clone()));
 
@@ -811,7 +882,8 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
     }
     let mut notes: Vec<String> = loaded.warnings.clone();
     if loaded.extension_mismatch {
-        notes.push("The file extension disagrees with the contents. The contents were used.".into());
+        notes
+            .push("The file extension disagrees with the contents. The contents were used.".into());
     }
     if notes.is_empty() {
         ui.warn_group.set_visible(false);
@@ -842,7 +914,8 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
         render::human_bytes(loaded.size_bytes)
     ));
 
-    ui.slider.set_range(0.0, (count.saturating_sub(1)).max(1) as f64);
+    ui.slider
+        .set_range(0.0, (count.saturating_sub(1)).max(1) as f64);
     ui.slider.set_value(0.0);
     for b in &ui.nav_buttons {
         b.set_sensitive(count > 1);
@@ -854,14 +927,15 @@ fn present(ui: &Rc<Ui>, loaded: Loaded) {
     ui.clear_btn.set_visible(true);
     LOADED.with(|l| *l.borrow_mut() = Some(loaded));
     suggest_name(ui);
+    ui.info_group.set_visible(true);
+    ui.right.set_visible_child_name("view");
     ui.stack.set_visible_child_name("inspect");
     show_layer(ui, 0);
 }
 
 /// Decode and display one layer, off the main thread.
 fn show_layer(ui: &Rc<Ui>, index: u32) {
-    let Some((layers, count)) =
-        with_loaded(|l| (l.opened.clone(), l.opened.print.layer_count()))
+    let Some((layers, count)) = with_loaded(|l| (l.opened.clone(), l.opened.print.layer_count()))
     else {
         return;
     };
@@ -869,7 +943,8 @@ fn show_layer(ui: &Rc<Ui>, index: u32) {
         return;
     }
     let index = index.min(count - 1);
-    ui.layer_label.set_text(&format!("Layer {} / {}", index + 1, count));
+    ui.layer_label
+        .set_text(&format!("Layer {} / {}", index + 1, count));
 
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -911,10 +986,12 @@ fn toggle_play(ui: &Rc<Ui>) {
     let running = PLAYING.with(|p| p.borrow().is_some());
     if running {
         stop_play();
-        ui.play_button.set_icon_name("media-playback-start-symbolic");
+        ui.play_button
+            .set_icon_name("media-playback-start-symbolic");
         return;
     }
-    ui.play_button.set_icon_name("media-playback-pause-symbolic");
+    ui.play_button
+        .set_icon_name("media-playback-pause-symbolic");
     let ui2 = ui.clone();
     let id = glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         let count = with_loaded(|l| l.opened.print.layer_count()).unwrap_or(0);
@@ -1053,7 +1130,10 @@ fn show_settings(ui: &Rc<Ui>) {
                 .unwrap_or_else(|| "Wherever the last file was opened from".into()),
         )
         .build();
-    let choose = gtk::Button::builder().label("Choose…").valign(gtk::Align::Center).build();
+    let choose = gtk::Button::builder()
+        .label("Choose…")
+        .valign(gtk::Align::Center)
+        .build();
     let clear_default = gtk::Button::builder()
         .icon_name("edit-undo-symbolic")
         .valign(gtk::Align::Center)
@@ -1065,7 +1145,9 @@ fn show_settings(ui: &Rc<Ui>) {
         let row = open_dir_row.clone();
         let parent = win.clone();
         choose.connect_clicked(move |_| {
-            let dlg = gtk::FileDialog::builder().title("Default folder for opening files").build();
+            let dlg = gtk::FileDialog::builder()
+                .title("Default folder for opening files")
+                .build();
             let ui2 = ui.clone();
             let row2 = row.clone();
             dlg.select_folder(Some(&parent), gio::Cancellable::NONE, move |res| {
@@ -1103,7 +1185,9 @@ fn show_settings(ui: &Rc<Ui>) {
         )
         .build();
 
-    let sub_row = adw::EntryRow::builder().title("Subfolder on pinned drives").build();
+    let sub_row = adw::EntryRow::builder()
+        .title("Subfolder on pinned drives")
+        .build();
     sub_row.set_text(&current.pinned_subfolder);
     {
         let ui = ui.clone();
@@ -1142,7 +1226,9 @@ fn show_settings(ui: &Rc<Ui>) {
                 .active(current.is_pinned(&d.name))
                 .build();
             if d.removable {
-                row.add_prefix(&gtk::Image::from_icon_name("drive-removable-media-symbolic"));
+                row.add_prefix(&gtk::Image::from_icon_name(
+                    "drive-removable-media-symbolic",
+                ));
             } else {
                 row.add_prefix(&gtk::Image::from_icon_name("drive-harddisk-symbolic"));
             }
@@ -1173,7 +1259,9 @@ fn show_settings(ui: &Rc<Ui>) {
             .title(name.as_str())
             .subtitle("Not connected")
             .build();
-        row.add_prefix(&gtk::Image::from_icon_name("drive-removable-media-symbolic"));
+        row.add_prefix(&gtk::Image::from_icon_name(
+            "drive-removable-media-symbolic",
+        ));
         row.add_css_class("dim-label");
         let unpin = gtk::Button::builder()
             .icon_name("list-remove-symbolic")
@@ -1256,13 +1344,17 @@ fn wire_convert(
                 .modal(true)
                 .build();
             let ui2 = ui.clone();
-            dialog.select_folder(Some(&ui.window.clone()), gio::Cancellable::NONE, move |res| {
-                if let Ok(folder) = res {
-                    if let Some(path) = folder.path() {
-                        set_out_dir(&ui2, Some(path));
+            dialog.select_folder(
+                Some(&ui.window.clone()),
+                gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(folder) = res {
+                        if let Some(path) = folder.path() {
+                            set_out_dir(&ui2, Some(path));
+                        }
                     }
-                }
-            });
+                },
+            );
         });
     }
     {
@@ -1342,7 +1434,8 @@ fn start_convert(ui: &Rc<Ui>) {
 
     let out_dir = ui.out_dir.borrow().clone();
     let Some(generated) = convert::destination_for(&source, format_id, out_dir.as_deref()) else {
-        ui.toasts.add_toast(adw::Toast::new("Could not work out a destination filename"));
+        ui.toasts
+            .add_toast(adw::Toast::new("Could not work out a destination filename"));
         return;
     };
     // Whatever the user typed wins, but a name is required and it must stay a
@@ -1356,9 +1449,14 @@ fn start_convert(ui: &Rc<Ui>) {
         }
         generated
     } else {
-        let dir = generated.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = generated
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         // Keep the extension matching the chosen format if the user dropped it.
-        let want_ext = registry::by_id(format_id).map(|h| h.info().extension).unwrap_or("");
+        let want_ext = registry::by_id(format_id)
+            .map(|h| h.info().extension)
+            .unwrap_or("");
         let name = if Path::new(&typed)
             .extension()
             .map(|e| e.eq_ignore_ascii_case(want_ext))
@@ -1516,7 +1614,8 @@ fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
     ui.convert_btn.set_sensitive(false);
     ui.progress.set_visible(true);
     ui.progress.set_fraction(0.0);
-    ui.progress.set_text(Some(&format!("Preparing {} layers…", plan.layer_count)));
+    ui.progress
+        .set_text(Some(&format!("Preparing {} layers…", plan.layer_count)));
 
     // Progress arrives from the worker as (done, total). The channel is
     // unbounded and sent to without blocking, so reporting can never slow the
@@ -1600,7 +1699,8 @@ fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
                 toast.connect_button_clicked(move |_| {
                     if let Some(parent) = d.parent() {
                         let uri = gio::File::for_path(parent).uri();
-                        let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                        let _ =
+                            gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
                     }
                 });
                 ui.toasts.add_toast(toast);

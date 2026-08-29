@@ -14,21 +14,22 @@
 
 use super::goo_rle;
 use crate::error::{Error, FormatError, Result};
-use crate::format::{
-    Capabilities, Confidence, Detection, FormatHandler, FormatInfo, OpenedFile,
-};
+use crate::format::{Capabilities, Confidence, Detection, FormatHandler, FormatInfo, OpenedFile};
 use crate::layers::LayerProvider;
 use crate::limits;
 use crate::model::*;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 pub const ID: &str = "goo";
 
 /// `V3.0` then the fixed magic tag.
 const VERSION: &[u8; 4] = b"V3.0";
 const MAGIC: [u8; 8] = [0x07, 0x00, 0x00, 0x00, 0x44, 0x4C, 0x50, 0x00];
-const ENDING: [u8; 11] = [0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x44, 0x4C, 0x50, 0x00];
+const ENDING: [u8; 11] = [
+    0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x44, 0x4C, 0x50, 0x00,
+];
 const DELIM: [u8; 2] = [0x0D, 0x0A];
 
 const SMALL_W: u32 = 116;
@@ -49,7 +50,7 @@ static INFO: FormatInfo = FormatInfo {
         "Stores no material name",
     ],
     capabilities: Capabilities {
-        reads: false, // reading lands in a later phase; writing is what unblocks conversion
+        reads: true,
         writes: true,
         per_layer_exposure: true,
         per_layer_lift: true,
@@ -62,6 +63,327 @@ static INFO: FormatInfo = FormatInfo {
 };
 
 pub struct GooHandler;
+
+/// Byte offset of the parameter block: two previews of fixed size, each
+/// followed by a two byte delimiter.
+const PARAMS: u64 = 194 + 0x6920 + 2 + 0x29108 + 2;
+/// Bytes of layer record preceding each image payload.
+const LAYER_PREAMBLE_LEN: u64 = 2 + 15 * 4 + 2 + 2;
+
+/// A cursor over a file that refuses to read outside it.
+struct Reader {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl Reader {
+    fn need(&self, n: usize) -> Result<()> {
+        if self.pos + n > self.data.len() {
+            return Err(FormatError::Truncated {
+                offset: self.pos as u64,
+                expected: n as u64,
+                actual: self.data.len().saturating_sub(self.pos) as u64,
+            }
+            .into());
+        }
+        Ok(())
+    }
+    fn u8(&mut self) -> Result<u8> {
+        self.need(1)?;
+        let v = self.data[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+    fn u16(&mut self) -> Result<u16> {
+        self.need(2)?;
+        let v = u16::from_be_bytes(self.data[self.pos..self.pos + 2].try_into().unwrap());
+        self.pos += 2;
+        Ok(v)
+    }
+    fn u32(&mut self) -> Result<u32> {
+        self.need(4)?;
+        let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+    fn f32(&mut self) -> Result<f32> {
+        self.need(4)?;
+        let v = f32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+    fn text(&mut self, width: usize) -> Result<String> {
+        self.need(width)?;
+        let raw = &self.data[self.pos..self.pos + width];
+        self.pos += width;
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        Ok(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+    }
+    fn skip(&mut self, n: usize) -> Result<()> {
+        self.need(n)?;
+        self.pos += n;
+        Ok(())
+    }
+}
+
+/// Where each layer's encoded payload lives, found once when the file opens so
+/// layers can be fetched later without rescanning.
+struct GooLayers {
+    path: PathBuf,
+    /// (offset, length) of each payload, excluding magic and checksum.
+    spans: Vec<(u64, u32)>,
+    width: u32,
+    height: u32,
+}
+
+impl LayerProvider for GooLayers {
+    fn layer_count(&self) -> u32 {
+        self.spans.len() as u32
+    }
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn layer(&self, index: u32) -> Result<LayerImage> {
+        let &(offset, len) = self
+            .spans
+            .get(index as usize)
+            .ok_or(Error::LayerOutOfRange {
+                index,
+                count: self.spans.len() as u32,
+            })?;
+        let mut file = std::fs::File::open(&self.path).map_err(|e| Error::Io {
+            path: self.path.clone(),
+            source: e,
+        })?;
+        file.seek(SeekFrom::Start(offset)).map_err(|e| Error::Io {
+            path: self.path.clone(),
+            source: e,
+        })?;
+        let cap = limits::check_allocation(len as u64)?;
+        let mut buf = vec![0u8; cap];
+        file.read_exact(&mut buf).map_err(|e| Error::Io {
+            path: self.path.clone(),
+            source: e,
+        })?;
+        let pixels = goo_rle::decode(&buf, (self.width as usize) * (self.height as usize))
+            .map_err(|e| FormatError::LayerDecode(format!("layer {index}: {e}")))?;
+        if pixels.len() != (self.width as usize) * (self.height as usize) {
+            return Err(FormatError::LayerDecode(format!(
+                "layer {index} decoded {} pixels, expected {}",
+                pixels.len(),
+                self.width as usize * self.height as usize
+            ))
+            .into());
+        }
+        Ok(LayerImage {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
+    }
+}
+
+/// Read the header and locate every layer payload.
+fn parse(path: &Path) -> Result<(PrintFile, GooLayers, Vec<String>)> {
+    let data = std::fs::read(path).map_err(|e| Error::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let file_size = data.len() as u64;
+    if data.len() < 12 || &data[..4] != VERSION || data[4..12] != MAGIC {
+        return Err(FormatError::BadMagic.into());
+    }
+    let mut r = Reader { data, pos: 12 };
+    let software = r.text(32)?;
+    let software_version = r.text(24)?;
+    let file_time = r.text(24)?;
+    let printer_name = r.text(32)?;
+    let _printer_type = r.text(32)?;
+    let profile = r.text(32)?;
+    let _aa = r.u16()?;
+    let _grey = r.u16()?;
+    let _blur = r.u16()?;
+
+    r.pos = PARAMS as usize;
+    let total_layers = limits::check_layer_count(r.u32()? as u64)?;
+    let xres = r.u16()? as u32;
+    let yres = r.u16()? as u32;
+    limits::check_resolution(xres, yres)?;
+    let _x_mirror = r.u8()?;
+    let _y_mirror = r.u8()?;
+    let x_size = r.f32()?;
+    let y_size = r.f32()?;
+    let z_size = r.f32()?;
+    let layer_thickness = r.f32()?;
+    if !(layer_thickness.is_finite() && layer_thickness > 0.0) {
+        return Err(FormatError::InvalidValue {
+            field: "layer_thickness".into(),
+            value: layer_thickness.to_string(),
+            reason: "must be a positive number".into(),
+        }
+        .into());
+    }
+    let common_exposure = r.f32()?;
+    let _delay_mode = r.u8()?;
+    let turn_off_time = r.f32()?;
+    r.skip(6 * 4)?; // before/after lift and retract waits
+    let bottom_exposure = r.f32()?;
+    let bottom_layers = r.u32()?;
+    let bottom_lift_distance = r.f32()?;
+    let bottom_lift_speed = r.f32()?;
+    let lift_distance = r.f32()?;
+    let lift_speed = r.f32()?;
+    let _bottom_retract_distance = r.f32()?;
+    let bottom_retract_speed = r.f32()?;
+    let _retract_distance = r.f32()?;
+    let retract_speed = r.f32()?;
+    r.skip(8 * 4)?; // second lift and retract
+    let bottom_pwm = r.u16()?;
+    let light_pwm = r.u16()?;
+    let _advance = r.u8()?;
+    let printing_time = r.u32()?;
+    let volume = r.f32()?;
+    let weight = r.f32()?;
+    let _price = r.f32()?;
+    r.skip(8)?; // price unit
+    let layer_offset = r.u32()? as u64;
+    let _gray_scale = r.u8()?;
+    let transition = r.u16()?;
+
+    let mut warnings = Vec::new();
+    if layer_offset != r.pos as u64 {
+        warnings.push(format!(
+            "the header says layers start at {layer_offset} but the fields end at {}",
+            r.pos
+        ));
+    }
+    limits::check_range(layer_offset, 0, file_size)?;
+
+    // Walk the layer records, recording each payload and its own metadata.
+    let mut spans = Vec::with_capacity(total_layers as usize);
+    let mut layer_infos = Vec::with_capacity(total_layers as usize);
+    let mut cursor = layer_offset;
+    for index in 0..total_layers {
+        limits::check_range(cursor, LAYER_PREAMBLE_LEN + 4, file_size)?;
+        let mut lr = Reader {
+            data: std::mem::take(&mut r.data),
+            pos: cursor as usize,
+        };
+        let _pause = lr.u16()?;
+        let _pause_z = lr.f32()?;
+        let z = lr.f32()?;
+        let exposure = lr.f32()?;
+        let off_time = lr.f32()?;
+        lr.skip(3 * 4)?;
+        let l_lift = lr.f32()?;
+        let l_lift_speed = lr.f32()?;
+        lr.skip(2 * 4)?;
+        lr.skip(4 * 4)?;
+        let _pwm = lr.u16()?;
+        lr.skip(2)?; // delimiter
+        let data_size = lr.u32()?;
+        if data_size < 2 {
+            return Err(FormatError::InvalidValue {
+                field: format!("layer {index} data_size"),
+                value: data_size.to_string(),
+                reason: "must cover at least the magic byte and the checksum".into(),
+            }
+            .into());
+        }
+        let payload_len = data_size - 2;
+        let magic_pos = lr.pos as u64;
+        limits::check_range(magic_pos, data_size as u64 + 2, file_size)?;
+        if lr.data[magic_pos as usize] != goo_rle::IMAGE_MAGIC {
+            return Err(FormatError::InvalidValue {
+                field: format!("layer {index} image magic"),
+                value: format!("0x{:02x}", lr.data[magic_pos as usize]),
+                reason: format!("expected 0x{:02x}", goo_rle::IMAGE_MAGIC),
+            }
+            .into());
+        }
+        let payload_start = magic_pos + 1;
+        let stored_checksum = lr.data[(payload_start + payload_len as u64) as usize];
+        let payload =
+            &lr.data[payload_start as usize..(payload_start + payload_len as u64) as usize];
+        if goo_rle::checksum(payload) != stored_checksum {
+            warnings.push(format!("layer {index} checksum does not match its data"));
+        }
+        spans.push((payload_start, payload_len));
+        layer_infos.push(LayerInfo {
+            z_mm: z,
+            exposure_s: Some(exposure),
+            light_off_delay_s: Some(off_time),
+            lift_height_mm: Some(l_lift),
+            lift_speed_mm_min: Some(l_lift_speed),
+        });
+        cursor = payload_start + payload_len as u64 + 1 + 2;
+        r.data = lr.data;
+    }
+
+    let mut extra = BTreeMap::new();
+    if !software.is_empty() {
+        extra.insert(
+            "goo.software".into(),
+            format!("{software} {software_version}"),
+        );
+    }
+    if !file_time.is_empty() {
+        extra.insert("goo.file_time".into(), file_time);
+    }
+    if !profile.is_empty() {
+        extra.insert("goo.profile".into(), profile);
+    }
+
+    let print = PrintFile {
+        source_format: ID.to_string(),
+        geometry: Geometry {
+            resolution_x: xres,
+            resolution_y: yres,
+            display_width_mm: (x_size > 0.0).then_some(x_size),
+            display_height_mm: (y_size > 0.0).then_some(y_size),
+            machine_z_mm: (z_size > 0.0).then_some(z_size),
+        },
+        exposure: Exposure {
+            layer_height_mm: layer_thickness,
+            exposure_s: common_exposure,
+            bottom_exposure_s: Some(bottom_exposure),
+            bottom_layers: Some(bottom_layers),
+            light_off_delay_s: (turn_off_time > 0.0).then_some(turn_off_time),
+            bottom_light_off_delay_s: None,
+            transition_layers: (transition > 0).then_some(transition as u32),
+            light_pwm: Some(light_pwm.min(255) as u8),
+            bottom_light_pwm: Some(bottom_pwm.min(255) as u8),
+        },
+        lift: Lift {
+            lift_height_mm: (lift_distance > 0.0).then_some(lift_distance),
+            lift_speed_mm_min: (lift_speed > 0.0).then_some(lift_speed),
+            bottom_lift_height_mm: (bottom_lift_distance > 0.0).then_some(bottom_lift_distance),
+            bottom_lift_speed_mm_min: (bottom_lift_speed > 0.0).then_some(bottom_lift_speed),
+            retract_speed_mm_min: (retract_speed > 0.0).then_some(retract_speed),
+            bottom_retract_speed_mm_min: (bottom_retract_speed > 0.0)
+                .then_some(bottom_retract_speed),
+        },
+        layers: layer_infos,
+        thumbnails: Vec::new(), // previews are RGB565; decoding them is not needed to convert
+        print_time_s: (printing_time > 0).then_some(printing_time as u64),
+        material_volume_ml: (volume > 0.0).then_some(volume),
+        material_grams: (weight > 0.0).then_some(weight),
+        material_name: None,
+        machine_name: (!printer_name.is_empty()).then_some(printer_name),
+        extra,
+    };
+
+    Ok((
+        print,
+        GooLayers {
+            path: path.to_path_buf(),
+            spans,
+            width: xres,
+            height: yres,
+        },
+        warnings,
+    ))
+}
 
 /// Fixed-width text field, NUL padded and NUL terminated.
 fn text(out: &mut Vec<u8>, s: &str, width: usize) {
@@ -142,20 +464,17 @@ impl FormatHandler for GooHandler {
         }
     }
 
-    fn validate(&self, _path: &Path) -> Result<Vec<String>> {
-        Err(FormatError::Other(
-            "reading GOO files is not implemented yet; CheapAzSLA can write them but not open them"
-                .into(),
-        )
-        .into())
+    fn validate(&self, path: &Path) -> Result<Vec<String>> {
+        let (_, _, warnings) = parse(path)?;
+        Ok(warnings)
     }
 
-    fn open(&self, _path: &Path) -> Result<OpenedFile> {
-        Err(FormatError::Other(
-            "reading GOO files is not implemented yet; CheapAzSLA can write them but not open them"
-                .into(),
-        )
-        .into())
+    fn open(&self, path: &Path) -> Result<OpenedFile> {
+        let (print, layers, _) = parse(path)?;
+        Ok(OpenedFile {
+            print,
+            layers: Box::new(layers),
+        })
     }
 
     fn write(&self, path: &Path, print: &PrintFile, layers: &dyn LayerProvider) -> Result<()> {
@@ -280,9 +599,7 @@ impl FormatHandler for GooHandler {
                 .get(index as usize)
                 .map(|l| l.z_mm)
                 .unwrap_or_else(|| e.layer_height_mm * (index + 1) as f32);
-            let exposure = print
-                .effective_exposure_s(index)
-                .unwrap_or(e.exposure_s);
+            let exposure = print.effective_exposure_s(index).unwrap_or(e.exposure_s);
             let is_bottom = index < bottom_layers;
 
             let mut rec: Vec<u8> = Vec::with_capacity(LAYER_PREAMBLE);

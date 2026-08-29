@@ -202,7 +202,9 @@ impl PrintFile {
         }
         let bottom = self.exposure.bottom_layers.unwrap_or(0);
         if index < bottom {
-            self.exposure.bottom_exposure_s.or(Some(self.exposure.exposure_s))
+            self.exposure
+                .bottom_exposure_s
+                .or(Some(self.exposure.exposure_s))
         } else {
             Some(self.exposure.exposure_s)
         }

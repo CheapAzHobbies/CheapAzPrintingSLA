@@ -36,11 +36,13 @@ pub fn check_allocation(declared: u64) -> Result<usize> {
 /// Uses checked arithmetic: a crafted file can otherwise pick values whose sum
 /// wraps and appears to be in bounds.
 pub fn check_range(offset: u64, length: u64, file_size: u64) -> Result<()> {
-    let end = offset.checked_add(length).ok_or(FormatError::OffsetOutOfBounds {
-        offset,
-        length,
-        file_size,
-    })?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(FormatError::OffsetOutOfBounds {
+            offset,
+            length,
+            file_size,
+        })?;
     if end > file_size {
         return Err(FormatError::OffsetOutOfBounds {
             offset,

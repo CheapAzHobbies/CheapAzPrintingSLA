@@ -63,7 +63,10 @@ fn main() {
     };
     let p = &opened.print;
     println!("\nPRINT");
-    println!("  resolution      {} x {}", p.geometry.resolution_x, p.geometry.resolution_y);
+    println!(
+        "  resolution      {} x {}",
+        p.geometry.resolution_x, p.geometry.resolution_y
+    );
     if let (Some(w), Some(h)) = (p.geometry.display_width_mm, p.geometry.display_height_mm) {
         println!("  display         {w} x {h} mm");
     }
@@ -76,11 +79,23 @@ fn main() {
         println!("  print height    {h:.2} mm");
     }
     println!("  exposure        {} s", p.exposure.exposure_s);
-    show("  bottom exposure", p.exposure.bottom_exposure_s.map(|v| format!("{v} s")));
-    show("  bottom layers  ", p.exposure.bottom_layers.map(|v| v.to_string()));
-    show("  transition     ", p.exposure.transition_layers.map(|v| format!("{v} layers")));
+    show(
+        "  bottom exposure",
+        p.exposure.bottom_exposure_s.map(|v| format!("{v} s")),
+    );
+    show(
+        "  bottom layers  ",
+        p.exposure.bottom_layers.map(|v| v.to_string()),
+    );
+    show(
+        "  transition     ",
+        p.exposure.transition_layers.map(|v| format!("{v} layers")),
+    );
     show("  print time     ", p.print_time_s.map(fmt_time));
-    show("  material       ", p.material_volume_ml.map(|v| format!("{v} ml")));
+    show(
+        "  material       ",
+        p.material_volume_ml.map(|v| format!("{v} ml")),
+    );
     show("  material name  ", p.material_name.clone());
     show("  printer        ", p.machine_name.clone());
     println!("  thumbnails      {}", p.thumbnails.len());
@@ -92,15 +107,23 @@ fn main() {
     }
 
     // --- layer ----------------------------------------------------------
-    let idx = layer_idx.unwrap_or(p.layer_count() / 2).min(p.layer_count().saturating_sub(1));
+    let idx = layer_idx
+        .unwrap_or(p.layer_count() / 2)
+        .min(p.layer_count().saturating_sub(1));
     match opened.layers.layer(idx) {
         Ok(img) => {
             let exposed = img.exposed_pixels(0);
             let total = img.width as u64 * img.height as u64;
             println!("\nLAYER {idx} of {}", p.layer_count());
             println!("  size            {} x {}", img.width, img.height);
-            println!("  exposed pixels  {exposed} ({:.4}% of the panel)", exposed as f64 / total as f64 * 100.0);
-            show("  exposure       ", p.effective_exposure_s(idx).map(|v| format!("{v} s")));
+            println!(
+                "  exposed pixels  {exposed} ({:.4}% of the panel)",
+                exposed as f64 / total as f64 * 100.0
+            );
+            show(
+                "  exposure       ",
+                p.effective_exposure_s(idx).map(|v| format!("{v} s")),
+            );
             if let Some(out) = out_png {
                 match write_png(&out, &img) {
                     Ok(_) => println!("  written to      {out}"),
@@ -128,6 +151,8 @@ fn write_png(path: &str, img: &cheapazsla_core::LayerImage) -> std::io::Result<(
     enc.set_color(png::ColorType::Grayscale);
     enc.set_depth(png::BitDepth::Eight);
     let mut writer = enc.write_header()?;
-    writer.write_image_data(&img.pixels).map_err(std::io::Error::other)?;
+    writer
+        .write_image_data(&img.pixels)
+        .map_err(std::io::Error::other)?;
     Ok(())
 }

@@ -16,9 +16,7 @@
 
 use super::ini;
 use crate::error::{Error, FormatError, Result};
-use crate::format::{
-    Capabilities, Confidence, Detection, FormatHandler, FormatInfo, OpenedFile,
-};
+use crate::format::{Capabilities, Confidence, Detection, FormatHandler, FormatInfo, OpenedFile};
 use crate::layers::LayerProvider;
 use crate::limits;
 use crate::model::*;
@@ -52,7 +50,6 @@ static INFO: FormatInfo = FormatInfo {
         print_time: true,
         material_volume: true,
         machine_name: true,
-        ..Capabilities::minimal()
     },
 };
 
@@ -93,9 +90,9 @@ impl LayerProvider for Sl1Layers {
         })?;
         let mut zip = zip::ZipArchive::new(file)
             .map_err(|e| FormatError::Other(format!("archive could not be opened: {e}")))?;
-        let mut entry = zip
-            .by_name(name)
-            .map_err(|e| FormatError::Other(format!("layer {index} is missing from the archive: {e}")))?;
+        let mut entry = zip.by_name(name).map_err(|e| {
+            FormatError::Other(format!("layer {index} is missing from the archive: {e}"))
+        })?;
         let declared = entry.size();
         let cap = limits::check_allocation(declared)?;
         let mut buf = Vec::with_capacity(cap.min(8 * 1024 * 1024));
@@ -166,7 +163,13 @@ fn decode_png_grey(bytes: &[u8], index: u32) -> Result<LayerImage> {
 fn sanitise_job_name(stem: &str) -> String {
     let cleaned: String = stem
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "print".to_string()
@@ -204,14 +207,29 @@ fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((r as u16 * 299 + g as u16 * 587 + b as u16 * 114) / 1000) as u8
 }
 
+/// What a scan of an SL1 archive yields: layer entry names in print order,
+/// thumbnail entry names, and the two settings files already parsed.
+type ArchiveIndex = (
+    Vec<String>,
+    Vec<String>,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+);
+
 /// Layer entry names in print order, and the thumbnails, from an archive.
-fn index_archive(path: &Path) -> Result<(Vec<String>, Vec<String>, BTreeMap<String, String>, BTreeMap<String, String>)> {
+fn index_archive(
+    path: &Path,
+) -> Result<(
+    Vec<String>,
+    Vec<String>,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+)> {
     let file = File::open(path).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|_| FormatError::BadMagic)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|_| FormatError::BadMagic)?;
 
     let mut layers: Vec<String> = Vec::new();
     let mut thumbs: Vec<String> = Vec::new();
@@ -370,9 +388,8 @@ impl FormatHandler for Sl1Handler {
         }
         limits::check_resolution(res_x, res_y)?;
 
-        let layer_height: f32 = ini::get(&config, "layerHeight").ok_or_else(|| {
-            FormatError::MissingField("layerHeight in config.ini".to_string())
-        })?;
+        let layer_height: f32 = ini::get(&config, "layerHeight")
+            .ok_or_else(|| FormatError::MissingField("layerHeight in config.ini".to_string()))?;
         if !(layer_height.is_finite() && layer_height > 0.0) {
             return Err(FormatError::InvalidValue {
                 field: "layerHeight".into(),
@@ -381,9 +398,8 @@ impl FormatHandler for Sl1Handler {
             }
             .into());
         }
-        let exposure_s: f32 = ini::get(&config, "expTime").ok_or_else(|| {
-            FormatError::MissingField("expTime in config.ini".to_string())
-        })?;
+        let exposure_s: f32 = ini::get(&config, "expTime")
+            .ok_or_else(|| FormatError::MissingField("expTime in config.ini".to_string()))?;
 
         let layers: Vec<LayerInfo> = (0..layer_names.len())
             .map(|i| LayerInfo {
@@ -401,8 +417,17 @@ impl FormatHandler for Sl1Handler {
         for (k, v) in &config {
             if !matches!(
                 k.as_str(),
-                "layerHeight" | "expTime" | "expTimeFirst" | "numFade" | "numFast" | "numSlow"
-                    | "printTime" | "usedMaterial" | "printerModel" | "materialName" | "jobDir"
+                "layerHeight"
+                    | "expTime"
+                    | "expTimeFirst"
+                    | "numFade"
+                    | "numFast"
+                    | "numSlow"
+                    | "printTime"
+                    | "usedMaterial"
+                    | "printerModel"
+                    | "materialName"
+                    | "jobDir"
             ) && !v.is_empty()
             {
                 extra.insert(format!("sl1.{k}"), v.clone());
@@ -576,7 +601,8 @@ impl FormatHandler for Sl1Handler {
             // uncompressed avoids paying for a second pass that gains nothing.
             let store: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            zip.start_file(format!("{job}{index:05}.png"), store).map_err(zerr)?;
+            zip.start_file(format!("{job}{index:05}.png"), store)
+                .map_err(zerr)?;
             zip.write_all(&png).map_err(|err| Error::Io {
                 path: path.to_path_buf(),
                 source: err,
@@ -631,11 +657,15 @@ fn decode_thumbnail(bytes: &[u8]) -> Result<Thumbnail> {
     let used = &buf[..frame.buffer_size()];
     let rgb = match frame.color_type {
         png::ColorType::Rgb => used.to_vec(),
-        png::ColorType::Rgba => used.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
+        png::ColorType::Rgba => used
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect(),
         png::ColorType::Grayscale => used.iter().flat_map(|&g| [g, g, g]).collect(),
-        png::ColorType::GrayscaleAlpha => {
-            used.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect()
-        }
+        png::ColorType::GrayscaleAlpha => used
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0]])
+            .collect(),
         _ => return Err(FormatError::Other("unsupported thumbnail encoding".into()).into()),
     };
     Ok(Thumbnail {

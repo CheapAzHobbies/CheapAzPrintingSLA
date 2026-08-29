@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  engine:
+    name: Engine (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.75"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # The engine has no GUI dependencies by design, so it builds and tests
+      # without any system libraries at all. If this job ever needs GTK,
+      # something has leaked across the crate boundary.
+      - name: Build engine
+        run: cargo build -p cheapazsla-core --verbose
+      - name: Test engine
+        run: cargo test -p cheapazsla-core --verbose
+      - name: Clippy
+        run: cargo clippy -p cheapazsla-core -- -D warnings
+      - name: Formatting
+        if: matrix.rust == 'stable'
+        run: cargo fmt --all -- --check
+
+  desktop:
+    name: Desktop application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GTK4 and libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+      - name: Build everything
+        run: cargo build --workspace --verbose
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  isolation:
+    name: Engine stays free of the interface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The separation between engine and interface is the main architectural
+      # promise here, so it is checked rather than assumed.
+      - name: No GUI toolkit in the engine's dependency tree
+        run: |
+          if cargo tree -p cheapazsla-core --prefix none \
+             | grep -Eiq '^(gtk4|libadwaita|gdk4|gsk4|glib)'; then
+            echo "::error::A GUI dependency has reached cheapazsla-core."
+            cargo tree -p cheapazsla-core
+            exit 1
+          fi
+          echo "Engine is free of GUI dependencies."
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Input files are untrusted, so a known advisory in a parsing dependency
+      # matters more here than in most projects.
+      - name: Audit
+        run: cargo audit

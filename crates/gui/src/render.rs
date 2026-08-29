@@ -48,7 +48,7 @@ fn downscale(img: &LayerImage, factor: u32) -> (u32, u32, Vec<u8>) {
                     count += 1;
                 }
             }
-            out[y * nw as usize + x] = if count > 0 { (sum / count) as u8 } else { 0 };
+            out[y * nw as usize + x] = sum.checked_div(count).unwrap_or(0) as u8;
         }
     }
     (nw, nh, out)
@@ -60,7 +60,7 @@ fn downscale(img: &LayerImage, factor: u32) -> (u32, u32, Vec<u8>) {
 /// tell the user they are not looking at full resolution.
 pub fn texture_for(img: &LayerImage) -> (gdk::Texture, u32) {
     let longest = img.width.max(img.height);
-    let factor = ((longest + MAX_EDGE - 1) / MAX_EDGE).max(1);
+    let factor = longest.div_ceil(MAX_EDGE).max(1);
     let (w, h, grey) = downscale(img, factor);
 
     // GTK has no 8-bit greyscale memory format, so expand to RGB. Tinting

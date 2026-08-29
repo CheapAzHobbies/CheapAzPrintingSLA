@@ -54,10 +54,10 @@ fn push_run(out: &mut Vec<u8>, value: u8, mut len: u32) {
         };
         let head_index = out.len();
         out.push(0); // control byte, filled in below
-        // A grey chunk carries its value in the byte immediately after the
-        // control byte, ahead of the length bytes. Putting it after them
-        // instead desynchronises every chunk that follows, which shows up
-        // only on layers that contain grey pixels at all.
+                     // A grey chunk carries its value in the byte immediately after the
+                     // control byte, ahead of the length bytes. Putting it after them
+                     // instead desynchronises every chunk that follows, which shows up
+                     // only on layers that contain grey pixels at all.
         if ty == TYPE_GREY {
             out.push(value);
         }
@@ -94,16 +94,18 @@ fn push_run(out: &mut Vec<u8>, value: u8, mut len: u32) {
 pub fn encode(pixels: &[u8], width: u32) -> (Vec<u8>, u64) {
     let mut out = Vec::with_capacity(pixels.len() / 32 + 16);
     let mut covered: u64 = 0;
-    let row = if width == 0 { pixels.len() } else { width as usize };
+    let row = if width == 0 {
+        pixels.len()
+    } else {
+        width as usize
+    };
 
     for line in pixels.chunks(row) {
         let mut i = 0usize;
         while i < line.len() {
             let value = line[i];
             let mut run = 1u32;
-            while (i + run as usize) < line.len()
-                && line[i + run as usize] == value
-                && run < MAX_28
+            while (i + run as usize) < line.len() && line[i + run as usize] == value && run < MAX_28
             {
                 run += 1;
             }
@@ -203,9 +205,7 @@ pub fn decode(payload: &[u8], expected_pixels: usize) -> Result<Vec<u8>, String>
         };
         previous = value;
         if out.len() as u64 + len as u64 > expected_pixels as u64 {
-            return Err(format!(
-                "runs describe more than {expected_pixels} pixels"
-            ));
+            return Err(format!("runs describe more than {expected_pixels} pixels"));
         }
         out.extend(std::iter::repeat(value).take(len as usize));
     }

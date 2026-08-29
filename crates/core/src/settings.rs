@@ -89,16 +89,32 @@ impl Settings {
         if let Some(v) = map.get("confirm_overwrite") {
             s.confirm_overwrite = v == "true";
         }
-        s.last_output_dir = map.get("last_output_dir").filter(|v| !v.is_empty()).map(PathBuf::from);
-        s.last_output_format = map.get("last_output_format").filter(|v| !v.is_empty()).cloned();
+        s.last_output_dir = map
+            .get("last_output_dir")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        s.last_output_format = map
+            .get("last_output_format")
+            .filter(|v| !v.is_empty())
+            .cloned();
         if let Some(v) = map.get("pinned_volumes") {
-            s.pinned_volumes = v.split('\x1f').filter(|p| !p.is_empty()).map(String::from).collect();
+            s.pinned_volumes = v
+                .split('\x1f')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
         }
         if let Some(v) = map.get("pinned_subfolder") {
             s.pinned_subfolder = v.clone();
         }
-        s.default_open_dir = map.get("default_open_dir").filter(|v| !v.is_empty()).map(PathBuf::from);
-        s.last_open_dir = map.get("last_open_dir").filter(|v| !v.is_empty()).map(PathBuf::from);
+        s.default_open_dir = map
+            .get("default_open_dir")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        s.last_open_dir = map
+            .get("last_open_dir")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         if let Some(v) = map.get("recent_output_dirs") {
             s.recent_output_dirs = v
                 .split('\x1f')
@@ -137,11 +153,20 @@ impl Settings {
              pinned_subfolder = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
-            self.last_output_dir.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            self.last_output_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             self.last_output_format.clone().unwrap_or_default(),
             recent,
-            self.default_open_dir.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-            self.last_open_dir.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            self.default_open_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            self.last_open_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             self.pinned_volumes.join("\x1f"),
             self.pinned_subfolder,
         );
@@ -186,7 +211,11 @@ impl Settings {
     /// dropped from the list rather than offered and then failing (§ drive
     /// removal).
     pub fn available_recent_dirs(&self) -> Vec<PathBuf> {
-        self.recent_output_dirs.iter().filter(|p| p.is_dir()).cloned().collect()
+        self.recent_output_dirs
+            .iter()
+            .filter(|p| p.is_dir())
+            .cloned()
+            .collect()
     }
 }
 
@@ -211,7 +240,10 @@ mod tests {
     #[test]
     fn defaults_warn_before_dropping_information() {
         let s = Settings::default();
-        assert!(s.warn_on_information_loss, "a user who has not chosen should be warned");
+        assert!(
+            s.warn_on_information_loss,
+            "a user who has not chosen should be warned"
+        );
         assert!(s.confirm_overwrite);
     }
 

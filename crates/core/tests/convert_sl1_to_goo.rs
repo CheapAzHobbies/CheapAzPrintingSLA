@@ -16,7 +16,11 @@ fn converts_a_real_sl1_into_a_goo() {
     };
     let dir = tempfile::tempdir().unwrap();
     let dst = convert::destination_for(&src, "goo", Some(dir.path())).expect("destination");
-    assert_eq!(dst.extension().unwrap(), "goo", "extension is swapped, stem kept");
+    assert_eq!(
+        dst.extension().unwrap(),
+        "goo",
+        "extension is swapped, stem kept"
+    );
 
     let plan = convert::plan(&src, "goo", &dst).expect("plan");
     println!("  {} -> {}", plan.from.name, plan.to.name);
@@ -33,7 +37,10 @@ fn converts_a_real_sl1_into_a_goo() {
     // The header must describe itself consistently.
     let bytes = std::fs::read(&dst).unwrap();
     assert_eq!(&bytes[..4], b"V3.0");
-    assert_eq!(&bytes[4..12], &[0x07, 0x00, 0x00, 0x00, 0x44, 0x4C, 0x50, 0x00]);
+    assert_eq!(
+        &bytes[4..12],
+        &[0x07, 0x00, 0x00, 0x00, 0x44, 0x4C, 0x50, 0x00]
+    );
     assert_eq!(
         &bytes[bytes.len() - 11..],
         &[0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x44, 0x4C, 0x50, 0x00],
@@ -45,8 +52,27 @@ fn converts_a_real_sl1_into_a_goo() {
     let be16 = |o: usize| u16::from_be_bytes(bytes[o..o + 2].try_into().unwrap());
     assert_eq!(be32(params), plan.layer_count, "layer count in header");
 
-    let off_field = params + 4 + 2 + 2 + 1 + 1 + 4 * 4 + 4 + 1 + 4 * 7 + 4 + 4 + 4 * 16
-        + 2 + 2 + 1 + 4 + 4 + 4 + 4 + 8;
+    let off_field = params
+        + 4
+        + 2
+        + 2
+        + 1
+        + 1
+        + 4 * 4
+        + 4
+        + 1
+        + 4 * 7
+        + 4
+        + 4
+        + 4 * 16
+        + 2
+        + 2
+        + 1
+        + 4
+        + 4
+        + 4
+        + 4
+        + 8;
     let layer_offset = be32(off_field) as usize;
     println!(
         "  header says layers start at {layer_offset}, resolution {}x{}",
@@ -73,13 +99,25 @@ fn converts_a_real_sl1_into_a_goo() {
             stored,
             "layer {i} checksum"
         );
-        assert_eq!(&bytes[p + 4 + size..p + 6 + size], &[0x0D, 0x0A], "layer {i} delimiter");
+        assert_eq!(
+            &bytes[p + 4 + size..p + 6 + size],
+            &[0x0D, 0x0A],
+            "layer {i} delimiter"
+        );
         p += 4 + size + 2;
     }
-    assert_eq!(p, bytes.len() - 11, "layers must end exactly at the trailer");
+    assert_eq!(
+        p,
+        bytes.len() - 11,
+        "layers must end exactly at the trailer"
+    );
     println!("  all {} layers verified", plan.layer_count);
 
-    std::fs::copy(&dst, "/tmp/claude-1000/-home-bao/b9cc5c32-916f-482d-9377-c2783027e087/scratchpad/mine.goo").ok();
+    std::fs::copy(
+        &dst,
+        "/tmp/claude-1000/-home-bao/b9cc5c32-916f-482d-9377-c2783027e087/scratchpad/mine.goo",
+    )
+    .ok();
 }
 
 #[test]
@@ -110,7 +148,10 @@ fn a_long_run_is_split_across_chunks_correctly() {
         assert_eq!(covered, len as u64, "run of {len}");
         let back = goo_rle::decode(&payload, len).expect("decode");
         assert_eq!(back.len(), len, "run of {len} decoded to the wrong length");
-        assert!(back.iter().all(|&p| p == 0xFF), "run of {len} changed value");
+        assert!(
+            back.iter().all(|&p| p == 0xFF),
+            "run of {len} changed value"
+        );
     }
 }
 
@@ -135,8 +176,27 @@ fn every_layer_survives_the_conversion_pixel_for_pixel() {
     let pixels_per_layer = (w * h) as usize;
 
     let params = 194 + 0x6920 + 2 + 0x29108 + 2;
-    let off_field = params + 4 + 2 + 2 + 1 + 1 + 4 * 4 + 4 + 1 + 4 * 7 + 4 + 4 + 4 * 16
-        + 2 + 2 + 1 + 4 + 4 + 4 + 4 + 8;
+    let off_field = params
+        + 4
+        + 2
+        + 2
+        + 1
+        + 1
+        + 4 * 4
+        + 4
+        + 1
+        + 4 * 7
+        + 4
+        + 4
+        + 4 * 16
+        + 2
+        + 2
+        + 1
+        + 4
+        + 4
+        + 4
+        + 4
+        + 8;
     let mut p = u32::from_be_bytes(bytes[off_field..off_field + 4].try_into().unwrap()) as usize;
 
     for index in 0..plan.layer_count {
@@ -148,7 +208,10 @@ fn every_layer_survives_the_conversion_pixel_for_pixel() {
         assert_eq!(decoded.len(), pixels_per_layer, "layer {index} pixel count");
 
         let original = opened.layers.layer(index).unwrap();
-        assert_eq!(decoded, original.pixels, "layer {index} differs after conversion");
+        assert_eq!(
+            decoded, original.pixels,
+            "layer {index} differs after conversion"
+        );
         p += 4 + size + 2;
     }
     println!(
@@ -185,8 +248,16 @@ fn conversion_reports_progress_for_every_layer() {
 
     let n = seen.load(Ordering::Relaxed);
     assert_eq!(n, plan.layer_count, "one report per layer");
-    assert_eq!(last.load(Ordering::Relaxed), plan.layer_count, "final report is the last layer");
-    assert_eq!(reported_total.load(Ordering::Relaxed), plan.layer_count, "total is reported");
+    assert_eq!(
+        last.load(Ordering::Relaxed),
+        plan.layer_count,
+        "final report is the last layer"
+    );
+    assert_eq!(
+        reported_total.load(Ordering::Relaxed),
+        plan.layer_count,
+        "total is reported"
+    );
     println!("  {n} progress reports for {} layers", plan.layer_count);
 }
 
@@ -220,12 +291,30 @@ fn an_sl1_survives_a_round_trip_through_our_own_writer() {
         again.print.geometry.resolution_y,
         original.print.geometry.resolution_y
     );
-    assert_eq!(again.print.geometry.display_width_mm, original.print.geometry.display_width_mm);
-    assert_eq!(again.print.geometry.display_height_mm, original.print.geometry.display_height_mm);
-    assert_eq!(again.print.exposure.layer_height_mm, original.print.exposure.layer_height_mm);
-    assert_eq!(again.print.exposure.exposure_s, original.print.exposure.exposure_s);
-    assert_eq!(again.print.exposure.bottom_exposure_s, original.print.exposure.bottom_exposure_s);
-    assert_eq!(again.print.exposure.bottom_layers, original.print.exposure.bottom_layers);
+    assert_eq!(
+        again.print.geometry.display_width_mm,
+        original.print.geometry.display_width_mm
+    );
+    assert_eq!(
+        again.print.geometry.display_height_mm,
+        original.print.geometry.display_height_mm
+    );
+    assert_eq!(
+        again.print.exposure.layer_height_mm,
+        original.print.exposure.layer_height_mm
+    );
+    assert_eq!(
+        again.print.exposure.exposure_s,
+        original.print.exposure.exposure_s
+    );
+    assert_eq!(
+        again.print.exposure.bottom_exposure_s,
+        original.print.exposure.bottom_exposure_s
+    );
+    assert_eq!(
+        again.print.exposure.bottom_layers,
+        original.print.exposure.bottom_layers
+    );
     assert_eq!(again.print.print_time_s, original.print.print_time_s);
     assert_eq!(again.print.machine_name, original.print.machine_name);
 
@@ -235,7 +324,10 @@ fn an_sl1_survives_a_round_trip_through_our_own_writer() {
         let b = again.layers.layer(i).unwrap();
         assert_eq!(a.width, b.width, "layer {i} width");
         assert_eq!(a.height, b.height, "layer {i} height");
-        assert_eq!(a.pixels, b.pixels, "layer {i} pixels changed in the round trip");
+        assert_eq!(
+            a.pixels, b.pixels,
+            "layer {i} pixels changed in the round trip"
+        );
     }
     println!(
         "  SL1 -> SL1: {} layers identical, all print settings preserved",

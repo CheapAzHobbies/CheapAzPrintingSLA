@@ -12,7 +12,10 @@ pub fn parse(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') || line.starts_with('[')
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with(';')
+            || line.starts_with('[')
         {
             continue;
         }
@@ -75,7 +78,11 @@ mod tests {
     #[test]
     fn a_malformed_number_is_absent_rather_than_zero() {
         let m = parse("expTime = banana\n");
-        assert_eq!(get::<f32>(&m, "expTime"), None, "must not silently become 0.0");
+        assert_eq!(
+            get::<f32>(&m, "expTime"),
+            None,
+            "must not silently become 0.0"
+        );
     }
 
     #[test]

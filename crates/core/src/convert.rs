@@ -168,10 +168,7 @@ pub fn run(plan: &Plan) -> Result<()> {
 ///
 /// Progress comes from counting layer fetches rather than from each writer
 /// reporting for itself, so a new format gets progress reporting for free.
-pub fn run_with_progress(
-    plan: &Plan,
-    on_progress: impl Fn(u32, u32) + Send + Sync,
-) -> Result<()> {
+pub fn run_with_progress(plan: &Plan, on_progress: impl Fn(u32, u32) + Send + Sync) -> Result<()> {
     let from = registry::by_id(plan.from.id).ok_or(Error::UnknownFormat)?;
     let to = registry::by_id(plan.to.id).ok_or(Error::UnknownFormat)?;
 
@@ -194,7 +191,9 @@ pub fn run_with_progress(
 pub fn destination_for(source: &Path, format_id: &str, into: Option<&Path>) -> Option<PathBuf> {
     let info = registry::by_id(format_id)?.info();
     let stem = source.file_stem()?;
-    let dir = into.map(Path::to_path_buf).or_else(|| source.parent().map(Path::to_path_buf))?;
+    let dir = into
+        .map(Path::to_path_buf)
+        .or_else(|| source.parent().map(Path::to_path_buf))?;
     let mut name = std::ffi::OsString::from(stem);
     name.push(".");
     name.push(info.extension);
@@ -208,8 +207,13 @@ pub fn unique_path(desired: &Path) -> PathBuf {
         return desired.to_path_buf();
     }
     let dir = desired.parent().unwrap_or(Path::new("."));
-    let stem = desired.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = desired.extension().map(|s| s.to_string_lossy().into_owned());
+    let stem = desired
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = desired
+        .extension()
+        .map(|s| s.to_string_lossy().into_owned());
     for n in 1..10_000 {
         let name = match &ext {
             Some(e) => format!("{stem} ({n}).{e}"),

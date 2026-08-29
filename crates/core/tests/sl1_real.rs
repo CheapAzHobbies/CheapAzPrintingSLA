@@ -70,7 +70,10 @@ fn reads_metadata_from_a_real_sl1() {
     if let Some((x, y)) = p.geometry.pixel_size_um() {
         println!("  pixel size {x:.1} x {y:.1} um");
     }
-    println!("  print time {:?}s  material {:?}ml", p.print_time_s, p.material_volume_ml);
+    println!(
+        "  print time {:?}s  material {:?}ml",
+        p.print_time_s, p.material_volume_ml
+    );
 }
 
 #[test]
@@ -78,19 +81,34 @@ fn decodes_real_layer_bitmaps_at_the_declared_size() {
     let path = real_or_skip!();
     let opened = registry::open(&path).expect("open");
     let (w, h) = opened.layers.dimensions();
-    assert_eq!((w, h), (opened.print.geometry.resolution_x, opened.print.geometry.resolution_y));
+    assert_eq!(
+        (w, h),
+        (
+            opened.print.geometry.resolution_x,
+            opened.print.geometry.resolution_y
+        )
+    );
 
     let first = opened.layers.layer(0).expect("first layer");
     assert_eq!(first.width, w);
     assert_eq!(first.height, h);
     assert_eq!(first.pixels.len(), w as usize * h as usize);
 
-    let last = opened.layers.layer(opened.print.layer_count() - 1).expect("last layer");
+    let last = opened
+        .layers
+        .layer(opened.print.layer_count() - 1)
+        .expect("last layer");
     assert_eq!(last.pixels.len(), w as usize * h as usize);
 
     // A real print has exposed geometry somewhere in the middle of the stack.
-    let mid = opened.layers.layer(opened.print.layer_count() / 2).expect("middle layer");
-    assert!(!mid.is_blank(), "a middle layer of a real print should expose something");
+    let mid = opened
+        .layers
+        .layer(opened.print.layer_count() / 2)
+        .expect("middle layer");
+    assert!(
+        !mid.is_blank(),
+        "a middle layer of a real print should expose something"
+    );
     println!("  middle layer exposes {} pixels", mid.exposed_pixels(0));
 }
 
@@ -98,8 +116,14 @@ fn decodes_real_layer_bitmaps_at_the_declared_size() {
 fn a_layer_past_the_end_of_a_real_file_errors_cleanly() {
     let path = real_or_skip!();
     let opened = registry::open(&path).expect("open");
-    let err = opened.layers.layer(opened.print.layer_count() + 500).unwrap_err();
-    assert!(matches!(err, cheapazsla_core::Error::LayerOutOfRange { .. }));
+    let err = opened
+        .layers
+        .layer(opened.print.layer_count() + 500)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        cheapazsla_core::Error::LayerOutOfRange { .. }
+    ));
 }
 
 #[test]

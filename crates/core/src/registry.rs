@@ -40,7 +40,9 @@ pub fn writable() -> Vec<&'static FormatInfo> {
 
 /// Look up a handler by its stable id, e.g. `"sl1"`.
 pub fn by_id(id: &str) -> Option<&'static dyn FormatHandler> {
-    handlers().into_iter().find(|h| h.info().id.eq_ignore_ascii_case(id))
+    handlers()
+        .into_iter()
+        .find(|h| h.info().id.eq_ignore_ascii_case(id))
 }
 
 /// Look up a handler by extension, primary or alias.
@@ -85,7 +87,8 @@ pub fn identify(path: &Path) -> Result<Identified> {
         .map(|h| h.detect(path, &head))
         .filter(|d| d.confidence > Confidence::None)
         .collect();
-    scored.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    // Most confident first.
+    scored.sort_by_key(|d| std::cmp::Reverse(d.confidence));
 
     let best = scored.first().cloned().ok_or(Error::UnknownFormat)?;
 

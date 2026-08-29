@@ -58,7 +58,10 @@ fn our_decoder_reproduces_a_real_goo_layer() {
     };
     let bytes = std::fs::read(&goo).unwrap();
     let (layers, xres, yres, payload, checksum) = first_layer_payload(&bytes);
-    println!("  goo: {layers} layers, {xres}x{yres}, payload {} bytes", payload.len());
+    println!(
+        "  goo: {layers} layers, {xres}x{yres}, payload {} bytes",
+        payload.len()
+    );
 
     // The checksum must agree, or we are not looking at the payload we think.
     assert_eq!(
@@ -79,8 +82,10 @@ fn our_decoder_reproduces_a_real_goo_layer() {
 
 #[test]
 fn a_goo_layer_matches_the_same_layer_from_the_sl1() {
-    let (Some(goo), Some(sl1)) = (env_file("CHEAPAZSLA_REAL_GOO"), env_file("CHEAPAZSLA_REAL_SL1"))
-    else {
+    let (Some(goo), Some(sl1)) = (
+        env_file("CHEAPAZSLA_REAL_GOO"),
+        env_file("CHEAPAZSLA_REAL_SL1"),
+    ) else {
         eprintln!("skipped: set CHEAPAZSLA_REAL_GOO and CHEAPAZSLA_REAL_SL1");
         return;
     };

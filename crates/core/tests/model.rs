@@ -81,9 +81,21 @@ fn pixel_size_does_not_divide_by_zero() {
 #[test]
 fn bottom_layers_use_bottom_exposure() {
     let p = print_file((0..10).map(|i| layer_at(0.05 * (i + 1) as f32)).collect());
-    assert_eq!(p.effective_exposure_s(0), Some(30.0), "layer 0 is a bottom layer");
-    assert_eq!(p.effective_exposure_s(4), Some(30.0), "layer 4 is the last bottom layer");
-    assert_eq!(p.effective_exposure_s(5), Some(2.5), "layer 5 is a normal layer");
+    assert_eq!(
+        p.effective_exposure_s(0),
+        Some(30.0),
+        "layer 0 is a bottom layer"
+    );
+    assert_eq!(
+        p.effective_exposure_s(4),
+        Some(30.0),
+        "layer 4 is the last bottom layer"
+    );
+    assert_eq!(
+        p.effective_exposure_s(5),
+        Some(2.5),
+        "layer 5 is a normal layer"
+    );
 }
 
 #[test]
@@ -141,21 +153,30 @@ fn a_range_inside_the_file_is_accepted() {
 #[test]
 fn a_range_past_the_end_is_rejected() {
     let err = limits::check_range(50, 51, 100).unwrap_err();
-    assert!(matches!(err, Error::Format(FormatError::OffsetOutOfBounds { .. })));
+    assert!(matches!(
+        err,
+        Error::Format(FormatError::OffsetOutOfBounds { .. })
+    ));
 }
 
 #[test]
 fn an_offset_and_length_that_would_overflow_are_rejected() {
     // A crafted file can pick values whose sum wraps to look in bounds.
     let err = limits::check_range(u64::MAX, 10, 100).unwrap_err();
-    assert!(matches!(err, Error::Format(FormatError::OffsetOutOfBounds { .. })));
+    assert!(matches!(
+        err,
+        Error::Format(FormatError::OffsetOutOfBounds { .. })
+    ));
 }
 
 #[test]
 fn an_oversized_allocation_is_refused() {
     assert!(limits::check_allocation(1024).is_ok());
     let err = limits::check_allocation(limits::MAX_ALLOCATION + 1).unwrap_err();
-    assert!(matches!(err, Error::Format(FormatError::AllocationTooLarge { .. })));
+    assert!(matches!(
+        err,
+        Error::Format(FormatError::AllocationTooLarge { .. })
+    ));
 }
 
 #[test]
@@ -196,7 +217,13 @@ fn layers_can_be_fetched_by_index() {
 #[test]
 fn fetching_a_layer_past_the_end_is_an_error_not_a_panic() {
     let err = provider(5).layer(99).unwrap_err();
-    assert!(matches!(err, Error::LayerOutOfRange { index: 99, count: 5 }));
+    assert!(matches!(
+        err,
+        Error::LayerOutOfRange {
+            index: 99,
+            count: 5
+        }
+    ));
 }
 
 #[test]
@@ -220,7 +247,11 @@ fn clearing_the_cache_empties_it() {
     assert_eq!(cached.cached_len(), 1);
     cached.clear();
     assert_eq!(cached.cached_len(), 0);
-    assert_eq!(cached.layer(1).unwrap().pixels[0], 1, "still readable after a clear");
+    assert_eq!(
+        cached.layer(1).unwrap().pixels[0],
+        1,
+        "still readable after a clear"
+    );
 }
 
 // --- capability honesty (§47) ---
