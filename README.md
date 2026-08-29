@@ -148,6 +148,10 @@ without holding the whole stack in memory.
 Anything marked not started is absent, not stubbed. There are no buttons that
 do nothing.
 
+What is coming and in what order is in [docs/ROADMAP.md](docs/ROADMAP.md),
+including which of the thirty-odd resin formats are worth adding and which
+are not.
+
 ## Building
 
 Needs a Rust toolchain and GTK4 development headers.
