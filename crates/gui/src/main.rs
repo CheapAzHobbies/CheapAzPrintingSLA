@@ -23,7 +23,7 @@ use cheapazsla_core::{convert, registry, OpenedFile};
 use gtk::glib;
 use gtk::{gdk, gio};
 use shell::Section;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -161,6 +161,12 @@ struct App {
     settings: RefCell<Settings>,
     history: RefCell<History>,
     playing: RefCell<Option<glib::SourceId>>,
+    /// Incremented on every layer request. A decode that finishes after a
+    /// newer one was asked for is discarded rather than drawn.
+    layer_request: Cell<u64>,
+    /// Built layer textures, so revisiting a layer is immediate.
+    textures: RefCell<std::collections::HashMap<u32, Drawn>>,
+    texture_order: RefCell<std::collections::VecDeque<u32>>,
     converting: RefCell<bool>,
 }
 
@@ -327,6 +333,9 @@ fn build(app: &adw::Application) -> Rc<App> {
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 1.0);
     slider.set_hexpand(true);
     slider.set_draw_value(false);
+    // Wide enough to be usable even in a narrow window; scrubbing a
+    // thousand-layer print through a stub of a slider is no use.
+    slider.set_size_request(200, -1);
     let play_btn = shell::icon_button("media-playback-start-symbolic", "Play  (Space)");
     let info_panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     let (preview_page, preview_stack) = build_preview_page(
@@ -393,6 +402,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         settings: RefCell::new(Settings::load()),
         history: RefCell::new(History::load()),
         playing: RefCell::new(None),
+        layer_request: Cell::new(0),
+        textures: RefCell::new(std::collections::HashMap::new()),
+        texture_order: RefCell::new(std::collections::VecDeque::new()),
         converting: RefCell::new(false),
     });
 
@@ -648,8 +660,6 @@ fn build_preview_page(
     bar.append(&nav);
     bar.append(slider);
     bar.append(&labels);
-    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    bar.append(&viewer.controls());
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.append(&viewer.widget);
@@ -1410,6 +1420,10 @@ fn select_file(ui: &Rc<App>, index: usize) {
     let index = index.min(len - 1);
     *ui.selected.borrow_mut() = index;
     stop_play(ui);
+    // Keyed by layer number, so it must not outlive the file it came from or
+    // the wrong image is shown instantly and convincingly.
+    ui.textures.borrow_mut().clear();
+    ui.texture_order.borrow_mut().clear();
 
     let (input, count, ready) = {
         let files = ui.files.borrow();
@@ -1521,6 +1535,14 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     ui.layer_label
         .set_text(&format!("Layer {} / {}", index + 1, count));
 
+    // Dragging the slider across a long print asks for a great many layers in
+    // quick succession, each of which is a multi-megapixel decode. Only the
+    // most recent request is worth drawing: the rest have already been
+    // superseded before they finish, and painting them makes the preview lag
+    // behind the slider and appear stuck.
+    let request = ui.layer_request.get().wrapping_add(1);
+    ui.layer_request.set(request);
+
     // Panels are often not square-pixelled, so the preview is corrected to the
     // physical proportions of the build area rather than drawn one bitmap
     // pixel to one screen pixel.
@@ -1529,7 +1551,24 @@ fn show_layer(ui: &Rc<App>, index: u32) {
         .geometry
         .pixel_size_um()
         .map(|(x_um, y_um)| render::PixelSize { x_um, y_um });
+    // Whether the correction was applied, so the caption can say so.
+    let square = pixel
+        .map(|p| (p.y_um / p.x_um - 1.0).abs() < 0.01)
+        .unwrap_or(true);
 
+    // Already built: draw it now. Scrubbing revisits layers constantly, and
+    // rebuilding a texture still in hand makes the slider feel like it is
+    // dragging something heavy.
+    if let Some(cached) = ui.textures.borrow().get(&index).cloned() {
+        draw_layer(ui, &cached, square);
+        return;
+    }
+
+    // Not cached: decode on a worker, starting immediately. An earlier version
+    // waited 35ms to avoid decoding layers being scrubbed past, which traded
+    // away the immediacy that makes scrubbing useful. The request number
+    // already stops a stale result being drawn, and the cache means most of
+    // these never happen a second time.
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let result = opened.layers.layer(index).map(|img| {
@@ -1539,36 +1578,92 @@ fn show_layer(ui: &Rc<App>, index: u32) {
         });
         let _ = tx.send_blocking(result);
     });
+    finish_layer(ui, rx, request, square, index);
+}
 
-    let square = pixel
-        .map(|p| (p.y_um / p.x_um - 1.0).abs() < 0.01)
-        .unwrap_or(true);
+/// A built layer, ready to draw.
+#[derive(Clone)]
+struct Drawn {
+    texture: gdk::Texture,
+    factor: u32,
+    exposed: u64,
+    total: u64,
+}
+
+/// Put a built layer on screen and update the caption beneath it.
+fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool) {
+    ui.viewer.set_texture(&d.texture);
+    let pct = if d.total > 0 {
+        d.exposed as f64 / d.total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let mut note = format!("{} px exposed ({pct:.3}%)", d.exposed);
+    if d.factor > 1 {
+        note.push_str(&format!("  ·  shown at 1/{}", d.factor));
+    }
+    if !square {
+        note.push_str("  ·  corrected for non-square pixels");
+    }
+    ui.layer_detail.set_text(&note);
+}
+
+/// Draw a decoded layer, unless a newer one has been asked for since.
+/// A decoded layer on its way to the screen.
+type DecodedLayer = Result<((gdk::Texture, u32), u64, u64), cheapazsla_core::Error>;
+
+fn finish_layer(
+    ui: &Rc<App>,
+    rx: async_channel::Receiver<DecodedLayer>,
+    request: u64,
+    square: bool,
+    index: u32,
+) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        match rx.recv().await {
+        let received = rx.recv().await;
+        match received {
             Ok(Ok(((texture, factor), exposed, total))) => {
-                ui.viewer.set_texture(&texture);
-                let pct = if total > 0 {
-                    exposed as f64 / total as f64 * 100.0
-                } else {
-                    0.0
+                let drawn = Drawn {
+                    texture,
+                    factor,
+                    exposed,
+                    total,
                 };
-                let mut note = format!("{exposed} px exposed ({pct:.3}%)");
-                if factor > 1 {
-                    note.push_str(&format!("  ·  shown at 1/{factor}"));
+                // Cached whether or not it is still wanted: the work is done,
+                // and the user is very likely to scrub back over it.
+                remember_texture(&ui, index, drawn.clone());
+                if ui.layer_request.get() == request {
+                    draw_layer(&ui, &drawn, square);
                 }
-                if !square {
-                    note.push_str("  ·  corrected for non-square pixels");
-                }
-                ui.layer_detail.set_text(&note);
             }
             Ok(Err(e)) => {
-                ui.layer_detail.set_text("layer could not be decoded");
-                ui.toasts.add_toast(adw::Toast::new(&e.to_string()));
+                if ui.layer_request.get() == request {
+                    ui.layer_detail.set_text("layer could not be decoded");
+                    ui.toasts.add_toast(adw::Toast::new(&e.to_string()));
+                }
             }
             Err(_) => {}
         }
     });
+}
+
+/// How many built layers to keep. Sized in layers rather than bytes because a
+/// layer's size is fixed for a given file, so a count is a predictable proxy
+/// for memory.
+const TEXTURE_CACHE: usize = 48;
+
+fn remember_texture(ui: &Rc<App>, index: u32, drawn: Drawn) {
+    let mut cache = ui.textures.borrow_mut();
+    let mut order = ui.texture_order.borrow_mut();
+    if cache.insert(index, drawn).is_none() {
+        order.push_back(index);
+    }
+    while order.len() > TEXTURE_CACHE {
+        if let Some(oldest) = order.pop_front() {
+            cache.remove(&oldest);
+        }
+    }
 }
 
 fn toggle_play(ui: &Rc<App>) {

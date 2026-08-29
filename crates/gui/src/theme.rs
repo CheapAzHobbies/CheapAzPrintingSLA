@@ -177,6 +177,15 @@ button.cz-inline {{
   margin: 0;
 }}
 
+/* A control bar floating over the image. Opaque enough to stay readable over
+   whatever layer is behind it. */
+.cz-overlay-bar {{
+  background-color: alpha(@cz_panel, 0.92);
+  border: 1px solid @cz_border;
+  border-radius: 6px;
+  padding: 2px 4px;
+}}
+
 /* The arrow says one format becomes another, which is the meaning of the row.
    Dimmed at 12px it read as decoration. */
 .cz-arrow {{ color: @cz_accent; }}

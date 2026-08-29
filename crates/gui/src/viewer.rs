@@ -60,14 +60,15 @@ impl LayerViewer {
             .child(&picture)
             .build();
 
-        let frame = gtk::Frame::builder().child(&scroller).build();
+        let overlay = gtk::Overlay::builder().child(&scroller).build();
+        let frame = gtk::Frame::builder().child(&overlay).build();
         frame.add_css_class("cz-panel");
         frame.set_hexpand(true);
         frame.set_vexpand(true);
 
         let zoom_label = gtk::Label::new(Some("Fit"));
         zoom_label.add_css_class("caption");
-        zoom_label.add_css_class("cz-dim");
+        zoom_label.add_css_class("cz-value");
         zoom_label.set_width_chars(6);
 
         let me = Rc::new(Self {
@@ -79,19 +80,26 @@ impl LayerViewer {
             natural: Cell::new((0, 0)),
         });
         me.widget.append(&frame);
+        overlay.add_overlay(&me.controls());
 
         me.install_wheel();
         me.install_drag();
+        me.install_double_click();
         me
     }
 
-    /// The zoom controls, so the caller can place them in its own bar.
-    pub fn controls(self: &Rc<Self>) -> gtk::Box {
+    /// The zoom controls, as an overlay in the corner of the image.
+    ///
+    /// They were briefly a row in the layer bar, which squeezed the layer
+    /// slider down to almost nothing. They belong over the thing they act on.
+    fn controls(self: &Rc<Self>) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
 
         let out = crate::shell::icon_button("zoom-out-symbolic", "Zoom out  (−)");
         let inn = crate::shell::icon_button("zoom-in-symbolic", "Zoom in  (+)");
-        let fit = crate::shell::icon_button("zoom-fit-best-symbolic", "Fit to window  (0)");
+        let fit = gtk::Button::with_label("Fit");
+        fit.add_css_class("flat");
+        fit.set_tooltip_text(Some("Show the whole plate  (0, or double click)"));
         let one = crate::shell::icon_button("zoom-original-symbolic", "Actual size  (1)");
 
         {
@@ -114,8 +122,14 @@ impl LayerViewer {
         row.append(&out);
         row.append(&self.zoom_label);
         row.append(&inn);
+        row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         row.append(&fit);
         row.append(&one);
+        row.add_css_class("cz-overlay-bar");
+        row.set_halign(gtk::Align::End);
+        row.set_valign(gtk::Align::End);
+        row.set_margin_end(theme::SPACE_3);
+        row.set_margin_bottom(theme::SPACE_3);
         row
     }
 
@@ -145,15 +159,7 @@ impl LayerViewer {
     pub fn effective_zoom(&self) -> f64 {
         match self.zoom.get() {
             Some(z) => z,
-            None => {
-                let (w, h) = self.natural.get();
-                if w == 0 || h == 0 {
-                    return 1.0;
-                }
-                let aw = self.scroller.width().max(1) as f64;
-                let ah = self.scroller.height().max(1) as f64;
-                (aw / w as f64).min(ah / h as f64).min(1.0)
-            }
+            None => self.fit_zoom(),
         }
     }
 
@@ -168,7 +174,28 @@ impl LayerViewer {
     }
 
     fn zoom_by(self: &Rc<Self>, factor: f64, anchor: Option<(f64, f64)>) {
-        self.set_zoom(self.effective_zoom() * factor, anchor);
+        let target = self.effective_zoom() * factor;
+        // Zooming out lands on Fit and stops there. The whole plate is the
+        // view people return to after examining something, and stepping past
+        // it into a postage stamp helps nobody. Fit is also the state the
+        // window keeps in step as it resizes, so landing on it exactly rather
+        // than near it matters.
+        if factor < 1.0 && target <= self.fit_zoom() {
+            self.fit();
+            return;
+        }
+        self.set_zoom(target, anchor);
+    }
+
+    /// The factor at which the whole layer is visible in the current pane.
+    fn fit_zoom(&self) -> f64 {
+        let (w, h) = self.natural.get();
+        if w == 0 || h == 0 {
+            return 1.0;
+        }
+        let aw = self.scroller.width().max(1) as f64;
+        let ah = self.scroller.height().max(1) as f64;
+        (aw / w as f64).min(ah / h as f64).min(1.0)
     }
 
     /// Hold the point under the pointer still across a zoom.
@@ -202,7 +229,10 @@ impl LayerViewer {
                 self.zoom_label.set_text("Fit");
             }
             Some(z) => {
-                self.picture.set_content_fit(gtk::ContentFit::Fill);
+                // Contain, not Fill. Fill ignores the aspect ratio, so any
+                // moment the allocation does not exactly match the request the
+                // layer is stretched, which is what made zooming look wrong.
+                self.picture.set_content_fit(gtk::ContentFit::Contain);
                 self.picture.set_size_request(
                     ((w as f64 * z).round() as i32).max(1),
                     ((h as f64 * z).round() as i32).max(1),
@@ -239,7 +269,28 @@ impl LayerViewer {
             me.zoom_by(factor, Some(pointer.get()));
             glib::Propagation::Stop
         });
+        // Capture, not bubble. A scrolled window with something to scroll
+        // handles the wheel itself, so a controller in the default phase never
+        // sees the event once the layer is larger than the pane, which leaves
+        // the view stuck at whatever magnification it reached.
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
         self.scroller.add_controller(scroll);
+    }
+
+    fn install_double_click(self: &Rc<Self>) {
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_PRIMARY);
+        let me = self.clone();
+        click.connect_pressed(move |_, n, x, y| {
+            if n == 2 {
+                if me.is_fit() {
+                    me.set_zoom(1.0, Some((x, y)));
+                } else {
+                    me.fit();
+                }
+            }
+        });
+        self.scroller.add_controller(click);
     }
 
     fn install_drag(self: &Rc<Self>) {
@@ -270,6 +321,7 @@ impl LayerViewer {
                 v.set_value((sy - dy).clamp(v.lower(), (v.upper() - v.page_size()).max(v.lower())));
             });
         }
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
         self.scroller.add_controller(drag);
     }
 
