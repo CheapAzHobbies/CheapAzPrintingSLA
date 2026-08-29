@@ -174,17 +174,63 @@ pub fn run_with_progress(plan: &Plan, on_progress: impl Fn(u32, u32) + Send + Sy
 
     let opened = from.open(&plan.source)?;
     let counted = crate::layers::ProgressLayers::new(opened.layers.as_ref(), on_progress);
-    to.write(&plan.destination, &opened.print, &counted)?;
 
-    // Confirm something actually landed (§25).
-    match std::fs::metadata(&plan.destination) {
-        Ok(m) if m.len() > 0 => Ok(()),
-        Ok(_) => Err(FormatError::Other("the written file is empty".into()).into()),
-        Err(e) => Err(Error::Io {
+    // Write to a temporary name beside the destination and rename only once
+    // the whole file is there.
+    //
+    // A print file that stops halfway still opens, still reports a layer count
+    // from its header, and still looks like a finished job in a file manager.
+    // Killed mid-conversion, the old code left exactly that behind, and a
+    // half-written file on a USB stick is something a person can carry to a
+    // printer. Renaming within the same directory is atomic, so the
+    // destination either does not exist or is complete.
+    let temp = temp_path(&plan.destination);
+    let result = to.write(&temp, &opened.print, &counted);
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    match std::fs::metadata(&temp) {
+        Ok(m) if m.len() > 0 => {}
+        Ok(_) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(FormatError::Other("the written file is empty".into()).into());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::Io {
+                path: temp,
+                source: e,
+            });
+        }
+    }
+    std::fs::rename(&temp, &plan.destination).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        Error::Io {
             path: plan.destination.clone(),
             source: e,
-        }),
-    }
+        }
+    })
+}
+
+/// A sibling path to write to before the rename.
+///
+/// Deliberately in the same directory: rename is only atomic within a
+/// filesystem, and a temporary directory may well be on a different one.
+/// The leading dot keeps it out of the way if anything ever does interrupt
+/// hard enough to leave it behind.
+fn temp_path(destination: &Path) -> PathBuf {
+    let dir = destination.parent().unwrap_or(Path::new("."));
+    let name = destination
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(".{name}.{stamp}.part"))
 }
 
 /// Swap a path's extension for the one belonging to `format_id`.

@@ -334,3 +334,69 @@ fn an_sl1_survives_a_round_trip_through_our_own_writer() {
         original.print.layer_count()
     );
 }
+
+#[test]
+fn a_failed_conversion_leaves_no_file_behind() {
+    // A half-written print file still opens, still reports a layer count from
+    // its header, and still looks finished in a file manager. Leaving one
+    // behind is worse than writing nothing.
+    let Some(src) = real_sl1() else {
+        eprintln!("skipped: set CHEAPAZSLA_REAL_SL1");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("target.goo");
+    let plan = convert::plan(&src, "goo", &dst).unwrap();
+
+    // Fail partway by making the destination directory read-only after the
+    // plan is made, so the write cannot complete.
+    let readonly = dir.path().join("locked");
+    std::fs::create_dir(&readonly).unwrap();
+    let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o500);
+    }
+    std::fs::set_permissions(&readonly, perms).unwrap();
+
+    let blocked = readonly.join("nope.goo");
+    let mut blocked_plan = plan.clone();
+    blocked_plan.destination = blocked.clone();
+    assert!(
+        convert::run(&blocked_plan).is_err(),
+        "writing here should fail"
+    );
+    assert!(!blocked.exists(), "no output should be left behind");
+
+    // And no stray temporary file either.
+    let strays: Vec<_> = std::fs::read_dir(&readonly)
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(strays.is_empty(), "left temporary files: {strays:?}");
+}
+
+#[test]
+fn a_successful_conversion_leaves_no_temporary_file() {
+    let Some(src) = real_sl1() else {
+        eprintln!("skipped");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dst = convert::destination_for(&src, "goo", Some(dir.path())).unwrap();
+    let plan = convert::plan(&src, "goo", &dst).unwrap();
+    convert::run(&plan).unwrap();
+
+    let entries: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the output should remain: {entries:?}"
+    );
+    assert!(entries[0].ends_with(".goo"));
+    assert!(!entries[0].contains(".part"));
+}
