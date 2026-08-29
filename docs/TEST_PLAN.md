@@ -176,6 +176,10 @@ Run through this before a release. Tick each line.
 - [ ] The zoom stays put when stepping to the next layer
 - [ ] Scrollbars appear only when zoomed past the pane
 - [ ] Scrubbing quickly does not freeze the window
+- [ ] Scrubbing fast keeps the picture moving rather than holding one frame
+- [ ] While it is showing a stand-in, the caption says so and the layer number
+      is dimmed, and it never claims to be the layer that was selected
+- [ ] Stopping resolves to the exact layer within a moment
 
 ### Converting
 

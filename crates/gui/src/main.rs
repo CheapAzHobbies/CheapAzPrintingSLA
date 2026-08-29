@@ -172,6 +172,9 @@ struct App {
     /// Which way the user is scrubbing, so prefetching reads ahead rather
     /// than behind.
     last_layer: Cell<u32>,
+    /// When the previous layer was asked for, so the speed of scrubbing can
+    /// be judged.
+    last_request_at: RefCell<Option<std::time::Instant>>,
     converting: RefCell<bool>,
 }
 
@@ -412,6 +415,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         texture_order: RefCell::new(std::collections::VecDeque::new()),
         in_flight: RefCell::new(std::collections::HashSet::new()),
         last_layer: Cell::new(0),
+        last_request_at: RefCell::new(None),
         converting: RefCell::new(false),
     });
 
@@ -1540,8 +1544,6 @@ fn show_layer(ui: &Rc<App>, index: u32) {
         return;
     }
     let index = index.min(count - 1);
-    ui.layer_label
-        .set_text(&format!("Layer {} / {}", index + 1, count));
 
     // Dragging the slider across a long print asks for a great many layers in
     // quick succession, each of which is a multi-megapixel decode. Only the
@@ -1567,19 +1569,88 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     // Already built: draw it now. Scrubbing revisits layers constantly, and
     // rebuilding a texture still in hand makes the slider feel like it is
     // dragging something heavy.
+    // How fast the slider is moving, judged from the gap between requests.
+    let moving_fast = {
+        let mut last = ui.last_request_at.borrow_mut();
+        let fast = last
+            .map(|t| t.elapsed() < std::time::Duration::from_millis(90))
+            .unwrap_or(false);
+        *last = Some(std::time::Instant::now());
+        fast
+    };
+
     let cached = ui.textures.borrow().get(&index).cloned();
     if let Some(cached) = cached {
-        draw_layer(ui, &cached, square);
+        draw_layer(ui, &cached, square, index, count, false);
         prefetch_around(ui, index, count, pixel);
         ui.last_layer.set(index);
         return;
     }
 
-    // Not cached: decode on a worker, starting immediately. An earlier version
-    // waited 35ms to avoid decoding layers being scrubbed past, which traded
-    // away the immediacy that makes scrubbing useful. The request number
-    // already stops a stale result being drawn, and the cache means most of
-    // these never happen a second time.
+    // Not built yet. Rather than leave the last layer sitting there while a
+    // decode runs, show the nearest one already built so the view keeps up
+    // with the slider. It is replaced by the real layer as soon as that
+    // arrives, and the caption says plainly that what is on screen is not the
+    // layer asked for, because an inspection tool that quietly shows you a
+    // different layer than the one you selected is worse than a slow one.
+    let mut stood_in = false;
+    if moving_fast {
+        if let Some((near, drawn)) = nearest_built(ui, index) {
+            draw_layer(ui, &drawn, square, near, count, near != index);
+            stood_in = true;
+        }
+    }
+
+    // Moving fast with something on screen: hold off. Every layer being flown
+    // past costs a full decode, and by the time it finishes the slider has
+    // moved on, so the work is thrown away and the machine is busy doing it.
+    // Waiting a moment means only the layer actually landed on is decoded.
+    //
+    // This is what makes fast scrubbing feel smooth rather than being smooth:
+    // the picture keeps changing from what is already built, and the exact
+    // layer resolves the instant the user slows down.
+    if stood_in {
+        let ui_later = ui.clone();
+        let opened_later = opened.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(70), move || {
+            if ui_later.layer_request.get() != request {
+                return; // still moving; this is not where they stopped
+            }
+            decode_and_show(
+                &ui_later,
+                opened_later,
+                index,
+                count,
+                pixel,
+                square,
+                request,
+            );
+        });
+        ui.last_layer.set(index);
+        return;
+    }
+
+    decode_and_show(ui, opened, index, count, pixel, square, request);
+    ui.last_layer.set(index);
+}
+
+/// Start the decode for one layer and show it when it arrives.
+#[allow(clippy::too_many_arguments)]
+fn decode_and_show(
+    ui: &Rc<App>,
+    opened: Arc<OpenedFile>,
+    index: u32,
+    count: u32,
+    pixel: Option<render::PixelSize>,
+    square: bool,
+    request: u64,
+) {
+    // Already built while we were waiting.
+    if let Some(cached) = ui.textures.borrow().get(&index).cloned() {
+        draw_layer(ui, &cached, square, index, count, false);
+        prefetch_around(ui, index, count, pixel);
+        return;
+    }
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let result = opened.layers.layer(index).map(|img| {
@@ -1591,7 +1662,6 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     ui.in_flight.borrow_mut().insert(index);
     finish_layer(ui, rx, request, square, index);
     prefetch_around(ui, index, count, pixel);
-    ui.last_layer.set(index);
 }
 
 /// How many layers to read ahead once the user settles.
@@ -1688,9 +1758,24 @@ struct Drawn {
     total: u64,
 }
 
-/// Put a built layer on screen and update the caption beneath it.
-fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool) {
+/// Put a built layer on screen and update the labels beneath it.
+///
+/// `shown` is the layer actually on screen, which during fast scrubbing may
+/// not yet be the one selected. When they differ the labels say so rather
+/// than letting the number claim something the image does not show.
+fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool, shown: u32, count: u32, approximate: bool) {
     ui.viewer.set_texture(&d.texture);
+    ui.layer_label
+        .set_text(&format!("Layer {} / {}", shown + 1, count));
+
+    if approximate {
+        ui.layer_detail
+            .set_text("nearest built layer, still loading…");
+        ui.layer_label.add_css_class("cz-dim");
+        return;
+    }
+    ui.layer_label.remove_css_class("cz-dim");
+
     let pct = if d.total > 0 {
         d.exposed as f64 / d.total as f64 * 100.0
     } else {
@@ -1704,6 +1789,20 @@ fn draw_layer(ui: &Rc<App>, d: &Drawn, square: bool) {
         note.push_str("  ·  corrected for non-square pixels");
     }
     ui.layer_detail.set_text(&note);
+}
+
+/// The built layer closest to the one asked for, if there is one near enough
+/// to be a useful stand-in.
+fn nearest_built(ui: &Rc<App>, index: u32) -> Option<(u32, Drawn)> {
+    /// Beyond this the image on screen has nothing to do with the layer
+    /// selected, and showing it is worse than showing nothing new.
+    const NEAR: u32 = 16;
+    let cache = ui.textures.borrow();
+    cache
+        .iter()
+        .filter(|(i, _)| i.abs_diff(index) <= NEAR)
+        .min_by_key(|(i, _)| i.abs_diff(index))
+        .map(|(i, d)| (*i, d.clone()))
 }
 
 /// Draw a decoded layer, unless a newer one has been asked for since.
@@ -1733,7 +1832,14 @@ fn finish_layer(
                 remember_texture(&ui, index, drawn.clone());
                 ui.in_flight.borrow_mut().remove(&index);
                 if ui.layer_request.get() == request {
-                    draw_layer(&ui, &drawn, square);
+                    let count = ui
+                        .files
+                        .borrow()
+                        .get(*ui.selected.borrow())
+                        .and_then(|f| f.opened.as_ref())
+                        .map(|o| o.print.layer_count())
+                        .unwrap_or(index + 1);
+                    draw_layer(&ui, &drawn, square, index, count, false);
                 }
             }
             Ok(Err(e)) => {
