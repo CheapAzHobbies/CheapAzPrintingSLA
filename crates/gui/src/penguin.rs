@@ -44,41 +44,108 @@ fn frames() -> Option<Rc<Vec<gdk::Texture>>> {
     })
 }
 
-fn slice() -> Option<Vec<gdk::Texture>> {
-    let mut reader = png::Decoder::new(SHEET).read_info().ok()?;
+/// Decode the sheet and cut it into per-frame RGBA buffers.
+///
+/// Kept free of GTK so it can be tested without a display, which is how the
+/// silent-failure bug in the first version was found: it returned None and the
+/// indicator simply never appeared, with nothing to say why.
+pub fn slice_pixels() -> Result<Vec<Vec<u8>>, String> {
+    let mut reader = png::Decoder::new(SHEET)
+        .read_info()
+        .map_err(|e| format!("sheet header: {e}"))?;
     let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).ok()?;
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("sheet data: {e}"))?;
     let (sheet_w, sheet_h) = (info.width as usize, info.height as usize);
-    // The sheet is authored RGBA; anything else means the asset was replaced
-    // with something unexpected, and silently guessing would look worse than
-    // simply not showing the indicator.
     if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-        return None;
+        return Err(format!(
+            "sheet is {:?}/{:?}, expected Rgba/Eight",
+            info.color_type, info.bit_depth
+        ));
     }
     let stride = sheet_w * 4;
     let (fw, fh) = (FRAME_W as usize, FRAME_H as usize);
+    if sheet_w < fw * COLS {
+        return Err(format!(
+            "sheet is {sheet_w}px wide, needs {} for {COLS} columns",
+            fw * COLS
+        ));
+    }
 
     let mut out = Vec::with_capacity(FRAMES);
     for i in 0..FRAMES {
         let (cx, cy) = ((i % COLS) * fw, (i / COLS) * fh);
         if cx + fw > sheet_w || cy + fh > sheet_h {
-            break;
+            return Err(format!(
+                "frame {i} at ({cx},{cy}) falls outside the {sheet_w}x{sheet_h} sheet"
+            ));
         }
         let mut px = Vec::with_capacity(fw * fh * 4);
         for row in 0..fh {
             let start = (cy + row) * stride + cx * 4;
             px.extend_from_slice(&buf[start..start + fw * 4]);
         }
-        let t = gdk::MemoryTexture::new(
-            fw as i32,
-            fh as i32,
-            gdk::MemoryFormat::R8g8b8a8,
-            &Bytes::from_owned(px),
-            fw * 4,
-        );
-        out.push(t.upcast());
+        out.push(px);
     }
-    (!out.is_empty()).then_some(out)
+    Ok(out)
+}
+
+fn slice() -> Option<Vec<gdk::Texture>> {
+    let frames = match slice_pixels() {
+        Ok(f) => f,
+        Err(e) => {
+            // Say why rather than quietly showing nothing.
+            eprintln!("cheapazsla: save indicator unavailable: {e}");
+            return None;
+        }
+    };
+    let (fw, fh) = (FRAME_W as usize, FRAME_H as usize);
+    Some(
+        frames
+            .into_iter()
+            .map(|px| {
+                gdk::MemoryTexture::new(
+                    fw as i32,
+                    fh as i32,
+                    gdk::MemoryFormat::R8g8b8a8,
+                    &Bytes::from_owned(px),
+                    fw * 4,
+                )
+                .upcast()
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sheet_slices_into_every_frame() {
+        let frames = slice_pixels().expect("sheet must decode");
+        assert_eq!(frames.len(), FRAMES, "expected {FRAMES} frames");
+        let expect = (FRAME_W * FRAME_H * 4) as usize;
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.len(), expect, "frame {i} is the wrong size");
+        }
+    }
+
+    #[test]
+    fn frames_are_not_all_empty() {
+        // A sheet that decodes to fully transparent pixels would animate
+        // invisibly, which looks identical to the indicator being broken.
+        let frames = slice_pixels().expect("decode");
+        let opaque = frames
+            .iter()
+            .filter(|f| f.chunks_exact(4).any(|p| p[3] > 0))
+            .count();
+        assert!(
+            opaque > FRAMES / 2,
+            "only {opaque} of {FRAMES} frames have any opaque pixels"
+        );
+    }
 }
 
 /// An animated save indicator.

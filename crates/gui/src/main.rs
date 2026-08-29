@@ -1637,6 +1637,8 @@ fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
     let (ptx, prx) = async_channel::unbounded::<(u32, u32)>();
     let (dtx, drx) = async_channel::bounded(1);
 
+    ui.penguin.start();
+
     let dest = plan.destination.clone();
     let total = plan.layer_count;
     std::thread::spawn(move || {
