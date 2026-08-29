@@ -151,6 +151,8 @@ struct App {
     info_panel: gtk::Box,
     /// The information column beside the preview, dropped when narrow.
     preview_side: gtk::Widget,
+    /// True while the window is narrow enough that columns are being dropped.
+    compact: Cell<bool>,
 
     // history page
     history_list: gtk::ListBox,
@@ -413,6 +415,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         play_btn: play_btn.clone(),
         info_panel,
         preview_side,
+        compact: Cell::new(false),
         history_list,
         history_stack,
         files: RefCell::new(Vec::new()),
@@ -454,22 +457,31 @@ fn wire_responsive(ui: &Rc<App>) {
 
     let apply = {
         let ui = ui.clone();
-        move |width: i32| {
+        std::rc::Rc::new(move |width: i32| {
             ui.preview_side.set_visible(width >= HIDE_INFO_BELOW);
-            ui.shell.set_compact(width < NARROW_SIDEBAR_BELOW);
-            // The slider gives up its minimum before anything overlaps.
-            ui.slider.set_size_request(
-                if width < NARROW_SIDEBAR_BELOW {
-                    120
-                } else {
-                    360
-                },
-                -1,
-            );
-        }
+            let narrow = width < NARROW_SIDEBAR_BELOW;
+            ui.shell.set_compact(narrow);
+            // Everything with a fixed width gives it up before anything can
+            // overlap, so the window can be tiled rather than refusing to
+            // shrink past whatever its widest row happens to need.
+            ui.slider
+                .set_size_request(if narrow { 90 } else { 360 }, -1);
+            if ui.compact.get() != narrow {
+                ui.compact.set(narrow);
+                if !ui.files.borrow().is_empty() {
+                    refresh_queue(&ui);
+                }
+            }
+        })
     };
-    apply(ui.window.width());
+    // Not applied here: before the window is shown its width is zero, which
+    // is below every threshold, so the sidebar came up collapsed on a window
+    // that was never narrow. The first real measurement arrives on map.
     let window = ui.window.clone();
+    {
+        let apply = apply.clone();
+        window.connect_map(move |w| apply(w.width().max(w.default_width())));
+    }
     window.connect_default_width_notify(move |w| apply(w.width()));
 }
 
@@ -570,8 +582,14 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
         .tightening_threshold(700)
         .child(&body)
         .build();
+    // Automatic rather than Never. Never makes the content's minimum width the
+    // window's minimum width, which is what stopped the window being tiled to
+    // a quarter of the screen: the widest row in the page set a floor under
+    // the whole application. Automatic lets the page scroll instead, which is
+    // a safety valve that should rarely be reached now the columns give way.
     gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(true)
         .child(&clamp)
         .build()
         .upcast()
@@ -692,8 +710,8 @@ fn build_preview_page(
     // the largest count it will ever show. Anything whose width follows its
     // content cannot share a row with the widget that expands.
     layer_label.set_xalign(1.0);
-    layer_label.set_width_chars(16);
-    layer_label.set_max_width_chars(16);
+    layer_label.set_width_chars(14);
+    layer_label.set_max_width_chars(14);
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
     labels.set_hexpand(false);
     labels.set_halign(gtk::Align::End);
@@ -729,7 +747,7 @@ fn build_preview_page(
     column.set_vexpand(true);
 
     let side = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
-    side.set_size_request(300, -1);
+    side.set_size_request(260, -1);
     side.append(&shell::section_label("File information"));
     side.append(info_panel);
     let layer_head = shell::section_label("This layer");
@@ -738,6 +756,7 @@ fn build_preview_page(
     side.append(layer_detail);
     let side_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(false)
         .child(&side)
         .build();
 
@@ -1278,7 +1297,7 @@ fn refresh_queue(ui: &Rc<App>) {
             f.format.to_uppercase()
         };
         let conversion = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
-        conversion.set_width_request(112);
+        conversion.set_width_request(if ui.compact.get() { 0 } else { 112 });
         let from_label = gtk::Label::new(Some(&from));
         from_label.add_css_class("cz-dim");
         conversion.append(&from_label);
@@ -1305,15 +1324,18 @@ fn refresh_queue(ui: &Rc<App>) {
         }
         row.append(&conversion);
 
+        // The size is the first thing to go: it is the least useful column
+        // when space is short, and it is in the file panel anyway.
         let size = gtk::Label::new(Some(&render::human_bytes(f.size)));
         size.add_css_class("cz-dim");
         size.add_css_class("cz-value");
         size.set_width_chars(9);
         size.set_xalign(1.0);
+        size.set_visible(!ui.compact.get());
         row.append(&size);
 
         let chip = f.status.chip();
-        chip.set_width_request(104);
+        chip.set_width_request(if ui.compact.get() { 0 } else { 104 });
         row.append(&chip);
 
         // Full technical text behind Details, as §28 asks.

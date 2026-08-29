@@ -218,7 +218,12 @@ pub fn info_row(label: &str, value: &str, dim: bool) -> gtk::Box {
     let l = gtk::Label::builder()
         .label(label)
         .xalign(0.0)
-        .width_request(140)
+        // Wide enough to align the values, but allowed to give way: a hard
+        // width here sets a floor under every panel that uses these rows,
+        // and therefore under the window itself.
+        .width_chars(14)
+        .max_width_chars(14)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     l.add_css_class("cz-dim");
     let v = gtk::Label::builder()
