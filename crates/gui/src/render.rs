@@ -33,34 +33,57 @@ fn downscale(img: &LayerImage, factor: u32) -> (u32, u32, Vec<u8>, u64) {
     }
     let nw = (img.width / factor).max(1);
     let nh = (img.height / factor).max(1);
-    let mut out = vec![0u8; (nw * nh) as usize];
-    let mut exposed: u64 = 0;
     let f = factor as usize;
     let src_w = img.width as usize;
-    for y in 0..nh as usize {
-        for x in 0..nw as usize {
-            let mut sum: u32 = 0;
-            let mut count: u32 = 0;
-            for dy in 0..f {
-                let sy = y * f + dy;
-                if sy >= img.height as usize {
-                    break;
-                }
-                let row = sy * src_w;
-                for dx in 0..f {
-                    let sx = x * f + dx;
-                    if sx >= src_w {
-                        break;
+    let src_h = img.height as usize;
+    let (nwu, nhu) = (nw as usize, nh as usize);
+    let mut out = vec![0u8; nwu * nhu];
+
+    // Split by output row across the machine. Each strip reads a distinct band
+    // of the source and writes a distinct band of the output, so there is
+    // nothing to synchronise. On a 12K layer this is the difference between
+    // about forty milliseconds and a handful.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(nhu.max(1))
+        .min(16);
+    let rows_each = nhu.div_ceil(threads.max(1));
+    let pixels = &img.pixels;
+
+    let exposed: u64 = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for (strip, chunk) in out.chunks_mut(rows_each * nwu).enumerate() {
+            let y0 = strip * rows_each;
+            handles.push(scope.spawn(move || {
+                let mut seen: u64 = 0;
+                for (row_in_chunk, row) in chunk.chunks_mut(nwu).enumerate() {
+                    let y = y0 + row_in_chunk;
+                    for (x, cell) in row.iter_mut().enumerate() {
+                        let mut sum: u32 = 0;
+                        let mut count: u32 = 0;
+                        for dy in 0..f {
+                            let sy = y * f + dy;
+                            if sy >= src_h {
+                                break;
+                            }
+                            let base = sy * src_w + x * f;
+                            let take = f.min(src_w.saturating_sub(x * f));
+                            for &v in &pixels[base..base + take] {
+                                sum += v as u32;
+                                seen += (v > 0) as u64;
+                                count += 1;
+                            }
+                        }
+                        *cell = sum.checked_div(count).unwrap_or(0) as u8;
                     }
-                    let v = img.pixels[row + sx];
-                    sum += v as u32;
-                    exposed += (v > 0) as u64;
-                    count += 1;
                 }
-            }
-            out[y * nw as usize + x] = sum.checked_div(count).unwrap_or(0) as u8;
+                seen
+            }));
         }
-    }
+        handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+    });
+
     (nw, nh, out, exposed)
 }
 
@@ -249,6 +272,47 @@ mod tests {
         assert!(
             px.iter().all(|&v| v == 0 || v == 255),
             "no intermediate values may appear"
+        );
+    }
+}
+
+/// Timing helper for the real downscale path, used by the benchmark test.
+#[cfg(test)]
+pub fn time_downscale(img: &LayerImage) -> (std::time::Duration, u32, u32, u64) {
+    let longest = img.width.max(img.height);
+    let factor = longest.div_ceil(MAX_EDGE).max(1);
+    let t = std::time::Instant::now();
+    let (w, h, _grey, exposed) = downscale(img, factor);
+    (t.elapsed(), w, h, exposed)
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Not an assertion so much as a measurement, printed with --nocapture.
+    /// Set CHEAPAZSLA_REAL_SL1 to time a real layer.
+    #[test]
+    fn downscale_speed() {
+        let Ok(path) = std::env::var("CHEAPAZSLA_REAL_SL1") else {
+            eprintln!("skipped: set CHEAPAZSLA_REAL_SL1");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        if !path.exists() {
+            return;
+        }
+        use cheapazsla_core::layers::LayerProvider;
+        let opened = cheapazsla_core::registry::open(&path).expect("open");
+        let img = opened.layers.layer(0).expect("layer");
+        // Warm, then measure.
+        let _ = time_downscale(&img);
+        let (took, w, h, exposed) = time_downscale(&img);
+        println!(
+            "  parallel downscale of {}x{} -> {w}x{h}: {:.1} ms ({exposed} exposed)",
+            img.width,
+            img.height,
+            took.as_secs_f64() * 1000.0
         );
     }
 }

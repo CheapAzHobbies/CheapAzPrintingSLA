@@ -1570,7 +1570,7 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     let cached = ui.textures.borrow().get(&index).cloned();
     if let Some(cached) = cached {
         draw_layer(ui, &cached, square);
-        prefetch_after_settling(ui, index, count, pixel, request);
+        prefetch_around(ui, index, count, pixel);
         ui.last_layer.set(index);
         return;
     }
@@ -1590,7 +1590,7 @@ fn show_layer(ui: &Rc<App>, index: u32) {
     });
     ui.in_flight.borrow_mut().insert(index);
     finish_layer(ui, rx, request, square, index);
-    prefetch_after_settling(ui, index, count, pixel, request);
+    prefetch_around(ui, index, count, pixel);
     ui.last_layer.set(index);
 }
 
@@ -1599,36 +1599,13 @@ const PREFETCH: u32 = 3;
 
 /// Most decodes to have running at once.
 ///
-/// Each one walks every pixel of a layer, so on a 12K panel a handful of them
-/// will saturate any machine. Reading ahead is worth nothing if it makes the
-/// layer actually being looked at arrive late.
-const MAX_DECODES: usize = 2;
-
-/// How long to wait before reading ahead.
-///
-/// Prefetching during an active drag is worse than not prefetching at all: it
-/// queues work for layers the slider has already passed and competes with the
-/// decode of the one on screen. Waiting until the user pauses means the work
-/// is both wanted and affordable.
-const SETTLE_MS: u64 = 120;
-
-/// Read ahead after the user stops moving.
-fn prefetch_after_settling(
-    ui: &Rc<App>,
-    index: u32,
-    count: u32,
-    pixel: Option<render::PixelSize>,
-    request: u64,
-) {
-    let ui = ui.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(SETTLE_MS), move || {
-        // Superseded: the user is still moving, so this is not where they are.
-        if ui.layer_request.get() != request {
-            return;
-        }
-        prefetch_around(&ui, index, count, pixel);
-    });
-}
+/// This cap, not a delay, is what stops reading ahead from swamping the
+/// machine. An earlier version waited for the user to stop moving before
+/// reading ahead at all, which meant every layer during a drag cost a full
+/// decode and the slider paused on each one. Starting immediately and
+/// limiting how many run together keeps the reads-ahead useful without them
+/// competing with the layer on screen.
+const MAX_DECODES: usize = 3;
 
 /// Decode the layers the user is about to want.
 ///
@@ -1839,6 +1816,17 @@ fn stop_play(ui: &Rc<App>) {
 // destination and validation
 // ---------------------------------------------------------------------------
 
+/// What a row in the Save to menu does when chosen.
+#[derive(Clone)]
+enum Destination {
+    /// Write next to each source file.
+    BesideOriginal,
+    /// Write into a specific folder.
+    Folder(PathBuf),
+    /// Ask for a folder.
+    Choose,
+}
+
 fn build_destination_menu(ui: &Rc<App>) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_size_request(340, -1);
@@ -1859,96 +1847,114 @@ fn build_destination_menu(ui: &Rc<App>) {
         list.set_selection_mode(gtk::SelectionMode::None);
         list.add_css_class("navigation-sidebar");
 
-        let add = |icon: &str, title: String, sub: Option<String>, dir: Option<PathBuf>| {
-            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
-            row_box.set_margin_top(theme::SPACE_2);
-            row_box.set_margin_bottom(theme::SPACE_2);
-            row_box.set_margin_start(theme::SPACE_3);
-            row_box.set_margin_end(theme::SPACE_3);
-            row_box.append(&gtk::Image::from_icon_name(icon));
-            let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            text.set_hexpand(true);
-            text.append(&gtk::Label::builder().label(&title).xalign(0.0).build());
-            if let Some(s) = &sub {
-                let l = gtk::Label::builder().label(s).xalign(0.0).build();
-                l.add_css_class("caption");
-                l.add_css_class("cz-dim");
-                text.append(&l);
-            }
-            row_box.append(&text);
-            let row = gtk::ListBoxRow::builder()
-                .child(&row_box)
-                .activatable(true)
-                .build();
-            list.append(&row);
-            let ui3 = ui2.clone();
-            let pop3 = pop2.clone();
-            row.connect_activate(move |_| {
-                match &dir {
-                    Some(d) => set_out_dir(&ui3, Some(d.clone())),
-                    None => choose_folder(&ui3),
+        // Actions in the same order as the rows. A row's own "activate" signal
+        // is a keyboard action and never fires on a click; the list's
+        // "row-activated" is what a click emits, and it reports an index.
+        let actions: Rc<RefCell<Vec<Destination>>> = Rc::new(RefCell::new(Vec::new()));
+
+        {
+            let actions = actions.clone();
+            let add = |icon: &str, title: String, sub: Option<String>, what: Destination| {
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+                row_box.set_margin_top(theme::SPACE_2);
+                row_box.set_margin_bottom(theme::SPACE_2);
+                row_box.set_margin_start(theme::SPACE_3);
+                row_box.set_margin_end(theme::SPACE_3);
+                row_box.append(&gtk::Image::from_icon_name(icon));
+                let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                text.set_hexpand(true);
+                text.append(&gtk::Label::builder().label(&title).xalign(0.0).build());
+                if let Some(s) = &sub {
+                    let l = gtk::Label::builder().label(s).xalign(0.0).build();
+                    l.add_css_class("caption");
+                    l.add_css_class("cz-dim");
+                    text.append(&l);
                 }
-                pop3.popdown();
-            });
-        };
+                row_box.append(&text);
+                list.append(
+                    &gtk::ListBoxRow::builder()
+                        .child(&row_box)
+                        .activatable(true)
+                        .build(),
+                );
+                actions.borrow_mut().push(what);
+            };
 
-        add(
-            "folder-symbolic",
-            "Beside the original".into(),
-            Some("Same folder as each source file".into()),
-            None,
-        );
-
-        let recents = ui2.settings.borrow().available_recent_dirs();
-        for dir in recents {
             add(
-                "document-open-recent-symbolic",
-                dir.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| dir.display().to_string()),
-                Some(dir.display().to_string()),
-                Some(dir.clone()),
+                "folder-symbolic",
+                "Beside the original".into(),
+                Some("Same folder as each source file".into()),
+                Destination::BesideOriginal,
+            );
+
+            for dir in ui2.settings.borrow().available_recent_dirs() {
+                add(
+                    "document-open-recent-symbolic",
+                    dir.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dir.display().to_string()),
+                    Some(dir.display().to_string()),
+                    Destination::Folder(dir.clone()),
+                );
+            }
+
+            let sub = ui2.settings.borrow().pinned_subfolder.clone();
+            for d in drives::mounted() {
+                let icon = if d.removable {
+                    "drive-removable-media-symbolic"
+                } else {
+                    "drive-harddisk-symbolic"
+                };
+                // A pinned drive with a subfolder set targets that folder,
+                // creating it if needed, rather than the drive root.
+                let target = if ui2.settings.borrow().is_pinned(&d.name) {
+                    drives::target_dir(&d.name, &sub).unwrap_or_else(|| d.path.clone())
+                } else {
+                    d.path.clone()
+                };
+                let space = drives::space(&target)
+                    .map(|(free, total)| {
+                        format!(
+                            "{} free of {}",
+                            render::human_bytes(free),
+                            render::human_bytes(total)
+                        )
+                    })
+                    .unwrap_or_else(|| target.display().to_string());
+                add(
+                    icon,
+                    d.name.clone(),
+                    Some(space),
+                    Destination::Folder(target),
+                );
+            }
+
+            add(
+                "folder-open-symbolic",
+                "Choose another location…".into(),
+                None,
+                Destination::Choose,
             );
         }
 
-        let sub = ui2.settings.borrow().pinned_subfolder.clone();
-        for d in drives::mounted() {
-            let icon = if d.removable {
-                "drive-removable-media-symbolic"
-            } else {
-                "drive-harddisk-symbolic"
-            };
-            // A pinned drive with a subfolder set targets that folder, creating
-            // it if needed, rather than the drive root.
-            let target = if ui2.settings.borrow().is_pinned(&d.name) {
-                drives::target_dir(&d.name, &sub).unwrap_or_else(|| d.path.clone())
-            } else {
-                d.path.clone()
-            };
-            let space = drives::space(&target)
-                .map(|(free, total)| {
-                    format!(
-                        "{} free of {}",
-                        render::human_bytes(free),
-                        render::human_bytes(total)
-                    )
-                })
-                .unwrap_or_else(|| target.display().to_string());
-            add(icon, d.name.clone(), Some(space), Some(target));
-        }
-
-        add(
-            "folder-open-symbolic",
-            "Choose another location…".into(),
-            None,
-            None,
-        );
+        let ui3 = ui2.clone();
+        let pop3 = pop2.clone();
+        list.connect_row_activated(move |_, row| {
+            let index = row.index();
+            if index < 0 {
+                return;
+            }
+            let chosen = actions.borrow().get(index as usize).cloned();
+            pop3.popdown();
+            match chosen {
+                Some(Destination::BesideOriginal) => set_out_dir(&ui3, None),
+                Some(Destination::Folder(d)) => set_out_dir(&ui3, Some(d)),
+                Some(Destination::Choose) => choose_folder(&ui3),
+                None => {}
+            }
+        });
         content2.append(&list);
     });
-
-    // The default "beside the original" entry is a no-op path; wire the real
-    // chooser separately for the last row.
-    let _ = ui;
 }
 
 fn choose_folder(ui: &Rc<App>) {
