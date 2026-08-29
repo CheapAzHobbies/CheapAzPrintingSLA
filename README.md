@@ -214,6 +214,16 @@ is the hard part and it was not mine to make.
   understands them. If you need a format CheapAzSLA does not support yet,
   UVtools very likely already has it.
 
+### Assets
+
+`assets/penguin_saving.png` is the save indicator, carried over from
+[lens](https://github.com/CheapAzHobbies/lens). It is the Club Penguin dance,
+141 frames, recoloured to a dark silhouette by that project's
+`tools/make_penguin_sheet.py`. The dance itself is Disney's; this is a
+recoloured silhouette used as a progress indicator, not shipped as artwork.
+Replacing it is a matter of dropping in a different sprite sheet with the same
+grid.
+
 ### Built with
 
 [Rust](https://www.rust-lang.org), [GTK4](https://www.gtk.org) and

@@ -217,14 +217,7 @@ type ArchiveIndex = (
 );
 
 /// Layer entry names in print order, and the thumbnails, from an archive.
-fn index_archive(
-    path: &Path,
-) -> Result<(
-    Vec<String>,
-    Vec<String>,
-    BTreeMap<String, String>,
-    BTreeMap<String, String>,
-)> {
+fn index_archive(path: &Path) -> Result<ArchiveIndex> {
     let file = File::open(path).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: e,

@@ -118,6 +118,7 @@ dependencies = [
  "cheapazsla-core",
  "gtk4",
  "libadwaita",
+ "png",
 ]
 
 [[package]]

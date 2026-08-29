@@ -7,6 +7,7 @@
 //! mocked up (§47).
 
 mod drives;
+mod penguin;
 mod render;
 
 use adw::prelude::*;
@@ -61,6 +62,7 @@ struct Ui {
     name_row: adw::EntryRow,
     convert_btn: gtk::Button,
     progress: gtk::ProgressBar,
+    penguin: Rc<penguin::Penguin>,
     out_dir: RefCell<Option<PathBuf>>,
     settings: RefCell<Settings>,
     writable: RefCell<Vec<&'static str>>,
@@ -244,9 +246,15 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         .visible(false)
         .build();
 
+    // Save indicator, carried over from CheapAzHobbies' lens.
+    let penguin = penguin::Penguin::new(88);
+
     let convert_bar = gtk::Box::new(gtk::Orientation::Vertical, 8);
     convert_bar.append(&convert_group);
     convert_bar.append(&convert_btn);
+    if penguin.is_available() {
+        convert_bar.append(&penguin.widget);
+    }
     convert_bar.append(&progress);
 
     let side = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -389,6 +397,7 @@ fn build_ui(app: &adw::Application) -> Rc<Ui> {
         name_row: name_row.clone(),
         convert_btn: convert_btn.clone(),
         progress,
+        penguin: penguin.clone(),
         out_dir: RefCell::new(None),
         settings: RefCell::new(Settings::load()),
         writable: RefCell::new(writable_ids),
@@ -704,6 +713,7 @@ fn load_file(ui: &Rc<Ui>, path: &Path) {
     ui.spinner.set_spinning(true);
     ui.spinner.set_visible(true);
     ui.title.set_subtitle("Reading…");
+    ui.penguin.start();
 
     let (tx, rx) = async_channel::bounded(1);
     let p = path.to_path_buf();
@@ -715,8 +725,12 @@ fn load_file(ui: &Rc<Ui>, path: &Path) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         match rx.recv().await {
-            Ok(Ok(loaded)) => present(&ui, loaded),
+            Ok(Ok(loaded)) => {
+                ui.penguin.stop();
+                present(&ui, loaded);
+            }
             Ok(Err(msg)) => {
+                ui.penguin.stop();
                 ui.spinner.set_spinning(false);
                 ui.spinner.set_visible(false);
                 ui.title
@@ -1667,6 +1681,7 @@ fn run_convert(ui: &Rc<Ui>, plan: convert::Plan) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let outcome = drx.recv().await;
+        ui.penguin.stop();
         ui.progress.set_visible(false);
         ui.convert_btn.set_sensitive(true);
         match outcome {
