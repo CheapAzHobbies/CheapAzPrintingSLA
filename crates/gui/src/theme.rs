@@ -127,6 +127,13 @@ fn sheet(p: &Palette) -> String {
 }}
 .cz-queue > row:last-child {{ border-bottom: none; }}
 .cz-queue > row:hover {{ background-color: {hover}; }}
+/* The stock selection colour on this row reads as an error state. The queue
+   selection only decides which file the preview shows, so it is quiet. */
+.cz-queue > row:selected {{
+  background-color: alpha(@cz_accent, 0.18);
+  color: @cz_text;
+}}
+.cz-queue > row:selected:hover {{ background-color: alpha(@cz_accent, 0.24); }}
 
 /* ---- typography ---- */
 .cz-title {{ font-size: 1.45rem; font-weight: bold; }}

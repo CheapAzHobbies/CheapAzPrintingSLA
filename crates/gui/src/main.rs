@@ -543,44 +543,42 @@ fn build_convert_page(
     let formats = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
     formats.set_homogeneous(false);
 
-    // Both columns use the same header shape, so the controls beneath them
-    // start at the same height.
-    let in_head = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
-    in_head.set_height_request(22);
-    let in_label = shell::section_label("Input");
-    in_label.set_valign(gtk::Align::Center);
-    in_head.append(&in_label);
-
     let in_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     in_col.set_hexpand(true);
     in_col.set_valign(gtk::Align::Start);
-    in_col.append(&in_head);
+    in_col.append(&shell::section_label("Input"));
     in_col.append(input_field);
 
+    // An invisible label of the same style as the headers, so the button lines
+    // up with the controls rather than being nudged by a guessed pixel height.
     let swap_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     swap_col.set_valign(gtk::Align::Start);
-    // A spacer the height of the headers, so the button lines up with the
-    // controls rather than floating between the two rows.
-    let swap_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    swap_spacer.set_height_request(22);
+    let swap_spacer = shell::section_label("");
     swap_col.append(&swap_spacer);
     swap_btn.set_valign(gtk::Align::Center);
-    swap_btn.set_height_request(34);
+    swap_btn.set_size_request(34, 34);
     swap_col.append(swap_btn);
 
+    // The information button sits beside the control, not in the header.
+    // A button in a header makes that header taller than a plain label, and no
+    // amount of trimming its metrics makes the two columns agree.
     let out_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     out_col.set_hexpand(true);
     out_col.set_valign(gtk::Align::Start);
-    let out_head = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
-    out_head.set_height_request(22);
-    let out_label = shell::section_label("Output");
-    out_label.set_valign(gtk::Align::Center);
-    out_head.append(&out_label);
-    output_info.add_css_class("cz-inline");
+    out_col.append(&shell::section_label("Output"));
+
+    let out_control = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    output_picker.button.set_hexpand(true);
+    out_control.append(&output_picker.button);
     output_info.set_valign(gtk::Align::Center);
-    out_head.append(output_info);
-    out_col.append(&out_head);
-    out_col.append(&output_picker.button);
+    out_control.append(output_info);
+    out_col.append(&out_control);
+
+    // hexpand alone divides the leftover space, which is not the same as
+    // making the two columns equal when their contents differ in width.
+    let equal = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    equal.add_widget(&in_col);
+    equal.add_widget(&out_col);
 
     formats.append(&in_col);
     formats.append(&swap_col);
@@ -1219,9 +1217,11 @@ fn refresh_queue(ui: &Rc<App>) {
         conversion.append(&from_label);
         if let Some(target) = ui.output_picker.selected() {
             let same = !f.format.is_empty() && f.format == target;
-            let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+            // go-next-symbolic is a chevron, which reads as "more" rather
+            // than "becomes". In a data row an arrow glyph is typography, not
+            // an icon standing in for a control.
+            let arrow = gtk::Label::new(Some("→"));
             arrow.add_css_class(if same { "cz-warn" } else { "cz-arrow" });
-            arrow.set_pixel_size(16);
             conversion.append(&arrow);
             let to_label = gtk::Label::new(Some(&target.to_uppercase()));
             if same {
