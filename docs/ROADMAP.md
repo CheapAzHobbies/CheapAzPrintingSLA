@@ -29,7 +29,8 @@ Smaller pieces of the specification still outstanding:
 - **Open the converted file** (§27). Only *Open Folder* is offered.
 - **File associations** (§33). The desktop entry declares a MIME type but no
   MIME definitions are installed, so double-clicking an `.sl1` in a file
-  manager will not launch CheapAzSLA yet.
+  manager will not launch CheapAzSLA yet. The icon and desktop entry install
+  correctly; only the MIME half is missing.
 - **GOO previews are not decoded.** The reader ignores the two embedded
   RGB565 images, so converting GOO to SL1 loses the thumbnails. The conversion
   planner does not currently report that as a loss, which it should.
