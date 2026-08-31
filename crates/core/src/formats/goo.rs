@@ -575,79 +575,93 @@ impl FormatHandler for GooHandler {
         out.write_all(&head).map_err(io)?;
 
         let expected_pixels = w as u64 * h as u64;
-        for index in 0..count {
-            let img = layers.layer(index)?;
-            if img.width != w || img.height != h {
-                return Err(FormatError::Other(format!(
-                    "layer {index} is {}x{} but the print is {w}x{h}",
-                    img.width, img.height
-                ))
-                .into());
-            }
-            let (payload, covered) = goo_rle::encode(&img.pixels, w);
-            // Every pixel must be accounted for. A short final run leaves
-            // whatever was already in the printer's buffer on the screen.
-            if covered != expected_pixels {
-                return Err(FormatError::Other(format!(
-                    "layer {index} encoded {covered} pixels but the panel needs {expected_pixels}"
-                ))
-                .into());
-            }
+        // Decoding the source image and run-length encoding it is the whole
+        // cost of a conversion, and each layer is independent, so it runs on
+        // a pool. Records still have to reach the file in order, which is
+        // what `in_order` guarantees; see pipeline.rs for how far ahead the
+        // workers are allowed to get.
+        let workers = crate::pipeline::workers_for(expected_pixels);
+        crate::pipeline::in_order(
+            count,
+            workers,
+            |index| {
+                let img = layers.layer(index)?;
+                if img.width != w || img.height != h {
+                    return Err(FormatError::Other(format!(
+                        "layer {index} is {}x{} but the print is {w}x{h}",
+                        img.width, img.height
+                    ))
+                    .into());
+                }
+                let (payload, covered) = goo_rle::encode(&img.pixels, w);
+                // Every pixel must be accounted for. A short final run leaves
+                // whatever was already in the printer's buffer on the screen.
+                if covered != expected_pixels {
+                    return Err(FormatError::Other(format!(
+                        "layer {index} encoded {covered} pixels but the panel needs \
+                         {expected_pixels}"
+                    ))
+                    .into());
+                }
+                Ok(payload)
+            },
+            |index, payload| {
+                let z = print
+                    .layers
+                    .get(index as usize)
+                    .map(|l| l.z_mm)
+                    .unwrap_or_else(|| e.layer_height_mm * (index + 1) as f32);
+                let exposure = print.effective_exposure_s(index).unwrap_or(e.exposure_s);
+                let is_bottom = index < bottom_layers;
 
-            let z = print
-                .layers
-                .get(index as usize)
-                .map(|l| l.z_mm)
-                .unwrap_or_else(|| e.layer_height_mm * (index + 1) as f32);
-            let exposure = print.effective_exposure_s(index).unwrap_or(e.exposure_s);
-            let is_bottom = index < bottom_layers;
-
-            let mut rec: Vec<u8> = Vec::with_capacity(LAYER_PREAMBLE);
-            be_u16(&mut rec, 0); // pause flag
-            be_f32(&mut rec, 0.0); // pause position
-            be_f32(&mut rec, z);
-            be_f32(&mut rec, exposure);
-            be_f32(&mut rec, e.light_off_delay_s.unwrap_or(0.0));
-            for _ in 0..3 {
-                be_f32(&mut rec, 0.0); // before/after lift, after retract waits
-            }
-            let (lift_h, lift_v) = if is_bottom {
-                (l.bottom_lift_height_mm, l.bottom_lift_speed_mm_min)
-            } else {
-                (l.lift_height_mm, l.lift_speed_mm_min)
-            };
-            be_f32(&mut rec, lift_h.unwrap_or(0.0));
-            be_f32(&mut rec, lift_v.unwrap_or(0.0));
-            be_f32(&mut rec, 0.0); // second lift distance
-            be_f32(&mut rec, 0.0); // second lift speed
-            be_f32(&mut rec, lift_h.unwrap_or(0.0));
-            be_f32(
-                &mut rec,
-                if is_bottom {
-                    l.bottom_retract_speed_mm_min.unwrap_or(0.0)
+                let mut rec: Vec<u8> = Vec::with_capacity(LAYER_PREAMBLE);
+                be_u16(&mut rec, 0); // pause flag
+                be_f32(&mut rec, 0.0); // pause position
+                be_f32(&mut rec, z);
+                be_f32(&mut rec, exposure);
+                be_f32(&mut rec, e.light_off_delay_s.unwrap_or(0.0));
+                for _ in 0..3 {
+                    be_f32(&mut rec, 0.0); // before/after lift, after retract waits
+                }
+                let (lift_h, lift_v) = if is_bottom {
+                    (l.bottom_lift_height_mm, l.bottom_lift_speed_mm_min)
                 } else {
-                    l.retract_speed_mm_min.unwrap_or(0.0)
-                },
-            );
-            be_f32(&mut rec, 0.0); // second retract distance
-            be_f32(&mut rec, 0.0); // second retract speed
-            let pwm = if is_bottom {
-                e.bottom_light_pwm.unwrap_or(255)
-            } else {
-                e.light_pwm.unwrap_or(255)
-            };
-            be_u16(&mut rec, pwm as u16);
-            rec.extend_from_slice(&DELIM);
-            debug_assert_eq!(rec.len(), LAYER_PREAMBLE);
-            out.write_all(&rec).map_err(io)?;
+                    (l.lift_height_mm, l.lift_speed_mm_min)
+                };
+                be_f32(&mut rec, lift_h.unwrap_or(0.0));
+                be_f32(&mut rec, lift_v.unwrap_or(0.0));
+                be_f32(&mut rec, 0.0); // second lift distance
+                be_f32(&mut rec, 0.0); // second lift speed
+                be_f32(&mut rec, lift_h.unwrap_or(0.0));
+                be_f32(
+                    &mut rec,
+                    if is_bottom {
+                        l.bottom_retract_speed_mm_min.unwrap_or(0.0)
+                    } else {
+                        l.retract_speed_mm_min.unwrap_or(0.0)
+                    },
+                );
+                be_f32(&mut rec, 0.0); // second retract distance
+                be_f32(&mut rec, 0.0); // second retract speed
+                let pwm = if is_bottom {
+                    e.bottom_light_pwm.unwrap_or(255)
+                } else {
+                    e.light_pwm.unwrap_or(255)
+                };
+                be_u16(&mut rec, pwm as u16);
+                rec.extend_from_slice(&DELIM);
+                debug_assert_eq!(rec.len(), LAYER_PREAMBLE);
+                out.write_all(&rec).map_err(io)?;
 
-            // data_size counts the magic byte, the payload and the checksum.
-            be_u32_w(&mut out, (payload.len() + 2) as u32).map_err(io)?;
-            out.write_all(&[goo_rle::IMAGE_MAGIC]).map_err(io)?;
-            out.write_all(&payload).map_err(io)?;
-            out.write_all(&[goo_rle::checksum(&payload)]).map_err(io)?;
-            out.write_all(&DELIM).map_err(io)?;
-        }
+                // data_size counts the magic byte, the payload and the checksum.
+                be_u32_w(&mut out, (payload.len() + 2) as u32).map_err(io)?;
+                out.write_all(&[goo_rle::IMAGE_MAGIC]).map_err(io)?;
+                out.write_all(&payload).map_err(io)?;
+                out.write_all(&[goo_rle::checksum(&payload)]).map_err(io)?;
+                out.write_all(&DELIM).map_err(io)?;
+                Ok(())
+            },
+        )?;
 
         out.write_all(&ENDING).map_err(io)?;
         out.flush().map_err(io)?;

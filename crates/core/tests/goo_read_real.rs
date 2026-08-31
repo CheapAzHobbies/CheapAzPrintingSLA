@@ -1,6 +1,5 @@
 //! Reading real GOO files (§41).
 
-use cheapazsla_core::layers::LayerProvider;
 use cheapazsla_core::registry;
 use std::path::PathBuf;
 

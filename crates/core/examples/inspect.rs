@@ -7,7 +7,6 @@
 //! Uses only the public API, so it doubles as a check that the engine is
 //! usable as a library.
 
-use cheapazsla_core::layers::LayerProvider;
 use cheapazsla_core::registry;
 use std::path::Path;
 

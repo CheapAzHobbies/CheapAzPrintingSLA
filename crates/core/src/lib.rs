@@ -20,6 +20,7 @@ pub mod history;
 pub mod layers;
 pub mod limits;
 pub mod model;
+pub mod pipeline;
 pub mod registry;
 pub mod remedy;
 pub mod settings;

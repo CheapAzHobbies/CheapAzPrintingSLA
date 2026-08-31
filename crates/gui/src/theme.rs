@@ -101,6 +101,14 @@ fn sheet(p: &Palette) -> String {
 .cz-nav-item.selected .cz-nav-marker {{ background-color: @cz_accent; }}
 .cz-nav-marker {{ background-color: transparent; border-radius: 2px; }}
 
+/* ---- page padding ----
+   Set here rather than as margins in code so the narrow state is one class on
+   the window rather than a handle to every page. */
+.cz-page-body {{ padding: {space_6}px; }}
+/* Only the sides give way. Vertical padding is not what is scarce, and
+   changing it made the whole page jump up as the window crossed the step. */
+.compact .cz-page-body {{ padding: {space_6}px {space_3}px; }}
+
 /* ---- surfaces ---- */
 .cz-panel {{
   background-color: @cz_panel;
@@ -221,6 +229,8 @@ button.cz-destructive {{ color: {error}; }}
         dim = p.dim,
         hover = p.hover,
         accent = ACCENT,
+        space_6 = SPACE_6,
+        space_3 = SPACE_3,
         accent_hover = ACCENT_HOVER,
         ok = OK,
         warn = WARN,

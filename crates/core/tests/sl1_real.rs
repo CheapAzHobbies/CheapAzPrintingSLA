@@ -4,7 +4,6 @@
 //! skipped when it is unset so the suite still passes on a clean checkout.
 
 use cheapazsla_core::format::Confidence;
-use cheapazsla_core::layers::LayerProvider;
 use cheapazsla_core::registry;
 use std::path::PathBuf;
 

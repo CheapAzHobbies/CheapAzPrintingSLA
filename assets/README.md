@@ -22,3 +22,10 @@ The save indicator. See the credits section of the top-level README: it is the
 Club Penguin dance recoloured to a silhouette, carried over from
 [lens](https://github.com/CheapAzHobbies/lens), and used as a progress
 indicator rather than shipped as artwork.
+
+The white sticker outline around it is generated, not hand-drawn: run
+`tools/outline_penguin.py assets/penguin_saving.png`. It dilates each frame's
+alpha, rounds the corners off and fills the result white behind the original,
+one grid cell at a time so an outline cannot bleed into a neighbouring frame.
+The first run keeps the un-outlined sheet as `penguin_saving.png.orig` and
+every later run starts from that, so the border is never applied twice.

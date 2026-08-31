@@ -5,8 +5,22 @@
 
 use crate::theme;
 use adw::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+/// Long enough to read as the rail folding up, short enough not to be a wait.
+const COLLAPSE_MS: u32 = 220;
+/// The width of the icon rail once the labels have gone.
+const RAIL_WIDTH: i32 = 56;
+
+/// Drop a revealer out of the layout once it has finished folding away.
+fn hide_when_folded(reveal: &gtk::Revealer) {
+    reveal.connect_child_revealed_notify(|r| {
+        if !r.is_child_revealed() && !r.reveals_child() {
+            r.set_visible(false);
+        }
+    });
+}
 
 /// A section of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +85,14 @@ pub struct Shell {
     items: RefCell<Vec<NavItem>>,
     current: RefCell<Section>,
     on_change: RefCell<Option<SectionHandler>>,
+    sidebar: gtk::Box,
+    /// One per navigation label, plus the wordmark, so the rail folds up
+    /// rather than snapping between two layouts.
+    reveals: RefCell<Vec<gtk::Revealer>>,
+    /// Held so a second toggle mid-animation replaces the first rather than
+    /// fighting it.
+    width_anim: RefCell<Option<adw::TimedAnimation>>,
+    compact: Cell<bool>,
 }
 
 impl Shell {
@@ -92,20 +114,37 @@ impl Shell {
         brand.set_margin_bottom(theme::SPACE_4);
         brand.set_margin_start(theme::SPACE_4);
         brand.set_margin_end(theme::SPACE_4);
+        // Ellipsized so the wordmark cannot hold the rail open: a revealer
+        // that slides vertically still reports its child's width, and the
+        // title alone was keeping the collapsed rail at 120px.
         let name = gtk::Label::builder()
             .label("CheapAzSLA")
             .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         name.add_css_class("heading");
         let tag = gtk::Label::builder()
             .label("Resin print files")
             .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         tag.add_css_class("caption");
         tag.add_css_class("cz-dim");
         brand.append(&name);
         brand.append(&tag);
-        sidebar.append(&brand);
+        let brand_reveal = gtk::Revealer::builder()
+            .child(&brand)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(COLLAPSE_MS)
+            .reveal_child(true)
+            .build();
+        // A collapsed revealer still reports its child's width along the axis
+        // it is not sliding on, and a box hands out spare space towards each
+        // child's natural width before it considers expansion — so the folded
+        // rail was being pulled back open to the width of the wordmark. Once
+        // the slide has finished there is nothing to show, so it goes.
+        hide_when_folded(&brand_reveal);
+        sidebar.append(&brand_reveal);
 
         let shell = Rc::new(Self {
             widget: gtk::Box::new(gtk::Orientation::Horizontal, 0),
@@ -113,6 +152,10 @@ impl Shell {
             items: RefCell::new(Vec::new()),
             current: RefCell::new(Section::Convert),
             on_change: RefCell::new(None),
+            sidebar: sidebar.clone(),
+            reveals: RefCell::new(vec![brand_reveal]),
+            width_anim: RefCell::new(None),
+            compact: Cell::new(false),
         });
 
         for section in Section::ALL {
@@ -125,7 +168,15 @@ impl Shell {
             marker.set_valign(gtk::Align::Center);
             row.append(&marker);
             row.append(&gtk::Image::from_icon_name(section.icon()));
-            row.append(&gtk::Label::new(Some(section.label())));
+            let reveal = gtk::Revealer::builder()
+                .child(&gtk::Label::new(Some(section.label())))
+                .transition_type(gtk::RevealerTransitionType::SlideRight)
+                .transition_duration(COLLAPSE_MS)
+                .reveal_child(true)
+                .build();
+            hide_when_folded(&reveal);
+            row.append(&reveal);
+            shell.reveals.borrow_mut().push(reveal);
 
             let button = gtk::Button::builder().child(&row).build();
             button.add_css_class("flat");
@@ -172,26 +223,60 @@ impl Shell {
 
     /// Keep the icons, drop the labels. At narrow widths the sidebar's text is
     /// most of its width and the icons carry the meaning on their own.
+    ///
+    /// Animated rather than switched: the labels slide away in revealers and
+    /// the rail's width is driven down alongside them, so narrowing the window
+    /// folds the sidebar up instead of making it jump between two layouts.
     pub fn set_compact(&self, compact: bool) {
-        for item in self.items.borrow().iter() {
-            if let Some(row) = item.button.child() {
-                let mut child = row.first_child();
-                while let Some(c) = child {
-                    if c.is::<gtk::Label>() {
-                        c.set_visible(!compact);
-                    }
-                    child = c.next_sibling();
-                }
-            }
+        if self.compact.replace(compact) == compact {
+            return;
         }
-        if let Some(sidebar) = self.widget.first_child() {
-            sidebar.set_size_request(if compact { 56 } else { theme::SIDEBAR_WIDTH }, -1);
-            // The wordmark goes with the labels; an icon rail with a title
-            // wrapped over three lines is worse than no title.
-            if let Some(brand) = sidebar.first_child() {
-                brand.set_visible(!compact);
+        for reveal in self.reveals.borrow().iter() {
+            if !compact {
+                // Made visible before it is told to reveal, or the slide has
+                // nothing to run on.
+                reveal.set_visible(true);
             }
+            reveal.set_reveal_child(!compact);
         }
+
+        // From wherever it is now, not from the nominal width, so a toggle
+        // part way through the previous one carries on from there.
+        let from = self.sidebar.width_request().max(RAIL_WIDTH) as f64;
+        let to = if compact {
+            RAIL_WIDTH
+        } else {
+            theme::SIDEBAR_WIDTH
+        } as f64;
+
+        // One animation, reused. Building a fresh one per toggle looked right
+        // and was not: the second one never ran a single frame, and the rail
+        // stayed at whatever width the first had left it.
+        let anim = self.width_anim.borrow().clone();
+        let anim = match anim {
+            Some(a) => a,
+            None => {
+                let sidebar = self.sidebar.clone();
+                let target = adw::CallbackAnimationTarget::new(move |value| {
+                    sidebar.set_size_request(value.round() as i32, -1);
+                });
+                let a = adw::TimedAnimation::builder()
+                    .widget(&self.sidebar)
+                    .value_from(from)
+                    .value_to(to)
+                    .duration(COLLAPSE_MS)
+                    .easing(adw::Easing::EaseOutCubic)
+                    .target(&target)
+                    .build();
+                *self.width_anim.borrow_mut() = Some(a.clone());
+                a
+            }
+        };
+        anim.pause();
+        anim.set_value_from(from);
+        anim.set_value_to(to);
+        anim.reset();
+        anim.play();
     }
 
     fn select_visual(&self, section: Section) {

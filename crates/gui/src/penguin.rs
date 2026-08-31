@@ -4,9 +4,14 @@
 //! shown while a conversion is running. Carried over from CheapAzHobbies'
 //! `lens`, where the sheet was built by `tools/make_penguin_sheet.py`.
 //!
-//! The sheet is a grid rather than one row: 141 frames at 124 pixels wide
-//! would otherwise be a 17000 pixel image. Frames are authored at 20fps and
-//! one full loop is 7.05 seconds.
+//! The sheet is a grid rather than one row: 141 frames side by side would
+//! otherwise be a 35000 pixel image. Frames are authored at 20fps and one full
+//! loop is 7.05 seconds.
+//!
+//! Cells are 248x240, rebuilt from the source at twice the size lens used.
+//! That project drew the indicator at about 40 pixels, so 124x120 cells were
+//! ample there; here it is drawn at 88 and the smaller cells were being
+//! stretched past their resolution and looked soft.
 //!
 //! It is embedded in the binary rather than loaded from disk, so an AppImage
 //! or a single copied binary keeps working with no asset path to get wrong.
@@ -20,8 +25,8 @@ use std::rc::Rc;
 const SHEET: &[u8] = include_bytes!("../../../assets/penguin_saving.png");
 const FRAMES: usize = 141;
 const COLS: usize = 12;
-const FRAME_W: u32 = 124;
-const FRAME_H: u32 = 120;
+const FRAME_W: u32 = 248;
+const FRAME_H: u32 = 240;
 /// 20fps, the rate the frames were authored at.
 const FRAME_MS: u64 = 50;
 

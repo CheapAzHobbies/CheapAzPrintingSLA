@@ -151,6 +151,14 @@ struct App {
     info_panel: gtk::Box,
     /// The information column beside the preview, dropped when narrow.
     preview_side: gtk::Widget,
+    /// The preview split, whose padding shrinks before anything is dropped.
+    preview_split: gtk::Box,
+    /// Input and output side by side, stacked when there is no room for two.
+    format_row: gtk::Box,
+    /// The swap button between them, which stacking leaves nothing to mean.
+    swap_col: gtk::Box,
+    /// First and last layer buttons, dropped at the narrowest step.
+    preview_nav_ends: Vec<gtk::Widget>,
     /// True while the window is narrow enough that columns are being dropped.
     compact: Cell<bool>,
 
@@ -218,10 +226,11 @@ fn build(app: &adw::Application) -> Rc<App> {
         .title("CheapAzSLA")
         .default_width(1440)
         .default_height(900)
-        // Half of a 1920 display is 960 wide and a quarter is 960x540, so a
-        // 1000px minimum quietly made the window untileable. The layout gives
-        // things up as it narrows rather than refusing to narrow.
-        .width_request(560)
+        // Half of a 1920 display is 960 wide and a quarter is 480, so any
+        // minimum above that quietly makes the window untileable. The layout
+        // gives things up as it narrows rather than refusing to narrow; see
+        // wire_responsive for how the minimum is unlocked at all.
+        .width_request(420)
         .height_request(440)
         .build();
     window.add_css_class("cheapazsla");
@@ -284,11 +293,18 @@ fn build(app: &adw::Application) -> Rc<App> {
         }
     });
 
+    // Ellipsized: a destination path is arbitrarily long and there is no
+    // width at which it should be what stops the window narrowing.
     let dest_label = gtk::Label::builder()
         .label("Beside the original")
         .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
-    let dest_detail = gtk::Label::builder().label("").xalign(0.0).build();
+    let dest_detail = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
     dest_detail.add_css_class("caption");
     dest_detail.add_css_class("cz-dim");
     let dest_inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -336,6 +352,8 @@ fn build(app: &adw::Application) -> Rc<App> {
     );
     let controls = convert_page.1;
     let name_row = convert_page.2;
+    let format_row = convert_page.3;
+    let swap_col = convert_page.4;
     shell.add_page(Section::Convert, &convert_page.0);
 
     // --- preview page -----------------------------------------------------
@@ -358,7 +376,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     slider.set_increments(1.0, 10.0);
     let play_btn = shell::icon_button("media-playback-start-symbolic", "Play  (Space)");
     let info_panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
-    let (preview_page, preview_stack, preview_side) = build_preview_page(
+    let preview = build_preview_page(
         &viewer,
         &layer_label,
         &slider,
@@ -366,6 +384,13 @@ fn build(app: &adw::Application) -> Rc<App> {
         &info_panel,
         &layer_detail,
     );
+    let PreviewChrome {
+        page: preview_page,
+        stack: preview_stack,
+        side: preview_side,
+        split: preview_split,
+        nav_ends: preview_nav_ends,
+    } = preview;
     shell.add_page(Section::Preview, &preview_page);
 
     // --- history page -----------------------------------------------------
@@ -415,6 +440,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         play_btn: play_btn.clone(),
         info_panel,
         preview_side,
+        preview_split,
+        format_row,
+        swap_col,
+        preview_nav_ends,
         compact: Cell::new(false),
         history_list,
         history_stack,
@@ -445,27 +474,88 @@ fn build(app: &adw::Application) -> Rc<App> {
     ui
 }
 
-/// Drop things as the window narrows, rather than refusing to narrow (§25).
+/// Print the smallest size each part of the window will accept.
 ///
-/// Two steps. Below the first the information panel beside the preview goes,
-/// since the image is the point and the numbers are still on the Convert page.
-/// Below the second the sidebar keeps its icons and loses its labels, which is
-/// most of its width.
+/// A stack takes the largest minimum of every page it holds, shown or not, so
+/// one wide page holds the whole window open. Walking the tree is the only way
+/// to find which.
+/// Let the window narrow instead of refusing to (§25).
+///
+/// A GtkWindow will not be resized below the minimum width its contents ask
+/// for, and the contents cannot be told to shrink until the window has
+/// narrowed, so on its own the layout deadlocks at whatever its widest row
+/// happens to need — here 1238px, which is more than half of a 1920 display.
+/// An AdwBreakpoint breaks that: once a window has one, libadwaita stops
+/// passing the child minimum up, the window honours its own width request
+/// instead, and the breakpoint tells us when to put the layout into a state
+/// that actually fits the width we have been given.
+///
+/// Three states. Wide shows everything. Below the first step the information
+/// column beside the image goes, since the image is the point and the same
+/// numbers are on the Convert page. Below the second the sidebar keeps its
+/// icons and loses its labels, the layer scale gives up its fixed width, and
+/// the first/last buttons go — they are the two of the five that a keyboard
+/// Home and End already cover.
 fn wire_responsive(ui: &Rc<App>) {
-    const HIDE_INFO_BELOW: i32 = 940;
-    const NARROW_SIDEBAR_BELOW: i32 = 720;
+    // Each threshold sits above the width the layout actually needs in the
+    // state below it, measured rather than guessed: the full sidebar and a
+    // full-padding page fit down to about 630, the icon rail and tight
+    // padding to about 460, and stacked columns to about 380.
+    const WIDE_BELOW: &str = "max-width: 1140px";
+    const NARROW_BELOW: &str = "max-width: 760px";
+    const STACKED_BELOW: &str = "max-width: 480px";
 
     let apply = {
         let ui = ui.clone();
-        std::rc::Rc::new(move |width: i32| {
-            ui.preview_side.set_visible(width >= HIDE_INFO_BELOW);
-            let narrow = width < NARROW_SIDEBAR_BELOW;
+        Rc::new(move |level: u8| {
+            ui.preview_side.set_visible(level == 0);
+            let pad = match level {
+                0 => theme::SPACE_6,
+                1 => theme::SPACE_4,
+                _ => theme::SPACE_3,
+            };
+            // Sides only: the top and bottom stay put, so crossing a step
+            // does not shift everything on the page up or down.
+            ui.preview_split.set_margin_start(pad);
+            ui.preview_split.set_margin_end(pad);
+
+            let narrow = level >= 2;
+            let stacked = level >= 3;
+            ui.format_row.set_orientation(if stacked {
+                gtk::Orientation::Vertical
+            } else {
+                gtk::Orientation::Horizontal
+            });
+            // Stacked, an arrow between two things that are now above and
+            // below each other says nothing, and the swap is still there at
+            // any width with room for the two columns.
+            ui.swap_col.set_visible(!stacked);
+            if narrow {
+                ui.window.add_css_class("compact");
+            } else {
+                ui.window.remove_css_class("compact");
+            }
             ui.shell.set_compact(narrow);
             // Everything with a fixed width gives it up before anything can
             // overlap, so the window can be tiled rather than refusing to
             // shrink past whatever its widest row happens to need.
-            ui.slider
-                .set_size_request(if narrow { 90 } else { 360 }, -1);
+            // A minimum, not a width: the scale expands into whatever the row
+            // has left, so a smaller floor costs nothing at full size and is
+            // what lets the window keep narrowing.
+            ui.slider.set_size_request(
+                match level {
+                    0 => 240,
+                    1 => 160,
+                    _ => 80,
+                },
+                -1,
+            );
+            let chars = if narrow { 8 } else { 14 };
+            ui.layer_label.set_width_chars(chars);
+            ui.layer_label.set_max_width_chars(chars);
+            for b in &ui.preview_nav_ends {
+                b.set_visible(!narrow);
+            }
             if ui.compact.get() != narrow {
                 ui.compact.set(narrow);
                 if !ui.files.borrow().is_empty() {
@@ -474,15 +564,72 @@ fn wire_responsive(ui: &Rc<App>) {
             }
         })
     };
-    // Not applied here: before the window is shown its width is zero, which
-    // is below every threshold, so the sidebar came up collapsed on a window
-    // that was never narrow. The first real measurement arrives on map.
-    let window = ui.window.clone();
-    {
-        let apply = apply.clone();
-        window.connect_map(move |w| apply(w.width().max(w.default_width())));
+    apply(0);
+
+    // Only one breakpoint is ever applied at a time — the last one added
+    // whose condition holds — so the narrow one standing alone still means
+    // the narrow state, and the flags can simply be read in order. The
+    // recompute is deferred so it does not matter whether libadwaita
+    // unapplies the old breakpoint before or after it applies the new one.
+    let hit_wide = Rc::new(Cell::new(false));
+    let hit_narrow = Rc::new(Cell::new(false));
+    let hit_stacked = Rc::new(Cell::new(false));
+    let recompute = {
+        let (apply, hit_wide, hit_narrow, hit_stacked) = (
+            apply.clone(),
+            hit_wide.clone(),
+            hit_narrow.clone(),
+            hit_stacked.clone(),
+        );
+        let pending = Rc::new(Cell::new(false));
+        Rc::new(move || {
+            if pending.replace(true) {
+                return;
+            }
+            let (apply, hit_wide, hit_narrow, hit_stacked, pending) = (
+                apply.clone(),
+                hit_wide.clone(),
+                hit_narrow.clone(),
+                hit_stacked.clone(),
+                pending.clone(),
+            );
+            glib::idle_add_local_once(move || {
+                pending.set(false);
+                apply(if hit_stacked.get() {
+                    3
+                } else if hit_narrow.get() {
+                    2
+                } else if hit_wide.get() {
+                    1
+                } else {
+                    0
+                });
+            });
+        })
+    };
+
+    for (condition, flag) in [
+        (WIDE_BELOW, &hit_wide),
+        (NARROW_BELOW, &hit_narrow),
+        (STACKED_BELOW, &hit_stacked),
+    ] {
+        let bp = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse(condition).expect("breakpoint condition"),
+        );
+        for (state, signal) in [(true, "apply"), (false, "unapply")] {
+            let (flag, recompute) = (flag.clone(), recompute.clone());
+            let handler = move |_: &adw::Breakpoint| {
+                flag.set(state);
+                recompute();
+            };
+            if signal == "apply" {
+                bp.connect_apply(handler);
+            } else {
+                bp.connect_unapply(handler);
+            }
+        }
+        ui.window.add_breakpoint(bp);
     }
-    window.connect_default_width_notify(move |w| apply(w.width()));
 }
 
 /// An icon and a label side by side, for buttons that deserve both (§6).
@@ -513,9 +660,15 @@ fn build_dropzone() -> (gtk::Box, gtk::Label) {
 
     let title = gtk::Label::new(Some("Drop files here"));
     title.add_css_class("cz-title");
+    title.set_wrap(true);
+    title.set_justify(gtk::Justification::Center);
+    title.set_max_width_chars(38);
 
     let sub = gtk::Label::new(Some("or browse your computer"));
     sub.add_css_class("cz-subtitle");
+    sub.set_wrap(true);
+    sub.set_justify(gtk::Justification::Center);
+    sub.set_max_width_chars(38);
 
     let browse = gtk::Button::with_label("Browse Files");
     browse.set_halign(gtk::Align::Center);
@@ -561,8 +714,14 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
     let head = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     let t = gtk::Label::builder().label(title).xalign(0.0).build();
     t.add_css_class("cz-title");
+    t.set_wrap(true);
+    t.set_justify(gtk::Justification::Center);
+    t.set_max_width_chars(38);
     let s = gtk::Label::builder().label(subtitle).xalign(0.0).build();
     s.add_css_class("cz-subtitle");
+    s.set_wrap(true);
+    s.set_justify(gtk::Justification::Center);
+    s.set_max_width_chars(38);
     head.append(&t);
     head.append(&s);
     head.set_margin_bottom(theme::SPACE_5);
@@ -570,10 +729,9 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
     let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     body.append(&head);
     body.append(content);
-    body.set_margin_top(theme::SPACE_6);
-    body.set_margin_bottom(theme::SPACE_6);
-    body.set_margin_start(theme::SPACE_6);
-    body.set_margin_end(theme::SPACE_6);
+    // Padding in CSS rather than margins in code, so the narrow state is one
+    // class on the window instead of a handle to every page.
+    body.add_css_class("cz-page-body");
 
     // Clamped so text never runs to an uncomfortable measure on a wide screen,
     // while the workspace still takes the extra width (§25).
@@ -609,7 +767,7 @@ fn build_convert_page(
     progress: &gtk::ProgressBar,
     penguin: &Rc<penguin::Penguin>,
     problem: &gtk::Box,
-) -> (gtk::Widget, gtk::Box, gtk::Box) {
+) -> (gtk::Widget, gtk::Box, gtk::Box, gtk::Box, gtk::Box) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
     content.append(dropzone);
     content.append(queue_panel);
@@ -633,6 +791,7 @@ fn build_convert_page(
     // up with the controls rather than being nudged by a guessed pixel height.
     let swap_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     swap_col.set_valign(gtk::Align::Start);
+    swap_col.set_halign(gtk::Align::Center);
     let swap_spacer = shell::section_label("");
     swap_col.append(&swap_spacer);
     swap_btn.set_valign(gtk::Align::Center);
@@ -664,6 +823,8 @@ fn build_convert_page(
     formats.append(&swap_col);
     formats.append(&out_col);
     controls.append(&formats);
+    // Side by side needs both columns' width at once. Narrow, they stack.
+    formats.set_widget_name("format-row");
 
     // Destination and filename.
     let dest_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
@@ -695,7 +856,21 @@ fn build_convert_page(
         ),
         controls,
         name_row,
+        formats,
+        swap_col,
     )
+}
+
+/// The parts of the preview page that have to give way as the window narrows.
+struct PreviewChrome {
+    page: gtk::Widget,
+    stack: gtk::Stack,
+    /// The information column beside the image.
+    side: gtk::Widget,
+    /// The padding around the split, which is the cheapest width to give up.
+    split: gtk::Box,
+    /// First and last layer buttons, the two least used of the five.
+    nav_ends: Vec<gtk::Widget>,
 }
 
 fn build_preview_page(
@@ -705,7 +880,7 @@ fn build_preview_page(
     play_btn: &gtk::Button,
     info_panel: &gtk::Box,
     layer_detail: &gtk::Box,
-) -> (gtk::Widget, gtk::Stack, gtk::Widget) {
+) -> PreviewChrome {
     // Only the layer number sits beside the slider, in a cell wide enough for
     // the largest count it will ever show. Anything whose width follows its
     // content cannot share a row with the widget that expands.
@@ -719,10 +894,9 @@ fn build_preview_page(
     labels.append(layer_label);
 
     let nav = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
-    nav.append(&shell::icon_button(
-        "go-first-symbolic",
-        "First layer  (Home)",
-    ));
+    let first = shell::icon_button("go-first-symbolic", "First layer  (Home)");
+    let last = shell::icon_button("go-last-symbolic", "Last layer  (End)");
+    nav.append(&first);
     nav.append(&shell::icon_button(
         "go-previous-symbolic",
         "Previous layer  (Left)",
@@ -732,7 +906,8 @@ fn build_preview_page(
         "go-next-symbolic",
         "Next layer  (Right)",
     ));
-    nav.append(&shell::icon_button("go-last-symbolic", "Last layer  (End)"));
+    nav.append(&last);
+    let nav_ends = vec![first.upcast::<gtk::Widget>(), last.upcast::<gtk::Widget>()];
 
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
     bar.set_margin_top(theme::SPACE_3);
@@ -779,10 +954,16 @@ fn build_preview_page(
     icon.add_css_class("cz-dim");
     let t = gtk::Label::new(Some("Nothing to preview yet"));
     t.add_css_class("cz-title");
+    t.set_wrap(true);
+    t.set_justify(gtk::Justification::Center);
+    t.set_max_width_chars(38);
     let s = gtk::Label::new(Some(
         "Add a file on the Convert page to look through its layers.",
     ));
     s.add_css_class("cz-subtitle");
+    s.set_wrap(true);
+    s.set_justify(gtk::Justification::Center);
+    s.set_max_width_chars(38);
     empty.append(&icon);
     empty.append(&t);
     empty.append(&s);
@@ -794,7 +975,13 @@ fn build_preview_page(
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&split, Some("view"));
     stack.set_visible_child_name("empty");
-    (stack.clone().upcast(), stack, side_scroll.upcast())
+    PreviewChrome {
+        page: stack.clone().upcast(),
+        stack,
+        side: side_scroll.upcast(),
+        split,
+        nav_ends,
+    }
 }
 
 fn build_history_page(list: &gtk::ListBox) -> (gtk::Widget, gtk::Stack) {
@@ -811,8 +998,14 @@ fn build_history_page(list: &gtk::ListBox) -> (gtk::Widget, gtk::Stack) {
     icon.add_css_class("cz-dim");
     let t = gtk::Label::new(Some("No conversions yet"));
     t.add_css_class("cz-title");
+    t.set_wrap(true);
+    t.set_justify(gtk::Justification::Center);
+    t.set_max_width_chars(38);
     let s = gtk::Label::new(Some("Files you convert will be listed here."));
     s.add_css_class("cz-subtitle");
+    s.set_wrap(true);
+    s.set_justify(gtk::Justification::Center);
+    s.set_max_width_chars(38);
     empty.append(&icon);
     empty.append(&t);
     empty.append(&s);

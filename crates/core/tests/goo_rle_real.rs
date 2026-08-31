@@ -8,7 +8,6 @@
 //!   CHEAPAZSLA_REAL_GOO=<file.goo> CHEAPAZSLA_REAL_SL1=<same.sl1> cargo test
 
 use cheapazsla_core::formats::goo_rle;
-use cheapazsla_core::layers::LayerProvider;
 use cheapazsla_core::registry;
 use std::path::PathBuf;
 

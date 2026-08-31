@@ -136,8 +136,13 @@ impl LayerProvider for InMemoryLayers {
 /// without every handler having to know about reporting. The callback runs on
 /// whichever thread is doing the writing, so it must not touch the interface
 /// directly.
+///
+/// What is reported is a count of completed fetches, not the index fetched:
+/// writers fetch layers on several threads at once, so indices arrive out of
+/// order and a bar driven by them would jump backwards.
 pub struct ProgressLayers<'a> {
     inner: &'a dyn LayerProvider,
+    done: std::sync::atomic::AtomicU32,
     #[allow(clippy::type_complexity)]
     on_layer: Box<dyn Fn(u32, u32) + Send + Sync + 'a>,
 }
@@ -149,6 +154,7 @@ impl<'a> ProgressLayers<'a> {
     ) -> Self {
         Self {
             inner,
+            done: std::sync::atomic::AtomicU32::new(0),
             on_layer: Box::new(on_layer),
         }
     }
@@ -167,7 +173,8 @@ impl LayerProvider for ProgressLayers<'_> {
         let img = self.inner.layer(index)?;
         // Reported after the fetch succeeds, so a failed layer is not counted
         // as done.
-        (self.on_layer)(index + 1, self.inner.layer_count());
+        let done = self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        (self.on_layer)(done, self.inner.layer_count());
         Ok(img)
     }
 }

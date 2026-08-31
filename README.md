@@ -129,6 +129,25 @@ back a provider that decodes a layer only when it is asked for, wrapped in a
 small most-recently-used cache so scrubbing the preview stays responsive
 without holding the whole stack in memory.
 
+### Conversion runs on every core it can use
+
+Decoding a source layer and re-encoding it for the destination is the whole
+cost of a conversion, and each layer is independent of every other. The file
+is not: records have to reach it in order. So the expensive half runs on a
+pool and the results are handed back in index order to a single writer, which
+keeps the append-only, atomic-rename property the conversion depends on.
+
+How many layers are worked on at once is decided from the machine, not fixed:
+core count, capped by how much memory a layer costs and by what is actually
+free right now. A 11520x5120 panel is 59MB per layer, and thirty-two of those
+in flight is 1.9GB on a machine that may not have it. Workers are also held to
+a short lookahead, so a fast decoder cannot queue an entire print into memory
+while the writer catches up.
+
+A 438 layer, 11520x5120 print converts from SL1 to GOO in 8.3 seconds on a
+32-core machine, against 48.1 seconds for the same work done one layer at a
+time. The output is byte-identical apart from the timestamp in the header.
+
 ## Current state
 
 | Area | State |
@@ -136,13 +155,15 @@ without holding the whole stack in memory.
 | Common print model | done, tested |
 | Safety limits for untrusted input | done, tested |
 | Lazy layer provider and cache | done, tested |
+| Ordered parallel conversion pipeline | done, tested |
 | Format handler interface and registry | done |
 | Format detection by content | done, tested |
 | SL1 reading | done, tested against real slicer output |
 | SL1 writing | not started |
-| GOO, CTB, PHZ | not started |
-| Desktop interface | not started |
-| Command line | not started |
+| GOO reading and writing | done, verified against a real Elegoo file |
+| CTB, PHZ | not started |
+| Desktop interface | done |
+| Command line | done |
 | Packaging | not started |
 
 Anything marked not started is absent, not stubbed. There are no buttons that
