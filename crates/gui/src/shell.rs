@@ -15,6 +15,10 @@ const COLLAPSE_MS: u32 = 220;
 const LABELS_OUT_MS: u32 = 130;
 const LABELS_IN_MS: u32 = 200;
 const LABELS_IN_DELAY_MS: u64 = 90;
+/// How often to check whether the rail is ready to animate, and how long to
+/// keep checking before setting the labels without a slide.
+const POLL_MS: u64 = 10;
+const GIVE_UP_MS: u64 = 400;
 /// The width of the icon rail once the labels have gone.
 const RAIL_WIDTH: i32 = 56;
 
@@ -252,33 +256,7 @@ impl Shell {
         // open before there is anywhere for a label to appear, so they trail.
         // Equal durations put them in each other's way in both directions.
         self.want_labels.set(!compact);
-        if compact {
-            for reveal in self.reveals.borrow().iter() {
-                reveal.set_transition_duration(LABELS_OUT_MS);
-                reveal.set_reveal_child(false);
-            }
-        } else {
-            // Held back a moment rather than started with the rail. A revealer
-            // told to reveal allocates its child at full size for a frame or
-            // two before its transition takes over, and starting from a folded
-            // rail that flash is most of the way open — a jump, then a wait,
-            // then the rest of the slide. By the time it fires the rail is
-            // already wider than the flash, so there is nothing to see.
-            let reveals: Vec<gtk::Revealer> = self.reveals.borrow().clone();
-            let want = self.want_labels.clone();
-            glib::timeout_add_local_once(
-                std::time::Duration::from_millis(LABELS_IN_DELAY_MS),
-                move || {
-                    if !want.get() {
-                        return;
-                    }
-                    for reveal in &reveals {
-                        reveal.set_transition_duration(LABELS_IN_MS);
-                        reveal.set_reveal_child(true);
-                    }
-                },
-            );
-        }
+        self.slide_labels(!compact);
 
         // From wherever it is now, not from the nominal width, so a toggle
         // part way through the previous one carries on from there.
@@ -289,6 +267,47 @@ impl Shell {
             theme::SIDEBAR_WIDTH
         } as f64;
         self.animate_width(from, to);
+    }
+
+    /// Slide the labels in or out, once the rail is in a state to show it.
+    ///
+    /// A revealer told to change while it is unmapped skips its transition and
+    /// jumps, and at the moment a breakpoint fires during a window resize the
+    /// sidebar is briefly unmapped — the same thing that was stopping the
+    /// width animating. So this waits for the rail to be mapped rather than
+    /// acting immediately, and gives up and sets the state anyway if that
+    /// never comes, since a label in the wrong state is worse than one that
+    /// arrived without sliding.
+    ///
+    /// Revealing also waits out a short delay on top: a revealer allocates its
+    /// child at full size for a frame or two before its transition takes over,
+    /// and from a folded rail that flash is most of the way open. By the time
+    /// it fires the rail is wider than the flash, so there is nothing to see.
+    fn slide_labels(&self, revealed: bool) {
+        let reveals: Vec<gtk::Revealer> = self.reveals.borrow().clone();
+        let want = self.want_labels.clone();
+        let sidebar = self.sidebar.clone();
+        let (delay, duration) = if revealed {
+            (LABELS_IN_DELAY_MS, LABELS_IN_MS)
+        } else {
+            (0, LABELS_OUT_MS)
+        };
+        let mut waited = 0u64;
+        glib::timeout_add_local(std::time::Duration::from_millis(POLL_MS), move || {
+            waited += POLL_MS;
+            // The window went the other way again while we were waiting.
+            if want.get() != revealed {
+                return glib::ControlFlow::Break;
+            }
+            if waited < delay || (!sidebar.is_mapped() && waited < GIVE_UP_MS) {
+                return glib::ControlFlow::Continue;
+            }
+            for reveal in &reveals {
+                reveal.set_transition_duration(duration);
+                reveal.set_reveal_child(revealed);
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     /// Drive the rail's width from the window's frame clock.
