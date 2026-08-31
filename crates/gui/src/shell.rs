@@ -5,22 +5,18 @@
 
 use crate::theme;
 use adw::prelude::*;
+use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Long enough to read as the rail folding up, short enough not to be a wait.
 const COLLAPSE_MS: u32 = 220;
+/// Labels clear out ahead of the narrowing rail, and arrive behind it.
+const LABELS_OUT_MS: u32 = 130;
+const LABELS_IN_MS: u32 = 200;
+const LABELS_IN_DELAY_MS: u64 = 90;
 /// The width of the icon rail once the labels have gone.
 const RAIL_WIDTH: i32 = 56;
-
-/// Drop a revealer out of the layout once it has finished folding away.
-fn hide_when_folded(reveal: &gtk::Revealer) {
-    reveal.connect_child_revealed_notify(|r| {
-        if !r.is_child_revealed() && !r.reveals_child() {
-            r.set_visible(false);
-        }
-    });
-}
 
 /// A section of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +88,9 @@ pub struct Shell {
     /// Held so a second toggle mid-animation replaces the first rather than
     /// fighting it.
     width_anim: RefCell<Option<adw::TimedAnimation>>,
+    /// Whether the labels should be showing, so a reveal held back for a
+    /// moment does not fire into a rail that has folded again meanwhile.
+    want_labels: Rc<Cell<bool>>,
     compact: Cell<bool>,
 }
 
@@ -117,33 +116,48 @@ impl Shell {
         // Ellipsized so the wordmark cannot hold the rail open: a revealer
         // that slides vertically still reports its child's width, and the
         // title alone was keeping the collapsed rail at 120px.
+        // Ellipsized, and asking for a single character rather than the
+        // default full width. An ellipsizing label still reports its whole
+        // text as its minimum unless it is told how little it can live with,
+        // and that minimum pinned the rail at 120px for the length of the
+        // fold: the width animation ran, changed nothing, and the rail
+        // dropped to its icon width in one step at the end.
         let name = gtk::Label::builder()
             .label("CheapAzSLA")
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
+            .width_chars(1)
             .build();
         name.add_css_class("heading");
         let tag = gtk::Label::builder()
             .label("Resin print files")
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
+            .width_chars(1)
             .build();
         tag.add_css_class("caption");
         tag.add_css_class("cz-dim");
         brand.append(&name);
         brand.append(&tag);
-        let brand_reveal = gtk::Revealer::builder()
+        // Two revealers, one per axis. A revealer only scales the axis it
+        // slides on, so the vertical one that takes the wordmark's height out
+        // of the rail went on reporting its full width the whole way down —
+        // and a box hands spare space to a child up to its natural width, so
+        // the rail sat at exactly that width for the length of the fold and
+        // then dropped to its icon width in a single step. The inner one
+        // takes the width away in step with it.
+        let brand_width = gtk::Revealer::builder()
             .child(&brand)
+            .transition_type(gtk::RevealerTransitionType::SlideRight)
+            .transition_duration(COLLAPSE_MS)
+            .reveal_child(true)
+            .build();
+        let brand_reveal = gtk::Revealer::builder()
+            .child(&brand_width)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
             .transition_duration(COLLAPSE_MS)
             .reveal_child(true)
             .build();
-        // A collapsed revealer still reports its child's width along the axis
-        // it is not sliding on, and a box hands out spare space towards each
-        // child's natural width before it considers expansion — so the folded
-        // rail was being pulled back open to the width of the wordmark. Once
-        // the slide has finished there is nothing to show, so it goes.
-        hide_when_folded(&brand_reveal);
         sidebar.append(&brand_reveal);
 
         let shell = Rc::new(Self {
@@ -153,8 +167,9 @@ impl Shell {
             current: RefCell::new(Section::Convert),
             on_change: RefCell::new(None),
             sidebar: sidebar.clone(),
-            reveals: RefCell::new(vec![brand_reveal]),
+            reveals: RefCell::new(vec![brand_reveal, brand_width]),
             width_anim: RefCell::new(None),
+            want_labels: Rc::new(Cell::new(true)),
             compact: Cell::new(false),
         });
 
@@ -174,7 +189,6 @@ impl Shell {
                 .transition_duration(COLLAPSE_MS)
                 .reveal_child(true)
                 .build();
-            hide_when_folded(&reveal);
             row.append(&reveal);
             shell.reveals.borrow_mut().push(reveal);
 
@@ -231,13 +245,39 @@ impl Shell {
         if self.compact.replace(compact) == compact {
             return;
         }
-        for reveal in self.reveals.borrow().iter() {
-            if !compact {
-                // Made visible before it is told to reveal, or the slide has
-                // nothing to run on.
-                reveal.set_visible(true);
+        // The labels and the rail's width are two mechanisms moving the same
+        // edge, and whichever finishes second decides what the fold looks
+        // like. Folding, the labels have to be out of the way before the rail
+        // can narrow past them, so they go first. Unfolding, the rail has to
+        // open before there is anywhere for a label to appear, so they trail.
+        // Equal durations put them in each other's way in both directions.
+        self.want_labels.set(!compact);
+        if compact {
+            for reveal in self.reveals.borrow().iter() {
+                reveal.set_transition_duration(LABELS_OUT_MS);
+                reveal.set_reveal_child(false);
             }
-            reveal.set_reveal_child(!compact);
+        } else {
+            // Held back a moment rather than started with the rail. A revealer
+            // told to reveal allocates its child at full size for a frame or
+            // two before its transition takes over, and starting from a folded
+            // rail that flash is most of the way open — a jump, then a wait,
+            // then the rest of the slide. By the time it fires the rail is
+            // already wider than the flash, so there is nothing to see.
+            let reveals: Vec<gtk::Revealer> = self.reveals.borrow().clone();
+            let want = self.want_labels.clone();
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(LABELS_IN_DELAY_MS),
+                move || {
+                    if !want.get() {
+                        return;
+                    }
+                    for reveal in &reveals {
+                        reveal.set_transition_duration(LABELS_IN_MS);
+                        reveal.set_reveal_child(true);
+                    }
+                },
+            );
         }
 
         // From wherever it is now, not from the nominal width, so a toggle
