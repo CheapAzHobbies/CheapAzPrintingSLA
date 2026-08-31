@@ -85,9 +85,9 @@ pub struct Shell {
     /// One per navigation label, plus the wordmark, so the rail folds up
     /// rather than snapping between two layouts.
     reveals: RefCell<Vec<gtk::Revealer>>,
-    /// Held so a second toggle mid-animation replaces the first rather than
+    /// Held so a second fold mid-animation replaces the first rather than
     /// fighting it.
-    width_anim: RefCell<Option<adw::TimedAnimation>>,
+    width_tick: RefCell<Option<gtk::TickCallbackId>>,
     /// Whether the labels should be showing, so a reveal held back for a
     /// moment does not fire into a rail that has folded again meanwhile.
     want_labels: Rc<Cell<bool>>,
@@ -168,7 +168,7 @@ impl Shell {
             on_change: RefCell::new(None),
             sidebar: sidebar.clone(),
             reveals: RefCell::new(vec![brand_reveal, brand_width]),
-            width_anim: RefCell::new(None),
+            width_tick: RefCell::new(None),
             want_labels: Rc::new(Cell::new(true)),
             compact: Cell::new(false),
         });
@@ -288,35 +288,56 @@ impl Shell {
         } else {
             theme::SIDEBAR_WIDTH
         } as f64;
+        self.animate_width(from, to);
+    }
 
-        // One animation, reused. Building a fresh one per toggle looked right
-        // and was not: the second one never ran a single frame, and the rail
-        // stayed at whatever width the first had left it.
-        let anim = self.width_anim.borrow().clone();
-        let anim = match anim {
-            Some(a) => a,
-            None => {
-                let sidebar = self.sidebar.clone();
-                let target = adw::CallbackAnimationTarget::new(move |value| {
-                    sidebar.set_size_request(value.round() as i32, -1);
-                });
-                let a = adw::TimedAnimation::builder()
-                    .widget(&self.sidebar)
-                    .value_from(from)
-                    .value_to(to)
-                    .duration(COLLAPSE_MS)
-                    .easing(adw::Easing::EaseOutCubic)
-                    .target(&target)
-                    .build();
-                *self.width_anim.borrow_mut() = Some(a.clone());
-                a
-            }
+    /// Drive the rail's width from the window's frame clock.
+    ///
+    /// This was an `AdwTimedAnimation` and looked right in isolation, but
+    /// libadwaita skips an animation whose widget is not mapped, and at the
+    /// moment a breakpoint fires during a window resize the sidebar reports
+    /// itself unmapped — realized, 207px wide, its window mapped, and still
+    /// unmapped. So the fold animated when it was triggered on its own and
+    /// jumped when it was triggered by dragging the window, which is the only
+    /// way anyone actually triggers it.
+    ///
+    /// The window is mapped throughout, so its clock is what this runs on.
+    fn animate_width(&self, from: f64, to: f64) {
+        if let Some(id) = self.width_tick.borrow_mut().take() {
+            id.remove();
+        }
+        let Some(root) = self.sidebar.root() else {
+            self.sidebar.set_size_request(to as i32, -1);
+            return;
         };
-        anim.pause();
-        anim.set_value_from(from);
-        anim.set_value_to(to);
-        anim.reset();
-        anim.play();
+        if (to - from).abs() < 1.0 {
+            self.sidebar.set_size_request(to as i32, -1);
+            return;
+        }
+        let root: gtk::Widget = root.upcast();
+        let sidebar = self.sidebar.clone();
+        let began = Cell::new(None::<i64>);
+        let span = (COLLAPSE_MS as i64) * 1000;
+        let id = root.add_tick_callback(move |_, clock| {
+            let now = clock.frame_time();
+            let start = match began.get() {
+                Some(t) => t,
+                None => {
+                    began.set(Some(now));
+                    now
+                }
+            };
+            let t = ((now - start) as f64 / span as f64).clamp(0.0, 1.0);
+            // Ease out cubic: quick to leave, gentle to arrive.
+            let eased = 1.0 - (1.0 - t).powi(3);
+            sidebar.set_size_request((from + (to - from) * eased).round() as i32, -1);
+            if t >= 1.0 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+        *self.width_tick.borrow_mut() = Some(id);
     }
 
     fn select_visual(&self, section: Section) {
