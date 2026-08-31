@@ -479,6 +479,41 @@ fn build(app: &adw::Application) -> Rc<App> {
 /// A stack takes the largest minimum of every page it holds, shown or not, so
 /// one wide page holds the whole window open. Walking the tree is the only way
 /// to find which.
+/// Report what is holding the window open, widest branch first.
+///
+/// Set `CHEAPAZSLA_DEBUG_SIZE=1` to print it a moment after the window opens.
+/// The layout has deadlocked at a too-large minimum more than once, always
+/// because of one widget nobody suspected, and guessing at which is slower
+/// than measuring. libadwaita's own "exceeds AdwApplicationWindow width"
+/// warning says that it happened; this says what did it.
+fn report_minimums(window: &adw::ApplicationWindow) {
+    fn walk(w: &gtk::Widget, depth: usize) {
+        let (min_w, _, _, _) = w.measure(gtk::Orientation::Horizontal, -1);
+        if min_w >= 120 {
+            let classes = w.css_classes().join(".");
+            eprintln!(
+                "{:indent$}{:<44} min {min_w} got {}",
+                "",
+                format!("{} .{classes}", w.type_().name()),
+                w.width(),
+                indent = depth * 2
+            );
+        }
+        if depth > 20 {
+            return;
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            walk(&c, depth + 1);
+            child = c.next_sibling();
+        }
+    }
+    let root = window.clone().upcast::<gtk::Widget>();
+    let (min, _, _, _) = root.measure(gtk::Orientation::Horizontal, -1);
+    eprintln!("window minimum width: {min}, currently {}", window.width());
+    walk(&root, 0);
+}
+
 /// Let the window narrow instead of refusing to (§25).
 ///
 /// A GtkWindow will not be resized below the minimum width its contents ask
@@ -629,6 +664,16 @@ fn wire_responsive(ui: &Rc<App>) {
             }
         }
         ui.window.add_breakpoint(bp);
+    }
+
+    if std::env::var_os("CHEAPAZSLA_DEBUG_SIZE").is_some() {
+        let window = ui.window.clone();
+        window.clone().connect_map(move |_| {
+            let w = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+                report_minimums(&w)
+            });
+        });
     }
 }
 

@@ -271,15 +271,10 @@ mod tests {
     #[test]
     fn one_worker_still_works() {
         let mut total = 0u32;
-        in_order(
-            50,
-            1,
-            Ok,
-            |_, v| {
-                total += v;
-                Ok(())
-            },
-        )
+        in_order(50, 1, Ok, |_, v| {
+            total += v;
+            Ok(())
+        })
         .expect("pipeline");
         assert_eq!(total, (0..50).sum::<u32>());
     }
