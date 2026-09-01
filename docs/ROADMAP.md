@@ -26,8 +26,6 @@ not a roadmap.
 
 Smaller pieces of the specification still outstanding:
 
-- **Architecture documentation** (§45). `ADDING_A_FORMAT.md` and
-  `TEST_PLAN.md` exist; a document describing the engine as a whole does not.
 - **3D layer view.** Not in the specification, but asked for. A stacked view of
   subsampled layers, since a full voxel model of a real print is billions of
   voxels.
@@ -38,6 +36,7 @@ Smaller pieces of the specification still outstanding:
 Done since this list was last written, and recorded here because a roadmap
 that quietly deletes its own entries is not much of a record:
 
+- **Architecture documentation** (§45). `docs/ARCHITECTURE.md`.
 - **Open the converted file** (§27). The toast opens the file, falling back to
   its folder when nothing on the system claims the format.
 - **File associations** (§33). MIME definitions are installed and

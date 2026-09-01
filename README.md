@@ -217,6 +217,7 @@ is written and skips until it exists:
 
     CHEAPAZSLA_REAL_CTB=/path/to/from-chitubox.ctb cargo test -p cheapazsla-core
 
+How it is put together is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 What is coming and in what order is in [docs/ROADMAP.md](docs/ROADMAP.md),
 including which of the thirty-odd resin formats are worth adding and which
 are not.
