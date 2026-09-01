@@ -860,6 +860,29 @@ fn wire_responsive(ui: &Rc<App>) {
     if std::env::var_os("CHEAPAZSLA_DEBUG_FOLD").is_some_and(|v| v == "1") {
         debug_fold(&ui.window);
     }
+    if let Some(path) = std::env::var_os("CHEAPAZSLA_DEBUG_SHOT") {
+        // Render the window to a file and quit, so a layout can be looked at
+        // rather than reasoned about.
+        let window = ui.window.clone();
+        window.clone().connect_map(move |_| {
+            let w = window.clone();
+            let path = path.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let Some(renderer) = w.native().and_then(|n| n.renderer()) else {
+                    return;
+                };
+                let paintable = gtk::WidgetPaintable::new(Some(&w));
+                let snapshot = gtk::Snapshot::new();
+                paintable.snapshot(&snapshot, w.width() as f64, w.height() as f64);
+                if let Some(node) = snapshot.to_node() {
+                    let _ = renderer
+                        .render_texture(&node, None)
+                        .save_to_png(path.to_string_lossy().as_ref());
+                }
+                w.close();
+            });
+        });
+    }
     if std::env::var_os("CHEAPAZSLA_DEBUG_SIZE").is_some() {
         let window = ui.window.clone();
         window.clone().connect_map(move |_| {
@@ -1020,37 +1043,62 @@ fn build_convert_page(
     let formats = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
     formats.set_homogeneous(false);
 
+    // Both headers are a row rather than a bare label, and both are held to
+    // the same height by a size group. The information button used to sit
+    // beside the dropdown instead, because putting it in the header made that
+    // header taller than the plain label opposite it and the two columns no
+    // longer lined up. A size group settles that properly: the button can go
+    // where it belongs, next to the thing it explains.
+    let headers = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
+
+    let in_header = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    in_header.append(&shell::section_label("Input"));
+    headers.add_widget(&in_header);
+
     let in_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     in_col.set_hexpand(true);
     in_col.set_valign(gtk::Align::Start);
-    in_col.append(&shell::section_label("Input"));
+    in_col.append(&in_header);
     in_col.append(input_field);
 
-    // An invisible label of the same style as the headers, so the button lines
-    // up with the controls rather than being nudged by a guessed pixel height.
+    // An empty header of its own, held to the same height as the other two by
+    // the size group, so the button below it starts level with the controls
+    // rather than at a guessed offset. It used to be a bare label, which
+    // matched only while both headers were bare labels too.
     let swap_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     swap_col.set_valign(gtk::Align::Start);
     swap_col.set_halign(gtk::Align::Center);
-    let swap_spacer = shell::section_label("");
-    swap_col.append(&swap_spacer);
+    let swap_header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    swap_header.append(&shell::section_label(""));
+    headers.add_widget(&swap_header);
+    swap_col.append(&swap_header);
     swap_btn.set_valign(gtk::Align::Center);
     swap_btn.set_size_request(34, 34);
     swap_col.append(swap_btn);
 
-    // The information button sits beside the control, not in the header.
-    // A button in a header makes that header taller than a plain label, and no
-    // amount of trimming its metrics makes the two columns agree.
+    // And the three controls share a height, so the row reads as one line
+    // rather than three things that happen to be near each other.
+    let controls_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
+    controls_height.add_widget(input_field);
+    controls_height.add_widget(&output_picker.button);
+    controls_height.add_widget(swap_btn);
+
+    let out_header = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    out_header.append(&shell::section_label("Output"));
+    output_info.set_valign(gtk::Align::Center);
+    output_info.set_halign(gtk::Align::Start);
+    out_header.append(output_info);
+    headers.add_widget(&out_header);
+
     let out_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     out_col.set_hexpand(true);
     out_col.set_valign(gtk::Align::Start);
-    out_col.append(&shell::section_label("Output"));
+    out_col.append(&out_header);
 
-    let out_control = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    // The dropdown now has the row to itself, so it is the same shape as the
+    // input control opposite it.
     output_picker.button.set_hexpand(true);
-    out_control.append(&output_picker.button);
-    output_info.set_valign(gtk::Align::Center);
-    out_control.append(output_info);
-    out_col.append(&out_control);
+    out_col.append(&output_picker.button);
 
     // hexpand alone divides the leftover space, which is not the same as
     // making the two columns equal when their contents differ in width.
@@ -1691,16 +1739,28 @@ fn build_input_menu(ui: &Rc<App>) {
     let popover = gtk::Popover::builder().child(&list).build();
     popover.add_css_class("menu");
 
-    let current = ui
-        .files
-        .borrow()
-        .get(*ui.selected.borrow())
-        .and_then(|f| f.forced_format.clone());
+    let (current, reading_as) = {
+        let files = ui.files.borrow();
+        let f = files.get(*ui.selected.borrow());
+        (
+            f.and_then(|f| f.forced_format.clone()),
+            f.map(|f| f.format.clone()).unwrap_or_default(),
+        )
+    };
 
+    // Say what automatic detection settled on, not just that it is on. The
+    // field beside this reads "GOO" while the tick sits on "Detect
+    // automatically", and without this the two look like they disagree.
+    let detected = registry::by_id(&reading_as)
+        .map(|h| h.info().name)
+        .filter(|_| current.is_none());
     let mut entries: Vec<(Option<String>, String, String)> = vec![(
         None,
         "Detect automatically".into(),
-        "Read the contents and work it out".into(),
+        match detected {
+            Some(name) => format!("Reading it as {name}"),
+            None => "Read the contents and work it out".into(),
+        },
     )];
     for info in registry::readable() {
         entries.push((

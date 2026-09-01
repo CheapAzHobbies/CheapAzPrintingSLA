@@ -292,9 +292,15 @@ Two environment variables help with the last two, because neither can be
 judged from a still and both have been wrong in ways that looked right when
 triggered any other way:
 
-    CHEAPAZSLA_DEBUG_SIZE=1   what is holding the window's minimum width open
-    CHEAPAZSLA_DEBUG_FOLD=1   the sidebar's drawn width, step by step, while
-                              the window is walked in and back out
+    CHEAPAZSLA_DEBUG_SIZE=1        what is holding the window's minimum width open
+    CHEAPAZSLA_DEBUG_FOLD=1        the sidebar's drawn width, step by step, while
+                                   the window is walked in and back out
+    CHEAPAZSLA_DEBUG_SHOT=out.png  render the window to a file and quit
+
+The last is for alignment. Whether two controls line up is not something to
+settle by eye or by reading the code: render it, then measure the columns in
+the image. A row that looked right that way turned out to have its two fields
+36 and 34 pixels tall with the button between them eleven pixels high.
 
 For the fold, the numbers should descend and climb evenly. A repeated value is
 a stall, a large gap is a jump, and the two directions should read as reverses
