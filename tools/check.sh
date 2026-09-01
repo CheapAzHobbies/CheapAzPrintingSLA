@@ -29,8 +29,11 @@ step() {
 # 2024, which older Cargo cannot parse, without anything here changing.
 msrv="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
 if rustup toolchain list 2>/dev/null | grep -q "^${msrv}"; then
-    step "Build engine (${msrv})" cargo "+${msrv}" build -p cheapazsla-core
-    step "Test engine (${msrv})"  cargo "+${msrv}" test -p cheapazsla-core
+    step "Build engine (${msrv})"  cargo "+${msrv}" build -p cheapazsla-core
+    step "Test engine (${msrv})"   cargo "+${msrv}" test -p cheapazsla-core
+    # Clippy's lints differ between releases in both directions: the older one
+    # here has caught things the newer one no longer mentions.
+    step "Clippy engine (${msrv})" cargo "+${msrv}" clippy -p cheapazsla-core -- -D warnings
 else
     printf '\n=== Oldest supported Rust (%s)\n    skipped: rustup toolchain install %s\n' "$msrv" "$msrv"
 fi

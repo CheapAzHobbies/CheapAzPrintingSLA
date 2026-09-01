@@ -114,24 +114,24 @@ impl History {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let body: String = self
-            .entries
-            .iter()
-            .take(MAX_ENTRIES)
-            .map(|e| {
-                format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                    e.when,
-                    e.outcome.as_str(),
-                    e.from_format,
-                    e.to_format,
-                    e.layers,
-                    escape(&e.source.to_string_lossy()),
-                    escape(&e.destination.to_string_lossy()),
-                    escape(&e.detail),
-                )
-            })
-            .collect();
+        // Written into one buffer rather than collected from formatted
+        // pieces, which allocates a string per entry and throws each away.
+        let mut body = String::new();
+        for e in self.entries.iter().take(MAX_ENTRIES) {
+            use std::fmt::Write;
+            let _ = writeln!(
+                body,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                e.when,
+                e.outcome.as_str(),
+                e.from_format,
+                e.to_format,
+                e.layers,
+                escape(&e.source.to_string_lossy()),
+                escape(&e.destination.to_string_lossy()),
+                escape(&e.detail),
+            );
+        }
         std::fs::write(path, body)
     }
 

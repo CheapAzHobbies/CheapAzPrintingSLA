@@ -104,7 +104,7 @@ where
     let produce = &produce;
     let (state, cv, stopped) = (&state, &cv, &stopped);
 
-    let outcome = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(move || loop {
                 let index = {
@@ -171,9 +171,7 @@ where
             }
         }
         Ok(())
-    });
-
-    outcome
+    })
 }
 
 #[cfg(test)]
