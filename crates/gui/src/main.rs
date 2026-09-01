@@ -479,6 +479,79 @@ fn build(app: &adw::Application) -> Rc<App> {
 /// A stack takes the largest minimum of every page it holds, shown or not, so
 /// one wide page holds the whole window open. Walking the tree is the only way
 /// to find which.
+/// Walk the window in and back out, reporting the sidebar each step.
+///
+/// Set `CHEAPAZSLA_DEBUG_FOLD=1`. Whether the rail folds smoothly cannot be
+/// seen from a still, and it behaves differently when a resize drives it than
+/// when it is toggled on its own — three separate bugs only appeared under a
+/// real resize, so this drives one. Numbers should descend and climb evenly;
+/// a repeated value is a stall and a large gap is a jump.
+fn debug_fold(window: &adw::ApplicationWindow) {
+    let window = window.clone();
+    window.clone().connect_map(move |_| {
+        let w = window.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+            // Unmaximising only takes effect on a later frame, so the walk has
+            // to wait for it.
+            w.unmaximize();
+            let w = w.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                for step in 0..60u64 {
+                    let w = w.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400 + 30 * step),
+                        move || {
+                            let width = if step < 30 {
+                                830 - (step as i32 * 6)
+                            } else {
+                                650 + ((step as i32 - 30) * 6)
+                            };
+                            w.set_default_size(width, 700);
+                            let (rail, brand, label) = fold_parts(&w);
+                            eprintln!("fold {width} rail {rail} wordmark {brand} label {label}");
+                        },
+                    );
+                }
+            });
+        });
+    });
+}
+
+/// The rail's drawn width, the wordmark's drawn height and the first
+/// navigation label's drawn width.
+fn fold_parts(window: &adw::ApplicationWindow) -> (i32, i32, i32) {
+    fn find(w: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+        if w.has_css_class(class) {
+            return Some(w.clone());
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            if let Some(f) = find(&c, class) {
+                return Some(f);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+    let Some(rail) = find(&window.clone().upcast(), "cz-sidebar") else {
+        return (-1, -1, -1);
+    };
+    // ScrolledWindow -> Viewport -> the box holding the rail's contents.
+    let content = rail
+        .first_child()
+        .and_then(|vp| vp.first_child())
+        .unwrap_or_else(|| rail.clone());
+    let brand = content.first_child().map(|b| b.height()).unwrap_or(-1);
+    let label = content
+        .first_child()
+        .and_then(|b| b.next_sibling())
+        .and_then(|btn| btn.first_child())
+        .and_then(|row| row.last_child())
+        .map(|r| r.width())
+        .unwrap_or(-1);
+    (rail.width(), brand, label)
+}
+
 /// Report what is holding the window open, widest branch first.
 ///
 /// Set `CHEAPAZSLA_DEBUG_SIZE=1` to print it a moment after the window opens.
@@ -666,6 +739,9 @@ fn wire_responsive(ui: &Rc<App>) {
         ui.window.add_breakpoint(bp);
     }
 
+    if std::env::var_os("CHEAPAZSLA_DEBUG_FOLD").is_some() {
+        debug_fold(&ui.window);
+    }
     if std::env::var_os("CHEAPAZSLA_DEBUG_SIZE").is_some() {
         let window = ui.window.clone();
         window.clone().connect_map(move |_| {

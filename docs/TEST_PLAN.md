@@ -240,6 +240,22 @@ Run through this before a release. Tick each line.
 - [ ] Narrowing drops the information panel beside the preview
 - [ ] Narrowing further leaves the sidebar as icons, still navigable
 - [ ] Nothing overlaps at the smallest size the window will take
+- [ ] The sidebar folds and unfolds smoothly while the window is dragged, not
+      only when it is resized in one jump, and the two directions look alike
+
+Two environment variables help with the last two, because neither can be
+judged from a still and both have been wrong in ways that looked right when
+triggered any other way:
+
+    CHEAPAZSLA_DEBUG_SIZE=1   what is holding the window's minimum width open
+    CHEAPAZSLA_DEBUG_FOLD=1   the sidebar's drawn width, step by step, while
+                              the window is walked in and back out
+
+For the fold, the numbers should descend and climb evenly. A repeated value is
+a stall, a large gap is a jump, and the two directions should read as reverses
+of each other. libadwaita also warns on stderr when the content is wider than
+the window it was given, which is the fastest signal that a minimum has
+regressed.
 
 ### Appearance
 

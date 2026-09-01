@@ -11,10 +11,9 @@ use std::rc::Rc;
 
 /// Long enough to read as the rail folding up, short enough not to be a wait.
 const COLLAPSE_MS: u32 = 340;
-/// Labels and rail move together, so the fold reads as one movement.
-const LABELS_OUT_MS: u32 = COLLAPSE_MS;
-const LABELS_IN_MS: u32 = COLLAPSE_MS;
-const LABELS_IN_DELAY_MS: u64 = 40;
+/// Labels and rail share one duration and start together, so unfolding is
+/// folding run backwards rather than its own arrangement. They used to differ,
+/// which is what made the two directions look unlike each other.
 /// How often to check whether the rail is ready to animate, and how long to
 /// keep checking before setting the labels without a slide.
 const POLL_MS: u64 = 10;
@@ -303,19 +302,10 @@ impl Shell {
     /// never comes, since a label in the wrong state is worse than one that
     /// arrived without sliding.
     ///
-    /// Revealing also waits out a short delay on top: a revealer allocates its
-    /// child at full size for a frame or two before its transition takes over,
-    /// and from a folded rail that flash is most of the way open. By the time
-    /// it fires the rail is wider than the flash, so there is nothing to see.
     fn slide_labels(&self, revealed: bool) {
         let reveals: Vec<gtk::Revealer> = self.reveals.borrow().clone();
         let want = self.want_labels.clone();
         let sidebar = self.sidebar.clone();
-        let (delay, duration) = if revealed {
-            (LABELS_IN_DELAY_MS, LABELS_IN_MS)
-        } else {
-            (0, LABELS_OUT_MS)
-        };
         let mut waited = 0u64;
         glib::timeout_add_local(std::time::Duration::from_millis(POLL_MS), move || {
             waited += POLL_MS;
@@ -323,11 +313,11 @@ impl Shell {
             if want.get() != revealed {
                 return glib::ControlFlow::Break;
             }
-            if waited < delay || (!sidebar.is_mapped() && waited < GIVE_UP_MS) {
+            if !sidebar.is_mapped() && waited < GIVE_UP_MS {
                 return glib::ControlFlow::Continue;
             }
             for reveal in &reveals {
-                reveal.set_transition_duration(duration);
+                reveal.set_transition_duration(COLLAPSE_MS);
                 reveal.set_reveal_child(revealed);
             }
             glib::ControlFlow::Break
