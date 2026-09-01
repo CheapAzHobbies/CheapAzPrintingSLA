@@ -47,10 +47,28 @@ impl Plan {
 ///
 /// Does not write anything. Call [`run`] to carry the plan out.
 pub fn plan(source: &Path, to_format: &str, destination: &Path) -> Result<Plan> {
-    let id = registry::identify(source)?;
-    let from = registry::by_id(id.detection.format_id).ok_or(Error::UnknownFormat)?;
+    plan_as(source, None, to_format, destination)
+}
+
+/// Plan a conversion, optionally saying what the source is rather than letting
+/// detection decide (§21).
+///
+/// `from_format` of `None` means detect, which is what almost everyone wants.
+pub fn plan_as(
+    source: &Path,
+    from_format: Option<&str>,
+    to_format: &str,
+    destination: &Path,
+) -> Result<Plan> {
+    let from = match from_format {
+        Some(id) => registry::by_id(id).ok_or(Error::UnknownFormat)?,
+        None => {
+            let id = registry::identify(source)?;
+            registry::by_id(id.detection.format_id).ok_or(Error::UnknownFormat)?
+        }
+    };
     let to = registry::by_id(to_format).ok_or_else(|| Error::UnsupportedConversion {
-        from: id.detection.format_id.to_string(),
+        from: from.info().id.to_string(),
         to: to_format.to_string(),
     })?;
 

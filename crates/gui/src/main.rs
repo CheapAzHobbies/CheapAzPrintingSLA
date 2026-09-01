@@ -103,6 +103,8 @@ struct Queued {
     status: Status,
     /// What the user can try, when something went wrong.
     suggestions: Vec<Suggestion>,
+    /// Set when the user has said what this file is, overriding detection.
+    forced_format: Option<String>,
 }
 
 impl Queued {
@@ -127,6 +129,8 @@ struct App {
     queue_list: gtk::ListBox,
     controls: gtk::Box,
     input_label: gtk::Label,
+    /// Opens the list of formats the input can be read as.
+    input_button: gtk::MenuButton,
     output_picker: Rc<format_picker::FormatPicker>,
     swap_btn: gtk::Button,
     dest_button: gtk::MenuButton,
@@ -267,20 +271,34 @@ fn build(app: &adw::Application) -> Rc<App> {
     queue_panel.append(&add_more);
     queue_panel.set_visible(false);
 
+    // Detected, but overridable (§21). Detection reads the contents rather
+    // than the name, which is right almost always and wrong occasionally: a
+    // format can be a container another format also uses, and a file can be
+    // truncated before the part that identifies it. When someone knows better
+    // than the detector they need a way to say so, and the place they will
+    // look is the box that told them what it thinks the file is.
     let input_label = gtk::Label::builder()
         .label("—")
         .xalign(0.0)
         .hexpand(true)
         .build();
     input_label.add_css_class("cz-value");
-    // Detected rather than chosen, so it must not look clickable, but bare
-    // text beside a boxed dropdown reads as unfinished.
+    let input_inner = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    input_inner.append(&input_label);
+    input_inner.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    let input_button = gtk::MenuButton::builder()
+        .child(&input_inner)
+        .hexpand(true)
+        .build();
+    input_button.add_css_class("flat");
+    input_button.set_tooltip_text(Some(
+        "Detected from the file's contents. Click to read it as something else",
+    ));
     let input_field = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
     input_field.add_css_class("cz-field");
     input_field.add_css_class("cz-format-control");
     input_field.set_valign(gtk::Align::Center);
-    input_field.append(&input_label);
-    input_field.set_tooltip_text(Some("Detected from the file's contents"));
+    input_field.append(&input_button);
     let output_picker = format_picker::FormatPicker::new(format_picker::Direction::Write);
     let swap_btn = shell::icon_button("media-playlist-repeat-symbolic", "Swap formats");
     let output_info = format_picker::info_button({
@@ -419,6 +437,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         queue_list,
         controls,
         input_label,
+        input_button: input_button.clone(),
         output_picker: output_picker.clone(),
         swap_btn: swap_btn.clone(),
         dest_button: dest_button.clone(),
@@ -1583,9 +1602,10 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
             opened: None,
             status: Status::Reading,
             suggestions: Vec::new(),
+            forced_format: None,
         });
         added += 1;
-        read_in_background(ui, path);
+        read_in_background(ui, path, None);
     }
     if added > 0 {
         refresh_queue(ui);
@@ -1599,12 +1619,12 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
     }
 }
 
-fn read_in_background(ui: &Rc<App>, path: PathBuf) {
+fn read_in_background(ui: &Rc<App>, path: PathBuf, forced: Option<String>) {
     ui.penguin.start();
     let (tx, rx) = async_channel::bounded(1);
     let p = path.clone();
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(read_file(&p));
+        let _ = tx.send_blocking(read_file(&p, forced.as_deref()));
     });
 
     let ui = ui.clone();
@@ -1659,20 +1679,130 @@ struct ReadFile {
 /// A message for the user, and what they can try (§28).
 type ReadFailure = (String, Vec<Suggestion>);
 
-fn read_file(path: &Path) -> Result<ReadFile, ReadFailure> {
+/// The list of formats the selected file can be read as (§21).
+///
+/// "Detect automatically" first, then every format that can read, so the
+/// normal case is the default and the override is a deliberate act.
+fn build_input_menu(ui: &Rc<App>) {
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("cz-menu");
+
+    let popover = gtk::Popover::builder().child(&list).build();
+    popover.add_css_class("menu");
+
+    let current = ui
+        .files
+        .borrow()
+        .get(*ui.selected.borrow())
+        .and_then(|f| f.forced_format.clone());
+
+    let mut entries: Vec<(Option<String>, String, String)> = vec![(
+        None,
+        "Detect automatically".into(),
+        "Read the contents and work it out".into(),
+    )];
+    for info in registry::readable() {
+        entries.push((
+            Some(info.id.to_string()),
+            info.name.to_string(),
+            format!("Read the file as {}", info.name),
+        ));
+    }
+
+    for (id, title, subtitle) in entries {
+        let row = gtk::ListBoxRow::new();
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+        line.set_margin_top(theme::SPACE_2);
+        line.set_margin_bottom(theme::SPACE_2);
+        line.set_margin_start(theme::SPACE_3);
+        line.set_margin_end(theme::SPACE_3);
+
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let t = gtk::Label::builder().label(&title).xalign(0.0).build();
+        let s = gtk::Label::builder().label(&subtitle).xalign(0.0).build();
+        s.add_css_class("caption");
+        s.add_css_class("cz-dim");
+        text.append(&t);
+        text.append(&s);
+        text.set_hexpand(true);
+        line.append(&text);
+        if id == current {
+            line.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+        }
+        row.set_child(Some(&line));
+        list.append(&row);
+    }
+
+    // Clicks land on the list, not the row: connect_activate on a row is a
+    // keyboard signal, which is why an earlier menu here did nothing at all.
+    let ui2 = ui.clone();
+    let popover2 = popover.clone();
+    list.connect_row_activated(move |_, row| {
+        popover2.popdown();
+        let index = row.index();
+        let chosen = if index <= 0 {
+            None
+        } else {
+            registry::readable()
+                .get(index as usize - 1)
+                .map(|i| i.id.to_string())
+        };
+        force_input_format(&ui2, chosen);
+    });
+
+    ui.input_button.set_popover(Some(&popover));
+}
+
+/// Re-read the selected file as a named format, or by detection again.
+fn force_input_format(ui: &Rc<App>, format: Option<String>) {
+    let (path, already) = {
+        let files = ui.files.borrow();
+        let Some(f) = files.get(*ui.selected.borrow()) else {
+            return;
+        };
+        (f.path.clone(), f.forced_format.clone())
+    };
+    if already == format {
+        return;
+    }
+    {
+        let mut files = ui.files.borrow_mut();
+        if let Some(f) = files.get_mut(*ui.selected.borrow()) {
+            f.forced_format = format.clone();
+            f.status = Status::Reading;
+            f.opened = None;
+            f.suggestions.clear();
+        }
+    }
+    refresh_queue(ui);
+    let index = *ui.selected.borrow();
+    select_file(ui, index);
+    read_in_background(ui, path, format);
+}
+
+fn read_file(path: &Path, forced: Option<&str>) -> Result<ReadFile, ReadFailure> {
     let facts = remedy::FileFacts::observe(path);
     let explain = |e: cheapazsla_core::Error| -> ReadFailure {
         (e.to_string(), remedy::for_error(&e, &facts))
     };
 
+    // Detection still runs even when the format is being forced, so the file
+    // can still be described and an extension mismatch still reported. Only
+    // the choice of handler changes.
     let id = registry::identify(path).map_err(explain)?;
-    let handler = registry::by_id(id.detection.format_id)
-        .ok_or_else(|| explain(cheapazsla_core::Error::UnknownFormat))?;
+    let chosen = forced.unwrap_or(id.detection.format_id);
+    let handler =
+        registry::by_id(chosen).ok_or_else(|| explain(cheapazsla_core::Error::UnknownFormat))?;
     let warnings = handler.validate(path).unwrap_or_default();
     let opened = handler.open(path).map_err(explain)?;
     Ok(ReadFile {
-        format: id.detection.format_id.to_string(),
-        detection: id.detection.reason,
+        format: chosen.to_string(),
+        detection: if forced.is_some() {
+            format!("read as {} because you said so", handler.info().name)
+        } else {
+            id.detection.reason
+        },
         extension_mismatch: id.extension_mismatch,
         warnings,
         opened: Arc::new(opened),
@@ -1945,6 +2075,9 @@ fn select_file(ui: &Rc<App>, index: usize) {
         )
     };
     ui.input_label.set_text(&input);
+    // Rebuilt per selection so the tick sits beside whatever this file is
+    // being read as.
+    build_input_menu(ui);
 
     if ready && count > 0 {
         build_overview(ui, count);

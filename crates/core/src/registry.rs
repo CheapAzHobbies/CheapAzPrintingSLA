@@ -114,3 +114,21 @@ pub fn open(path: &Path) -> Result<OpenedFile> {
     let handler = by_id(id.detection.format_id).ok_or(Error::UnknownFormat)?;
     handler.open(path)
 }
+
+/// Open a file as a named format, whatever detection thinks of it (§21).
+///
+/// Detection reads the contents rather than the name, which is right almost
+/// always and wrong occasionally: a format can be a container another format
+/// also uses, a file can be truncated before the part that identifies it, and
+/// two formats can share a marker. When someone knows better than the
+/// detector, they need a way to say so.
+pub fn open_as(path: &Path, format_id: &str) -> Result<OpenedFile> {
+    let handler = by_id(format_id).ok_or(Error::UnknownFormat)?;
+    if !handler.info().capabilities.reads {
+        return Err(Error::UnsupportedConversion {
+            from: handler.info().name.into(),
+            to: "anything".into(),
+        });
+    }
+    handler.open(path)
+}

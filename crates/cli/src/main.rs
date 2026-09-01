@@ -21,6 +21,8 @@ USAGE
 
 OPTIONS
     -f, --format <id>       Output format, e.g. goo
+        --input-format <id> Treat the input as this format instead of
+                            detecting it, for when detection gets it wrong
     -o, --output <path>     Output file. Only valid with a single input
     -d, --output-dir <dir>  Directory to write into
         --overwrite         Replace an existing file instead of stopping
@@ -45,6 +47,8 @@ EXAMPLES
 struct Args {
     inputs: Vec<PathBuf>,
     format: Option<String>,
+    /// Treat the input as this format rather than detecting it (§21).
+    input_format: Option<String>,
     output: Option<PathBuf>,
     output_dir: Option<PathBuf>,
     overwrite: bool,
@@ -85,7 +89,7 @@ fn main() -> ExitCode {
     let mut failures = 0usize;
     for input in &args.inputs {
         let outcome = if args.info {
-            show_info(input)
+            show_info(input, args.input_format.as_deref())
         } else if args.validate {
             validate(input)
         } else {
@@ -130,6 +134,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
             "-f" | "--format" => {
                 a.format = Some(it.next().ok_or("--format needs a value")?);
             }
+            "--input-format" => {
+                a.input_format = Some(it.next().ok_or("--input-format needs a value")?);
+            }
             "-o" | "--output" => {
                 a.output = Some(PathBuf::from(it.next().ok_or("--output needs a path")?));
             }
@@ -163,9 +170,13 @@ fn list_formats() {
     }
 }
 
-fn show_info(path: &Path) -> Result<(), String> {
+fn show_info(path: &Path, input_format: Option<&str>) -> Result<(), String> {
     let id = registry::identify(path).map_err(|e| explain(path, &e))?;
-    let opened = registry::open(path).map_err(|e| explain(path, &e))?;
+    let opened = match input_format {
+        Some(id) => registry::open_as(path, id),
+        None => registry::open(path),
+    }
+    .map_err(|e| explain(path, &e))?;
     let p = &opened.print;
 
     println!("{}", path.display());
@@ -253,7 +264,8 @@ fn convert_one(input: &Path, args: &Args) -> Result<(), String> {
             .ok_or("could not work out an output path")?,
     };
 
-    let plan = convert::plan(input, &format, &destination).map_err(|e| explain(input, &e))?;
+    let plan = convert::plan_as(input, args.input_format.as_deref(), &format, &destination)
+        .map_err(|e| explain(input, &e))?;
 
     if !args.quiet {
         for w in &plan.source_warnings {
