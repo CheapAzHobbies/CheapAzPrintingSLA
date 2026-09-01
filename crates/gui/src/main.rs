@@ -804,8 +804,14 @@ fn wire_responsive(ui: &Rc<App>) {
         );
         for state in [true, false] {
             let (hit, apply, pending) = (hit.clone(), apply.clone(), pending.clone());
+            let ui_for_aim = ui.clone();
             let handler = move |_: &adw::Breakpoint| {
                 hit[index].set(state);
+                let level = hit.iter().rposition(|h| h.get()).map_or(0, |i| i as u8 + 1);
+                // Aim the rail now and do the rest on the idle: a fast drag is
+                // several frames past the step by the time an idle runs, and
+                // those are the frames the fold should have started in.
+                ui_for_aim.shell.aim(level >= 2);
                 if pending.replace(true) {
                     return;
                 }

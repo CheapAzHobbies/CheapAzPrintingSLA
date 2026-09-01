@@ -18,6 +18,10 @@ const RAIL_TAU: f64 = 0.11;
 /// The least the rail will move per second, so the last few pixels arrive
 /// rather than creeping.
 const RAIL_MIN_SPEED: f64 = 110.0;
+/// The most of the rail's total travel any one frame may cover. At a healthy
+/// frame rate the steps are smaller than this and it never applies; it is here
+/// for the frames that arrive late.
+const RAIL_MAX_STEP: f64 = 0.16;
 /// Labels and rail share one duration and start together, so unfolding is
 /// folding run backwards rather than its own arrangement. They used to differ,
 /// which is what made the two directions look unlike each other.
@@ -99,9 +103,12 @@ pub struct Shell {
     /// One per navigation label, plus the wordmark, so the rail folds up
     /// rather than snapping between two layouts.
     reveals: RefCell<Vec<gtk::Revealer>>,
-    /// Runs while the rail is still moving. Held so the tick is not started
-    /// twice, and so it can retire itself when it arrives.
-    width_tick: Rc<RefCell<Option<gtk::TickCallbackId>>>,
+    /// Whether the rail is still moving, so its tick is not started twice.
+    /// A flag rather than the callback's id: the id could only be stored after
+    /// the callback was registered, leaving a window in which a tick that had
+    /// already finished would be recorded as still running — after which
+    /// nothing would ever start it again and the rail would only ever jump.
+    rail_moving: Rc<Cell<bool>>,
     /// Where the rail is heading, and where it has got to. Kept as a float so
     /// small per-frame steps are not lost to rounding.
     rail_target: Rc<Cell<f64>>,
@@ -211,7 +218,7 @@ impl Shell {
             on_change: RefCell::new(None),
             sidebar: sidebar.clone(),
             reveals: RefCell::new(vec![brand_reveal]),
-            width_tick: Rc::new(RefCell::new(None)),
+            rail_moving: Rc::new(Cell::new(false)),
             rail_target: Rc::new(Cell::new(theme::SIDEBAR_WIDTH as f64)),
             rail_width: Rc::new(Cell::new(theme::SIDEBAR_WIDTH as f64)),
             want_labels: Rc::new(Cell::new(true)),
@@ -327,11 +334,7 @@ impl Shell {
         self.want_labels.set(!compact);
         self.slide_labels(!compact);
 
-        self.set_rail_target(if compact {
-            RAIL_WIDTH as f64
-        } else {
-            theme::SIDEBAR_WIDTH as f64
-        });
+        self.aim(compact);
     }
 
     /// Slide the labels in or out, once the rail is in a state to show it.
@@ -368,6 +371,23 @@ impl Shell {
         });
     }
 
+    /// Point the rail at its folded or open width, without touching anything
+    /// else.
+    ///
+    /// The rest of the work a step involves is deferred to an idle, because
+    /// changing size requests while a breakpoint is being evaluated makes the
+    /// breakpoints oscillate. This part changes no widget — it sets a number
+    /// the next frame will read — so it is safe to do immediately, and doing
+    /// it immediately is what stops a fast drag getting several frames ahead
+    /// of the fold.
+    pub fn aim(&self, compact: bool) {
+        self.set_rail_target(if compact {
+            RAIL_WIDTH as f64
+        } else {
+            theme::SIDEBAR_WIDTH as f64
+        });
+    }
+
     /// Move the rail toward a width, and keep moving toward whatever the
     /// width becomes.
     ///
@@ -384,21 +404,22 @@ impl Shell {
     /// the other way.
     fn set_rail_target(&self, to: f64) {
         self.rail_target.set(to);
-        if self.width_tick.borrow().is_some() {
+        if self.rail_moving.replace(true) {
             return;
         }
         let Some(root) = self.sidebar.root() else {
+            self.rail_moving.set(false);
+            self.rail_width.set(to);
             self.sidebar.set_size_request(to as i32, -1);
             return;
         };
         let root: gtk::Widget = root.upcast();
         let sidebar = self.sidebar.clone();
-        let stack = self.stack.clone();
         let target = self.rail_target.clone();
         let width = self.rail_width.clone();
-        let tick = self.width_tick.clone();
+        let moving = self.rail_moving.clone();
         let last = Cell::new(None::<i64>);
-        let id = root.add_tick_callback(move |root, clock| {
+        root.add_tick_callback(move |_, clock| {
             let now = clock.frame_time();
             // A long gap means the clock was not running, not that a long
             // step is owed; clamp it so returning to the window does not
@@ -410,42 +431,52 @@ impl Shell {
 
             let want = target.get();
             let mut next = width.get();
-            // Exponential approach: the distance left shrinks by the same
-            // proportion every second, whichever way it is going. Plus a floor
-            // on the speed, because on its own an exponential never quite
-            // arrives — the last dozen pixels crawled, and the rail sat a
-            // little short of folded for as long again as the fold had taken.
+            let travel = (theme::SIDEBAR_WIDTH - RAIL_WIDTH) as f64;
             let remaining = want - next;
-            let step = remaining * (1.0 - (-dt / RAIL_TAU).exp());
-            let floor = RAIL_MIN_SPEED * dt;
-            next += if step.abs() < floor && remaining.abs() > floor {
-                floor * remaining.signum()
-            } else {
-                step
-            };
-            if (want - next).abs() < 0.5 || (want - next) * remaining < 0.0 {
+
+            // Exponential approach: the distance left shrinks by the same
+            // proportion every second, whichever way it is going.
+            let mut step = remaining * (1.0 - (-dt / RAIL_TAU).exp());
+
+            // A floor, because an exponential never quite arrives on its own:
+            // the last dozen pixels crawled, and the rail sat a little short
+            // of folded for as long again as the fold had taken.
+            let floor = (RAIL_MIN_SPEED * dt).min(travel * RAIL_MAX_STEP);
+            if step.abs() < floor {
+                step = floor * remaining.signum();
+            }
+
+            // And a ceiling, which is what keeps this from being a jump when
+            // the frame clock is starved. The step is worked out from elapsed
+            // time, so one late frame during a heavy drag would otherwise move
+            // the rail most of the way in a single visible increment. Capped,
+            // a stretch of slow frames makes the fold take longer rather than
+            // making it teleport.
+            let ceiling = travel * RAIL_MAX_STEP;
+            step = step.clamp(-ceiling, ceiling);
+
+            if step.abs() >= remaining.abs() || remaining.abs() < 0.5 {
                 next = want;
+            } else {
+                next += step;
             }
             width.set(next);
 
-            // Never wider than what is left once the workspace has what it
-            // needs. Dragging quickly, the window can cross the step and keep
-            // going while the rail is still near its old width, and it would
-            // sit too wide for the window to hold — everything squeezed, then
-            // a jump when it caught up.
-            let (workspace, _, _, _) = stack.measure(gtk::Orientation::Horizontal, -1);
-            let room = (root.width() - workspace).max(RAIL_WIDTH);
-            let drawn = next.min(room as f64).max(RAIL_WIDTH as f64);
-            sidebar.set_size_request(drawn.round() as i32, -1);
+            // Deliberately not clamped to what the window has room for. That
+            // was here to stop a fast drag outrunning the fold, and it did,
+            // by dragging the rail straight to its folded width the moment
+            // the window got small — a teleport rather than a fold. The fold
+            // takes the time it takes whatever the window does; being briefly
+            // wider than the window is worth far less than the animation is.
+            sidebar.set_size_request(next.round() as i32, -1);
 
             if next == want {
-                *tick.borrow_mut() = None;
+                moving.set(false);
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
             }
         });
-        *self.width_tick.borrow_mut() = Some(id);
     }
 
     fn select_visual(&self, section: Section) {
