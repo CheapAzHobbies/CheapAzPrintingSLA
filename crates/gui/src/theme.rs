@@ -28,7 +28,7 @@ pub const SPACE_6: i32 = 32;
 
 /// Sidebar width: wide enough for the longest label at larger text sizes,
 /// narrow enough to leave the workspace dominant.
-pub const SIDEBAR_WIDTH: i32 = 208;
+pub const SIDEBAR_WIDTH: i32 = 152;
 
 struct Palette {
     bg: &'static str,
@@ -84,8 +84,8 @@ fn sheet(p: &Palette) -> String {
 .cz-workspace {{ background-color: @cz_bg; }}
 
 .cz-nav-item {{
-  padding: 9px 12px;
-  margin: 2px 8px;
+  padding: 9px 8px;
+  margin: 2px 5px;
   border-radius: 6px;
   color: @cz_dim;
   transition: background-color 140ms ease, color 140ms ease;

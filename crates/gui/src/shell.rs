@@ -10,17 +10,21 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Long enough to read as the rail folding up, short enough not to be a wait.
-const COLLAPSE_MS: u32 = 220;
-/// Labels clear out ahead of the narrowing rail, and arrive behind it.
-const LABELS_OUT_MS: u32 = 130;
-const LABELS_IN_MS: u32 = 200;
-const LABELS_IN_DELAY_MS: u64 = 90;
+const COLLAPSE_MS: u32 = 340;
+/// Labels and rail move together, so the fold reads as one movement.
+const LABELS_OUT_MS: u32 = COLLAPSE_MS;
+const LABELS_IN_MS: u32 = COLLAPSE_MS;
+const LABELS_IN_DELAY_MS: u64 = 40;
 /// How often to check whether the rail is ready to animate, and how long to
 /// keep checking before setting the labels without a slide.
 const POLL_MS: u64 = 10;
 const GIVE_UP_MS: u64 = 400;
 /// The width of the icon rail once the labels have gone.
-const RAIL_WIDTH: i32 = 56;
+///
+/// Chosen so the icon is centred in it rather than by eye: the row puts the
+/// icon 24px in, past the nav item's margin and padding and the selection
+/// marker, so 24 + 16 + 24 leaves the same gap on both sides.
+const RAIL_WIDTH: i32 = 64;
 
 /// A section of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +89,7 @@ pub struct Shell {
     items: RefCell<Vec<NavItem>>,
     current: RefCell<Section>,
     on_change: RefCell<Option<SectionHandler>>,
-    sidebar: gtk::Box,
+    sidebar: gtk::ScrolledWindow,
     /// One per navigation label, plus the wordmark, so the rail folds up
     /// rather than snapping between two layouts.
     reveals: RefCell<Vec<gtk::Revealer>>,
@@ -108,7 +112,31 @@ impl Shell {
             .build();
         stack.add_css_class("cz-workspace");
 
-        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        // The rail is a clip, not a box that resizes.
+        //
+        // A GtkBox hands spare space to each child up to that child's natural
+        // width, and a revealer reports its child's full natural width from
+        // the instant it is told to reveal — before its transition has moved
+        // at all. So the rail jumped by the width of a label the moment the
+        // labels were told to appear, and no amount of ordering fixed it:
+        // delaying the labels only moved the jump later, which is the stagger
+        // it was trying to avoid.
+        //
+        // The contents are instead laid out at full width always, inside
+        // something whose own width says nothing about them. A scrolled window
+        // asked not to propagate its child's natural width is exactly that: it
+        // reports what it is told and clips the rest, so the width animation
+        // is the only thing deciding how wide the rail is.
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.set_size_request(theme::SIDEBAR_WIDTH, -1);
+        let sidebar = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_width(false)
+            .child(&content)
+            .build();
+        // On the clip rather than the contents, so the rail's right-hand
+        // border stays at the rail's edge instead of being clipped away.
         sidebar.add_css_class("cz-sidebar");
         sidebar.set_size_request(theme::SIDEBAR_WIDTH, -1);
 
@@ -117,15 +145,8 @@ impl Shell {
         brand.set_margin_bottom(theme::SPACE_4);
         brand.set_margin_start(theme::SPACE_4);
         brand.set_margin_end(theme::SPACE_4);
-        // Ellipsized so the wordmark cannot hold the rail open: a revealer
-        // that slides vertically still reports its child's width, and the
-        // title alone was keeping the collapsed rail at 120px.
-        // Ellipsized, and asking for a single character rather than the
-        // default full width. An ellipsizing label still reports its whole
-        // text as its minimum unless it is told how little it can live with,
-        // and that minimum pinned the rail at 120px for the length of the
-        // fold: the width animation ran, changed nothing, and the rail
-        // dropped to its icon width in one step at the end.
+        // Ellipsized rather than wrapped, so an overlong title would cut
+        // rather than push the rail's layout around.
         let name = gtk::Label::builder()
             .label("CheapAzSLA")
             .xalign(0.0)
@@ -143,26 +164,18 @@ impl Shell {
         tag.add_css_class("cz-dim");
         brand.append(&name);
         brand.append(&tag);
-        // Two revealers, one per axis. A revealer only scales the axis it
-        // slides on, so the vertical one that takes the wordmark's height out
-        // of the rail went on reporting its full width the whole way down —
-        // and a box hands spare space to a child up to its natural width, so
-        // the rail sat at exactly that width for the length of the fold and
-        // then dropped to its icon width in a single step. The inner one
-        // takes the width away in step with it.
-        let brand_width = gtk::Revealer::builder()
-            .child(&brand)
-            .transition_type(gtk::RevealerTransitionType::SlideRight)
-            .transition_duration(COLLAPSE_MS)
-            .reveal_child(true)
-            .build();
+        // Straight up and out of the way. This used to be two revealers, one
+        // per axis, because a vertical one still reported the wordmark's full
+        // width and that width held the rail open; now that the rail is a clip
+        // its contents' width is nobody's business but their own, and the
+        // wordmark can just leave the way it reads best.
         let brand_reveal = gtk::Revealer::builder()
-            .child(&brand_width)
+            .child(&brand)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
             .transition_duration(COLLAPSE_MS)
             .reveal_child(true)
             .build();
-        sidebar.append(&brand_reveal);
+        content.append(&brand_reveal);
 
         let shell = Rc::new(Self {
             widget: gtk::Box::new(gtk::Orientation::Horizontal, 0),
@@ -171,14 +184,14 @@ impl Shell {
             current: RefCell::new(Section::Convert),
             on_change: RefCell::new(None),
             sidebar: sidebar.clone(),
-            reveals: RefCell::new(vec![brand_reveal, brand_width]),
+            reveals: RefCell::new(vec![brand_reveal]),
             width_tick: RefCell::new(None),
             want_labels: Rc::new(Cell::new(true)),
             compact: Cell::new(false),
         });
 
         for section in Section::ALL {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
             // A 3px bar marks the active section, so selection is not carried
             // by colour alone (§15, §35).
             let marker = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -187,8 +200,19 @@ impl Shell {
             marker.set_valign(gtk::Align::Center);
             row.append(&marker);
             row.append(&gtk::Image::from_icon_name(section.icon()));
+            // Ellipsized down to a single character, so the label's own
+            // minimum can never hold the rail wider than the width animation
+            // has reached. Without that a revealer's first frame, which
+            // allocates its child at full size, pinned the rail open and the
+            // labels had to be held back to hide it — which is what made the
+            // two move at different times.
+            let label = gtk::Label::builder()
+                .label(section.label())
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .width_chars(1)
+                .build();
             let reveal = gtk::Revealer::builder()
-                .child(&gtk::Label::new(Some(section.label())))
+                .child(&label)
                 .transition_type(gtk::RevealerTransitionType::SlideRight)
                 .transition_duration(COLLAPSE_MS)
                 .reveal_child(true)
@@ -202,14 +226,14 @@ impl Shell {
             button.set_tooltip_text(Some(section.label()));
             let sh = shell.clone();
             button.connect_clicked(move |_| sh.show(section));
-            sidebar.append(&button);
+            content.append(&button);
             shell.items.borrow_mut().push(NavItem { button, section });
         }
 
         // About sits at the foot, away from navigation (§4).
         let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spacer.set_vexpand(true);
-        sidebar.append(&spacer);
+        content.append(&spacer);
 
         shell.widget.append(&sidebar);
         shell.widget.append(&stack);
