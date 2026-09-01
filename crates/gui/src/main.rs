@@ -230,11 +230,20 @@ fn build(app: &adw::Application) -> Rc<App> {
         .title("CheapAzSLA")
         .default_width(1440)
         .default_height(900)
-        // Half of a 1920 display is 960 wide and a quarter is 480, so any
-        // minimum above that quietly makes the window untileable. The layout
-        // gives things up as it narrows rather than refusing to narrow; see
-        // wire_responsive for how the minimum is unlocked at all.
-        .width_request(420)
+        // Quarter of a 1920 display, which was the target, and not a pixel
+        // narrower on purpose.
+        //
+        // The rail folds over a third of a second while the window keeps
+        // moving, so for a moment the layout holds a rail that is still open
+        // beside a workspace that has already narrowed. Fully open that is 152
+        // plus 323, and a window of 420 could not hold it: the right-hand edge
+        // went off screen for the length of the fold. Clamping the rail to
+        // what fits was the other way out and is worse — it drags the rail to
+        // its folded width the instant the window is small, which is a jump
+        // rather than a fold. 480 leaves room for the widest the layout is
+        // ever transiently in, so nothing has to be clamped and nothing goes
+        // off screen.
+        .width_request(480)
         .height_request(440)
         .build();
     window.add_css_class("cheapazsla");
@@ -277,10 +286,17 @@ fn build(app: &adw::Application) -> Rc<App> {
     // truncated before the part that identifies it. When someone knows better
     // than the detector they need a way to say so, and the place they will
     // look is the box that told them what it thinks the file is.
+    // Ellipsized, and asking for very little. A plain label's minimum width is
+    // its whole text, and "(Automatically Detect)" beside the format name took
+    // this control's minimum from about 80 pixels to 260 — enough to push the
+    // whole page wider than a narrow window and leave its right-hand side off
+    // screen.
     let input_label = gtk::Label::builder()
         .label("—")
         .xalign(0.0)
         .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .width_chars(3)
         .build();
     input_label.add_css_class("cz-value");
     let input_inner = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
@@ -536,7 +552,7 @@ fn debug_fold(window: &adw::ApplicationWindow) {
                             // frames, which is what catches a fold that
                             // restarts instead of reversing.
                             let width = if step < 30 {
-                                830 - (step as i32 * 6)
+                                900 - (step as i32 * 6)
                             } else if step < 44 {
                                 830
                             } else if step < 52 {
@@ -548,13 +564,48 @@ fn debug_fold(window: &adw::ApplicationWindow) {
                             };
                             w.set_default_size(width, 700);
                             let (rail, brand, label) = fold_parts(&w);
-                            eprintln!("fold {width} rail {rail} icon_x {brand} label_x {label}");
+                            // The content's own minimum beside the width it
+                            // has been given: anything larger is off screen.
+                            let need = content_minimum(&w);
+                            eprintln!(
+                                "fold {width} got {} needs {need}{} rail {rail} icon_x {brand} \
+                                 label_x {label}",
+                                w.width(),
+                                if need > w.width() { "  OVERFLOWS" } else { "" }
+                            );
+                            if need > w.width() && w.width() < 500 {
+                                report_minimums(&w);
+                            }
                         },
                     );
                 }
             });
         });
     });
+}
+
+/// The narrowest the window's contents will fit into.
+///
+/// Measured on the toolbar view rather than the window: since the window
+/// gained a breakpoint it reports its own width request as its minimum, which
+/// says nothing about whether the contents fit inside it.
+fn content_minimum(window: &adw::ApplicationWindow) -> i32 {
+    fn find(w: &gtk::Widget) -> Option<gtk::Widget> {
+        if w.type_().name() == "AdwToolbarView" {
+            return Some(w.clone());
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            if let Some(f) = find(&c) {
+                return Some(f);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+    find(&window.clone().upcast())
+        .map(|v| v.measure(gtk::Orientation::Horizontal, -1).0)
+        .unwrap_or(-1)
 }
 
 /// The rail's drawn width, and where the first navigation row's icon and
@@ -792,6 +843,7 @@ fn wire_responsive(ui: &Rc<App>) {
                 },
                 -1,
             );
+            refresh_input_label(&ui);
             let chars = if narrow { 8 } else { 14 };
             ui.layer_label.set_width_chars(chars);
             ui.layer_label.set_max_width_chars(chars);
@@ -1731,6 +1783,28 @@ struct ReadFile {
 /// A message for the user, and what they can try (§28).
 type ReadFailure = (String, Vec<Suggestion>);
 
+/// What the Input control says: the format, and how it was arrived at.
+///
+/// "GOO (Automatically Detect)" answers both questions at once, where a bare
+/// "GOO" left the menu's tick on "Detect automatically" looking like it
+/// disagreed with the field. Narrow, the suffix goes rather than being cut
+/// off in the middle of itself.
+fn refresh_input_label(ui: &Rc<App>) {
+    let files = ui.files.borrow();
+    let text = match files.get(*ui.selected.borrow()) {
+        Some(f) if !f.format.is_empty() => {
+            let name = f.format.to_uppercase();
+            if f.forced_format.is_some() || ui.compact.get() {
+                name
+            } else {
+                format!("{name} (Automatically Detect)")
+            }
+        }
+        _ => "—".to_string(),
+    };
+    ui.input_label.set_text(&text);
+}
+
 /// The list of formats the selected file can be read as (§21).
 ///
 /// "Detect automatically" first, then every format that can read, so the
@@ -2120,7 +2194,7 @@ fn select_file(ui: &Rc<App>, index: usize) {
     ui.texture_order.borrow_mut().clear();
     ui.in_flight.borrow_mut().clear();
 
-    let (input, count, ready) = {
+    let (count, ready) = {
         let files = ui.files.borrow();
         let f = &files[index];
         let count = f
@@ -2128,21 +2202,9 @@ fn select_file(ui: &Rc<App>, index: usize) {
             .as_ref()
             .map(|o| o.print.layer_count())
             .unwrap_or(0);
-        // Say how the format was arrived at, not just what it is. Read as
-        // "GOO (Automatically Detect)" the field answers both questions at
-        // once; a bare "GOO" left the menu's tick on "Detect automatically"
-        // looking like it disagreed with it.
-        (
-            match (f.format.is_empty(), f.forced_format.is_some()) {
-                (true, _) => "—".to_string(),
-                (false, true) => f.format.to_uppercase(),
-                (false, false) => format!("{} (Automatically Detect)", f.format.to_uppercase()),
-            },
-            count,
-            f.opened.is_some(),
-        )
+        (count, f.opened.is_some())
     };
-    ui.input_label.set_text(&input);
+    refresh_input_label(ui);
     // Rebuilt per selection so the tick sits beside whatever this file is
     // being read as.
     build_input_menu(ui);

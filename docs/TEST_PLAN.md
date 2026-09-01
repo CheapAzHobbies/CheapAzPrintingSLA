@@ -281,7 +281,8 @@ Run through this before a release. Tick each line.
 ### Window sizes
 
 - [ ] Tiles to half the screen without the layout breaking
-- [ ] Tiles to a quarter of the screen
+- [ ] Tiles to a quarter of the screen (480 on a 1920 display, the minimum)
+- [ ] Nothing goes off the right-hand edge *during* a fold, not only after it
 - [ ] Narrowing drops the information panel beside the preview
 - [ ] Narrowing further leaves the sidebar as icons, still navigable
 - [ ] Nothing overlaps at the smallest size the window will take
@@ -301,6 +302,12 @@ The last is for alignment. Whether two controls line up is not something to
 settle by eye or by reading the code: render it, then measure the columns in
 the image. A row that looked right that way turned out to have its two fields
 36 and 34 pixels tall with the button between them eleven pixels high.
+
+`CHEAPAZSLA_DEBUG_FOLD=1` also reports, at every step, the width the contents
+need beside the width they were given, and marks any step where the first
+exceeds the second `OVERFLOWS` — that is content off the right-hand edge. It
+dumps the widget tree when that happens, so the widget responsible is named
+rather than guessed at. A clean run has none.
 
 For the fold, the numbers should descend and climb evenly. A repeated value is
 a stall, a large gap is a jump, and the two directions should read as reverses
