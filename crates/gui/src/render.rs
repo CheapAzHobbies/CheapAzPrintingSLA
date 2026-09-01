@@ -302,7 +302,6 @@ mod bench {
         if !path.exists() {
             return;
         }
-        use cheapazsla_core::layers::LayerProvider;
         let opened = cheapazsla_core::registry::open(&path).expect("open");
         let img = opened.layers.layer(0).expect("layer");
         // Warm, then measure.

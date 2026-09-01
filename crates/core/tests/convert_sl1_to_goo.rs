@@ -158,7 +158,6 @@ fn a_long_run_is_split_across_chunks_correctly() {
 #[test]
 fn every_layer_survives_the_conversion_pixel_for_pixel() {
     use cheapazsla_core::formats::goo_rle;
-    use cheapazsla_core::layers::LayerProvider;
     use cheapazsla_core::registry;
 
     let Some(src) = real_sl1() else {
@@ -263,7 +262,6 @@ fn conversion_reports_progress_for_every_layer() {
 
 #[test]
 fn an_sl1_survives_a_round_trip_through_our_own_writer() {
-    use cheapazsla_core::layers::LayerProvider;
     use cheapazsla_core::registry;
 
     let Some(src) = real_sl1() else {

@@ -468,6 +468,10 @@ fn build(app: &adw::Application) -> Rc<App> {
     }
     build_settings_page(&ui, &settings_page);
     wire(&ui, &add_more);
+    {
+        let window = ui.window.clone();
+        ui.shell.connect_about(move || show_about(&window));
+    }
     wire_responsive(&ui);
     restore_session(&ui);
     refresh_history(&ui);
@@ -501,10 +505,15 @@ fn debug_fold(window: &adw::ApplicationWindow) {
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(400 + 30 * step),
                         move || {
+                            // Walk in slowly, settle back out, then walk in
+                            // again seven times as fast: the fold behaves
+                            // differently when the window outruns it.
                             let width = if step < 30 {
                                 830 - (step as i32 * 6)
+                            } else if step < 48 {
+                                830
                             } else {
-                                650 + ((step as i32 - 30) * 6)
+                                (830 - ((step as i32 - 48) * 140)).max(410)
                             };
                             w.set_default_size(width, 700);
                             let (rail, brand, label) = fold_parts(&w);
@@ -568,6 +577,79 @@ fn fold_parts(window: &adw::ApplicationWindow) -> (i32, i32, i32) {
         .map(|b| b.x().round() as i32)
         .unwrap_or(-1);
     (rail.width(), icon, label)
+}
+
+/// The guide and the project's details, from the button at the foot of the rail.
+///
+/// The guide itself is deliberately empty: the interface it would describe is
+/// about to be reworked, and a walkthrough of the old one would be worse than
+/// none. The section says so rather than pretending to be a page that failed
+/// to load.
+fn show_about(parent: &adw::ApplicationWindow) {
+    let page = adw::PreferencesPage::new();
+
+    let guide = adw::PreferencesGroup::builder()
+        .title("How to use CheapAzSLA")
+        .description("A step-by-step guide will live here.")
+        .build();
+    let placeholder = gtk::Label::builder()
+        .label("Not written yet — the interface it describes is being reworked.")
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    placeholder.add_css_class("cz-dim");
+    placeholder.add_css_class("caption");
+    placeholder.set_margin_top(theme::SPACE_2);
+    guide.add(&placeholder);
+    page.add(&guide);
+
+    let about = adw::PreferencesGroup::builder().title("About").build();
+    about.add(
+        &adw::ActionRow::builder()
+            .title("Version")
+            .subtitle(cheapazsla_core::VERSION)
+            .build(),
+    );
+    for (title, subtitle, url) in [
+        (
+            "Project on GitHub",
+            "github.com/CheapAzHobbies/CheapAzPrintingSLA",
+            "https://github.com/CheapAzHobbies/CheapAzPrintingSLA",
+        ),
+        (
+            "CheapAzHobbies on GitHub",
+            "github.com/CheapAzHobbies",
+            "https://github.com/CheapAzHobbies",
+        ),
+    ] {
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
+        row.connect_activated(move |_| {
+            let _ = gio::AppInfo::launch_default_for_uri(url, gio::AppLaunchContext::NONE);
+        });
+        about.add(&row);
+    }
+    page.add(&about);
+
+    let header = adw::HeaderBar::new();
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&header);
+    view.set_content(Some(&page));
+
+    let window = adw::Window::builder()
+        .title("About CheapAzSLA")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(460)
+        .default_height(420)
+        .content(&view)
+        .build();
+    window.add_css_class("cheapazsla");
+    window.present();
 }
 
 /// Report what is holding the window open, widest branch first.
@@ -692,63 +774,42 @@ fn wire_responsive(ui: &Rc<App>) {
     };
     apply(0);
 
-    // Only one breakpoint is ever applied at a time — the last one added
-    // whose condition holds — so the narrow one standing alone still means
-    // the narrow state, and the flags can simply be read in order. The
-    // recompute is deferred so it does not matter whether libadwaita
-    // unapplies the old breakpoint before or after it applies the new one.
-    let hit_wide = Rc::new(Cell::new(false));
-    let hit_narrow = Rc::new(Cell::new(false));
-    let hit_stacked = Rc::new(Cell::new(false));
-    let recompute = {
-        let (apply, hit_wide, hit_narrow, hit_stacked) = (
-            apply.clone(),
-            hit_wide.clone(),
-            hit_narrow.clone(),
-            hit_stacked.clone(),
-        );
-        let pending = Rc::new(Cell::new(false));
-        Rc::new(move || {
-            if pending.replace(true) {
-                return;
-            }
-            let (apply, hit_wide, hit_narrow, hit_stacked, pending) = (
-                apply.clone(),
-                hit_wide.clone(),
-                hit_narrow.clone(),
-                hit_stacked.clone(),
-                pending.clone(),
-            );
-            glib::idle_add_local_once(move || {
-                pending.set(false);
-                apply(if hit_stacked.get() {
-                    3
-                } else if hit_narrow.get() {
-                    2
-                } else if hit_wide.get() {
-                    1
-                } else {
-                    0
-                });
-            });
-        })
-    };
-
-    for (condition, flag) in [
-        (WIDE_BELOW, &hit_wide),
-        (NARROW_BELOW, &hit_narrow),
-        (STACKED_BELOW, &hit_stacked),
-    ] {
+    // Each breakpoint records whether it is currently in force, and the level
+    // is the deepest one that is. Reading them that way makes the order the
+    // signals arrive in irrelevant: going from one step to the next libadwaita
+    // unapplies the old and applies the new, either can come first, and the
+    // deepest flag set is the right answer whichever does.
+    //
+    // Deferred to an idle rather than applied in the signal. Applying it there
+    // changes size requests while a breakpoint is being evaluated, and the
+    // breakpoints then oscillate — the trace reads apply, unapply, apply,
+    // unapply for as long as the drag lasts. The lateness that costs is dealt
+    // with in the fold itself, which will not let the rail be wider than the
+    // window can fit.
+    let hit = Rc::new([Cell::new(false), Cell::new(false), Cell::new(false)]);
+    let pending = Rc::new(Cell::new(false));
+    for (index, condition) in [WIDE_BELOW, NARROW_BELOW, STACKED_BELOW]
+        .into_iter()
+        .enumerate()
+    {
         let bp = adw::Breakpoint::new(
             adw::BreakpointCondition::parse(condition).expect("breakpoint condition"),
         );
-        for (state, signal) in [(true, "apply"), (false, "unapply")] {
-            let (flag, recompute) = (flag.clone(), recompute.clone());
+        for state in [true, false] {
+            let (hit, apply, pending) = (hit.clone(), apply.clone(), pending.clone());
             let handler = move |_: &adw::Breakpoint| {
-                flag.set(state);
-                recompute();
+                hit[index].set(state);
+                if pending.replace(true) {
+                    return;
+                }
+                let (hit, apply, pending) = (hit.clone(), apply.clone(), pending.clone());
+                glib::idle_add_local_once(move || {
+                    pending.set(false);
+                    let level = hit.iter().rposition(|h| h.get()).map_or(0, |i| i as u8 + 1);
+                    apply(level);
+                });
             };
-            if signal == "apply" {
+            if state {
                 bp.connect_apply(handler);
             } else {
                 bp.connect_unapply(handler);

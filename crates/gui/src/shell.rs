@@ -98,6 +98,8 @@ pub struct Shell {
     /// Whether the labels should be showing, so a reveal held back for a
     /// moment does not fire into a rail that has folded again meanwhile.
     want_labels: Rc<Cell<bool>>,
+    /// The About button at the foot of the rail.
+    about: RefCell<Option<gtk::Button>>,
     compact: Cell<bool>,
 }
 
@@ -165,11 +167,13 @@ impl Shell {
             .width_chars(1)
             .build();
         name.add_css_class("heading");
+        // Wrapped rather than ellipsized: this one is a phrase, and half of a
+        // phrase followed by an ellipsis says less than the same phrase over
+        // two lines. GTK only takes the second line if it needs it.
         let tag = gtk::Label::builder()
-            .label("Resin print files")
+            .label("Convert and inspect")
             .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .width_chars(1)
+            .wrap(true)
             .build();
         tag.add_css_class("caption");
         tag.add_css_class("cz-dim");
@@ -198,58 +202,75 @@ impl Shell {
             reveals: RefCell::new(vec![brand_reveal]),
             width_tick: RefCell::new(None),
             want_labels: Rc::new(Cell::new(true)),
+            about: RefCell::new(None),
             compact: Cell::new(false),
         });
 
         for section in Section::ALL {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
-            // A 3px bar marks the active section, so selection is not carried
-            // by colour alone (§15, §35).
-            let marker = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            marker.add_css_class("cz-nav-marker");
-            marker.set_size_request(3, 18);
-            marker.set_valign(gtk::Align::Center);
-            row.append(&marker);
-            row.append(&gtk::Image::from_icon_name(section.icon()));
-            // Ellipsized down to a single character, so the label's own
-            // minimum can never hold the rail wider than the width animation
-            // has reached. Without that a revealer's first frame, which
-            // allocates its child at full size, pinned the rail open and the
-            // labels had to be held back to hide it — which is what made the
-            // two move at different times.
-            let label = gtk::Label::builder()
-                .label(section.label())
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .width_chars(1)
-                .build();
-            let reveal = gtk::Revealer::builder()
-                .child(&label)
-                .transition_type(gtk::RevealerTransitionType::SlideRight)
-                .transition_duration(COLLAPSE_MS)
-                .reveal_child(true)
-                .build();
-            row.append(&reveal);
-            shell.reveals.borrow_mut().push(reveal);
-
-            let button = gtk::Button::builder().child(&row).build();
-            button.add_css_class("flat");
-            button.add_css_class("cz-nav-item");
-            button.set_tooltip_text(Some(section.label()));
+            let button = shell.rail_button(section.icon(), section.label());
             let sh = shell.clone();
             button.connect_clicked(move |_| sh.show(section));
             content.append(&button);
             shell.items.borrow_mut().push(NavItem { button, section });
         }
 
-        // About sits at the foot, away from navigation (§4).
+        // The guide sits at the foot, away from navigation (§4).
         let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spacer.set_vexpand(true);
         content.append(&spacer);
+        let about = shell.rail_button("help-about-symbolic", "About");
+        about.set_margin_bottom(theme::SPACE_2);
+        content.append(&about);
+        *shell.about.borrow_mut() = Some(about);
 
         shell.widget.append(&sidebar);
         shell.widget.append(&stack);
         shell.select_visual(Section::Convert);
         shell
+    }
+
+    /// A row in the rail: marker, icon, and a label that slides away when the
+    /// rail folds. Used for the sections and for the About button, so the one
+    /// at the foot folds exactly like the ones above it.
+    fn rail_button(self: &Rc<Self>, icon: &str, label: &str) -> gtk::Button {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+        // A 3px bar marks the active section, so selection is not carried by
+        // colour alone (§15, §35). The About row keeps a transparent one so
+        // its icon lines up with the others.
+        let marker = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        marker.add_css_class("cz-nav-marker");
+        marker.set_size_request(3, 18);
+        marker.set_valign(gtk::Align::Center);
+        row.append(&marker);
+        row.append(&gtk::Image::from_icon_name(icon));
+        // Ellipsized down to a single character, so the label's own minimum
+        // can never hold the rail wider than the width animation has reached.
+        let text = gtk::Label::builder()
+            .label(label)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .width_chars(1)
+            .build();
+        let reveal = gtk::Revealer::builder()
+            .child(&text)
+            .transition_type(gtk::RevealerTransitionType::SlideRight)
+            .transition_duration(COLLAPSE_MS)
+            .reveal_child(true)
+            .build();
+        row.append(&reveal);
+        self.reveals.borrow_mut().push(reveal);
+
+        let button = gtk::Button::builder().child(&row).build();
+        button.add_css_class("flat");
+        button.add_css_class("cz-nav-item");
+        button.set_tooltip_text(Some(label));
+        button
+    }
+
+    /// Called when the About button at the foot of the rail is pressed.
+    pub fn connect_about(&self, f: impl Fn() + 'static) {
+        if let Some(button) = self.about.borrow().as_ref() {
+            button.connect_clicked(move |_| f());
+        }
     }
 
     /// Add a page. Called once per section during construction.
@@ -361,9 +382,10 @@ impl Shell {
         }
         let root: gtk::Widget = root.upcast();
         let sidebar = self.sidebar.clone();
+        let stack = self.stack.clone();
         let began = Cell::new(None::<i64>);
         let span = (COLLAPSE_MS as i64) * 1000;
-        let id = root.add_tick_callback(move |_, clock| {
+        let id = root.add_tick_callback(move |root, clock| {
             let now = clock.frame_time();
             let start = match began.get() {
                 Some(t) => t,
@@ -375,7 +397,19 @@ impl Shell {
             let t = ((now - start) as f64 / span as f64).clamp(0.0, 1.0);
             // Ease out cubic: quick to leave, gentle to arrive.
             let eased = 1.0 - (1.0 - t).powi(3);
-            sidebar.set_size_request((from + (to - from) * eased).round() as i32, -1);
+            let want = from + (to - from) * eased;
+
+            // Never wider than what is left once the workspace has what it
+            // needs. Dragging an edge quickly, the window can cross the step
+            // and keep going while the fold is still near its start, and the
+            // rail would sit at its full width over a window too narrow to
+            // hold it — everything squeezed, then a jump when the animation
+            // caught up, which reads as the fold having been skipped. Held to
+            // what fits, the rail simply folds as fast as the drag demands.
+            let (workspace, _, _, _) = stack.measure(gtk::Orientation::Horizontal, -1);
+            let room = (root.width() - workspace).max(RAIL_WIDTH);
+            let width = want.min(room as f64).max(RAIL_WIDTH as f64);
+            sidebar.set_size_request(width.round() as i32, -1);
             if t >= 1.0 {
                 glib::ControlFlow::Break
             } else {
