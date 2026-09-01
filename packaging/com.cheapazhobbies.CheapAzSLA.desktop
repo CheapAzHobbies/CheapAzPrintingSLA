@@ -8,6 +8,6 @@ Icon=com.cheapazhobbies.CheapAzSLA
 Terminal=false
 Categories=Graphics;3DGraphics;
 Keywords=resin;sla;msla;dlp;3d;print;sl1;goo;ctb;phz;convert;inspect;
-MimeType=application/x-sl1;
+MimeType=application/x-sl1;application/x-goo;application/x-ctb;
 StartupNotify=true
 StartupWMClass=cheapazsla-gui

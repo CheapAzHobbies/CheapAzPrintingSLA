@@ -19,7 +19,7 @@ not a roadmap.
 
 | Phase | | Notes |
 |---|---|---|
-| 19 | CTB | Reading and writing done, cross-checked against catibo both ways. |
+| 19 | CTB | Reading done and verified against real UVtools files, v3-v5. Writing implemented but not offered: UVtools rejects it, cause unknown. |
 | 20 | PHZ | Legacy Chitubox, closely related to CTB. |
 | 21 | Packaging | Flatpak, AppImage, deb, rpm, AUR. Nothing yet. |
 | 22 | Final polish | Ongoing. |

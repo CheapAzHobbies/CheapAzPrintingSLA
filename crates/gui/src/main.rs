@@ -3157,11 +3157,26 @@ fn run_batch(ui: &Rc<App>, plans: Vec<(PathBuf, convert::Plan)>) {
         };
         let toast = adw::Toast::builder().title(title).timeout(6).build();
         if let Some(dest) = last_dest {
-            toast.set_button_label(Some("Open Folder"));
+            // The file itself rather than the folder it is in (§27). Opening
+            // the folder was all there was, which left the last step —
+            // checking the thing that was just made — to be done by hand.
+            // Falls back to the folder when nothing claims the format, which
+            // is likely: few desktops know what a .goo is.
+            let single = ok == 1 && failed == 0;
+            toast.set_button_label(Some(if single { "Open File" } else { "Open Folder" }));
             toast.connect_button_clicked(move |_| {
-                if let Some(parent) = dest.parent() {
-                    let uri = gio::File::for_path(parent).uri();
-                    let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                let opened = single
+                    && gio::AppInfo::launch_default_for_uri(
+                        &gio::File::for_path(&dest).uri(),
+                        gio::AppLaunchContext::NONE,
+                    )
+                    .is_ok();
+                if !opened {
+                    if let Some(parent) = dest.parent() {
+                        let uri = gio::File::for_path(parent).uri();
+                        let _ =
+                            gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                    }
                 }
             });
         }

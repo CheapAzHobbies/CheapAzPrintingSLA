@@ -25,6 +25,15 @@ if [ -f "$root/packaging/com.cheapazhobbies.CheapAzSLA.desktop" ]; then
         "$prefix/share/applications/com.cheapazhobbies.CheapAzSLA.desktop"
 fi
 
+# The desktop entry says which types it opens; this says what those types are.
+# Without it the entry names a type the desktop has never heard of, and
+# double-clicking a print file does nothing.
+if [ -f "$root/packaging/com.cheapazhobbies.CheapAzSLA.mime.xml" ]; then
+    install -Dm644 "$root/packaging/com.cheapazhobbies.CheapAzSLA.mime.xml" \
+        "$prefix/share/mime/packages/com.cheapazhobbies.CheapAzSLA.xml"
+    update-mime-database "$prefix/share/mime" 2>/dev/null || true
+fi
+
 gtk-update-icon-cache -f -t "$prefix/share/icons/hicolor" 2>/dev/null || true
 update-desktop-database "$prefix/share/applications" 2>/dev/null || true
 

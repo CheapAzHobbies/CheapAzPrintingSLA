@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MIME types for resin print files.
+
+  The desktop entry named a type nothing ever defined, so double-clicking an
+  .sl1 in a file manager did nothing: the desktop had no idea such a type
+  existed, let alone that CheapAzSLA opened it.
+
+  Each type is matched by content as well as by name where the format has a
+  usable marker, since a file's extension is a hint and its first bytes are
+  evidence. SL1 is a ZIP and so cannot be told apart from any other ZIP by its
+  magic alone; it is matched by name, at a lower priority than a real archive.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+
+  <mime-type type="application/x-sl1">
+    <comment>PrusaSlicer SL1 print file</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.sl1" weight="60"/>
+    <glob pattern="*.sl1s" weight="60"/>
+  </mime-type>
+
+  <mime-type type="application/x-goo">
+    <comment>Elegoo GOO print file</comment>
+    <glob pattern="*.goo"/>
+    <magic priority="80">
+      <!-- "V3.0" then the format's fixed tag. -->
+      <match type="string" value="V3.0" offset="0">
+        <match type="byte" value="0x07" offset="4"/>
+      </match>
+    </magic>
+  </mime-type>
+
+  <mime-type type="application/x-ctb">
+    <comment>Chitubox CTB print file</comment>
+    <glob pattern="*.ctb"/>
+    <magic priority="80">
+      <!-- 0x12FD0086, little-endian. -->
+      <match type="little32" value="0x12fd0086" offset="0"/>
+    </magic>
+  </mime-type>
+
+</mime-info>

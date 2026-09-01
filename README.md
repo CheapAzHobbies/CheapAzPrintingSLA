@@ -161,7 +161,8 @@ time. The output is byte-identical apart from the timestamp in the header.
 | SL1 reading | done, tested against real slicer output |
 | SL1 writing | not started |
 | GOO reading and writing | done, verified against a real Elegoo file |
-| CTB reading and writing | done, checked both ways against another implementation |
+| CTB reading | done, verified against real files from UVtools, v3 to v5 |
+| CTB writing | implemented, **not offered**: UVtools will not read it |
 | PHZ | not started |
 | Desktop interface | done |
 | Command line | done |
@@ -170,34 +171,32 @@ time. The output is byte-identical apart from the timestamp in the header.
 Anything marked not started is absent, not stubbed. There are no buttons that
 do nothing.
 
-CTB is the one line above worth expanding on, because "tested" can mean two
-quite different things. Most of its tests read files CheapAzSLA itself built,
-which only shows the reader agrees with itself — the same trap that hid a
-byte-order mistake in the GOO writer until a real file caught it.
+CTB is the pair of lines above worth expanding on.
 
-So the CTB tests also read two files this project did not write. They come from
-[catibo](https://github.com/cbiffle/catibo), a separate reverse engineering of
-the format whose author verified it by printing from it, and the tests check
-every metadata field and every pixel of every layer, in both a plain file and
-one with the layer data obfuscated the way Chitubox does it. Header offsets,
-run-length encoding and cipher would all have to be right for those to pass,
-and they were not written by looking at this code.
+**Reading is verified properly.** UVtools, the reference implementation for
+these formats, converted a real 438 layer print at 11520x5120 to CTB at
+versions 3, 4 and 5, and this reader gives back pixel data identical to the
+source for every layer of each — the same lit-pixel counts and the same
+checksums. Version 4 and 5 files are obfuscated with the layer cipher, so that
+is verified against real files too. Two files written by
+[catibo](https://github.com/cbiffle/catibo), a separate reverse engineering
+verified by printing from it, are committed under `crates/core/tests/data` and
+read in the test suite down to individual pixels.
 
-Writing was checked the other way round, by having catibo read a file written
-here: an SL1 of 438 layers at 11520x5120 converted to CTB, then decoded by
-catibo, layer by layer. Its reader accounts for every pixel of every layer, and
-the counts agree with the source.
+**Writing is implemented, tested, and deliberately not offered.** The files it
+produces have a correct layer table — z strictly increasing, offsets
+contiguous, the last record ending exactly at the end of the file — and their
+run-length payloads come out the same length, byte for byte, as UVtools' own
+for the same input. catibo reads them completely; so does this reader. UVtools
+does not: it reads the layer table as though it began somewhere else, reports
+impossible z positions and refuses the file, for some resolutions and not
+others, and I have not worked out why. UVtools is what most people use to
+check a file before committing it to a printer, so until that is understood,
+handing anyone such a file would be irresponsible. The writer and its tests
+stay; the capability flag says no.
 
-They agree exactly on any value the two readers widen the same way. catibo maps
-the stored seven-bit grey by masking off its lowest bit and scaling the other
-six; this maps all seven, which is what the format description says the field
-is. The bytes written are the same either way, and on the layers of the
-reference file where every pixel is an even value the two readings are
-identical to the pixel.
-
-That is good evidence, not proof: catibo is not Chitubox. A file from Chitubox
-itself remains the last word, and the test for it is written and skips until
-one exists:
+A file from Chitubox itself would still be worth having, and the test for one
+is written and skips until it exists:
 
     CHEAPAZSLA_REAL_CTB=/path/to/from-chitubox.ctb cargo test -p cheapazsla-core
 

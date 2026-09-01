@@ -204,6 +204,22 @@ fn parse(path: &Path) -> Result<(PrintFile, GooLayers, Vec<String>)> {
     let _grey = r.u16()?;
     let _blur = r.u16()?;
 
+    // The two previews sit between the text header and the parameters, at
+    // fixed offsets and fixed sizes, raw RGB565 rather than run-length
+    // encoded. They were skipped here once, which meant a GOO converted to
+    // anything else arrived with a blank picture on the printer's screen and
+    // nothing said so.
+    let previews = [(194u64, SMALL_W, SMALL_H), (194 + 0x6920 + 2, BIG_W, BIG_H)];
+    let mut thumbnails = Vec::new();
+    for (at, w, h) in previews {
+        match read_preview(&r.data, at, w, h) {
+            Ok(t) => thumbnails.push(t),
+            // A preview is decoration. Losing one should not cost somebody
+            // their layers, so it is dropped rather than failing the open.
+            Err(e) => log::debug!("goo: preview at {at} ignored: {e}"),
+        }
+    }
+
     r.pos = PARAMS as usize;
     let total_layers = limits::check_layer_count(r.u32()? as u64)?;
     let xres = r.u16()? as u32;
@@ -364,7 +380,7 @@ fn parse(path: &Path) -> Result<(PrintFile, GooLayers, Vec<String>)> {
                 .then_some(bottom_retract_speed),
         },
         layers: layer_infos,
-        thumbnails: Vec::new(), // previews are RGB565; decoding them is not needed to convert
+        thumbnails,
         print_time_s: (printing_time > 0).then_some(printing_time as u64),
         material_volume_ml: (volume > 0.0).then_some(volume),
         material_grams: (weight > 0.0).then_some(weight),
@@ -401,6 +417,28 @@ fn be_u32(out: &mut Vec<u8>, v: u32) {
 }
 fn be_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_be_bytes());
+}
+
+/// Read one preview: raw RGB565, big-endian like the rest of the format.
+fn read_preview(data: &[u8], at: u64, w: u32, h: u32) -> Result<Thumbnail> {
+    let bytes = (w as u64) * (h as u64) * 2;
+    limits::check_range(at, bytes, data.len() as u64)?;
+    let start = at as usize;
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for i in 0..(w * h) as usize {
+        let v = u16::from_be_bytes([data[start + i * 2], data[start + i * 2 + 1]]);
+        // Five bits of red and blue, six of green, each widened by repeating
+        // its top bits so full scale stays full scale.
+        let (r5, g6, b5) = ((v >> 11) & 0x1F, (v >> 5) & 0x3F, v & 0x1F);
+        rgb.push(((r5 << 3) | (r5 >> 2)) as u8);
+        rgb.push(((g6 << 2) | (g6 >> 4)) as u8);
+        rgb.push(((b5 << 3) | (b5 >> 2)) as u8);
+    }
+    Ok(Thumbnail {
+        width: w,
+        height: h,
+        rgb,
+    })
 }
 
 /// Scale a thumbnail into an RGB565 buffer of the given size.

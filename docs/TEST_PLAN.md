@@ -104,13 +104,31 @@ independent code paths must produce the same image.
 | Preview images, both documented sizes | `ctb_preview.rs` |
 | The same, obfuscated with the layer cipher | `ctb_reference.rs` |
 | Layer cipher against independently computed keystream | `ctb.rs` |
+| Real files from UVtools at v3, v4 and v5 | `ctb.rs` with `CHEAPAZSLA_REAL_CTB` |
 | **A file Chitubox produced** | `ctb.rs`, skipped without `CHEAPAZSLA_REAL_CTB` |
+
+Real files can be made with UVtools, which is the reference implementation for
+these formats:
+
+    UVtools --cmd convert model.sl1 Chitubox -v 5 real.ctb
+    CHEAPAZSLA_REAL_CTB=real.ctb cargo test -p cheapazsla-core
+
+UVtools rewrites its input file in place, so give it a copy, never a fixture
+from this repository.
 
 The rows naming `ctb.rs` and `ctb_rle.rs` read files this project built, so
 they show the reader agrees with itself. The `ctb_reference.rs` rows read files
 another implementation wrote, which is what shows it agrees with anyone else;
 regenerate them with `tools/make_ctb_fixtures.sh`. The last row is still the
 one that would settle it, since catibo is not Chitubox either.
+
+### GOO previews
+
+| What | Test |
+|---|---|
+| A preview survives being written and read | `goo_previews.rs` |
+| Both previews come back at the sizes the format fixes | `goo_previews.rs` |
+| A preview crosses from GOO to CTB | `goo_previews.rs` |
 
 ### GOO
 

@@ -14,9 +14,22 @@
 //! stream, described below. Handling it is what lets this read files people
 //! actually have rather than only ones written by other open tools.
 //!
-//! Writing produces version 3 with the layer data in the clear. The cipher is
-//! optional — the proprietary slicer turns it off simply by setting the key to
-//! zero — and a file nobody has to decipher is the easier one to trust.
+//! Writing is implemented and tested but **not offered**, because UVtools will
+//! not read what it produces and I have not worked out why.
+//!
+//! What is known: the layer table it writes is correct — z strictly
+//! increasing, offsets contiguous, the last record ending exactly at the end
+//! of the file — and its run-length payloads come out the same length, byte
+//! for byte, as UVtools' own for the same input. catibo reads the files
+//! completely and correctly, and so does this reader. But UVtools reads the
+//! layer table as though it began somewhere else, reports impossible z values
+//! and refuses the file. It does that for some resolutions and not others,
+//! which no theory here explains.
+//!
+//! UVtools is what most people use to check a file before committing it to a
+//! printer, so a file it rejects is not one to hand anybody, whatever this
+//! reader thinks of it. The writer stays, with its tests, behind a capability
+//! flag that says no.
 
 use super::{ctb_preview, ctb_rle};
 use crate::error::{Error, FormatError, Result};
@@ -34,7 +47,7 @@ pub const ID: &str = "ctb";
 const MAGIC: u32 = 0x12FD_0086;
 /// The oldest and newest versions this understands.
 const MIN_VERSION: u32 = 2;
-const MAX_VERSION: u32 = 4;
+const MAX_VERSION: u32 = 5;
 
 /// Size of one entry in the layer table.
 const LAYER_ENTRY: u64 = 36;
@@ -56,11 +69,11 @@ static INFO: FormatInfo = FormatInfo {
     limitations: &[
         "Stores seven bits of grey per pixel, so an eight-bit image loses its lowest bit",
         "Stores two preview images, at 400x300 and 200x125",
-        "Not yet checked against a file produced by Chitubox itself",
+        "Reading only: writing is implemented but UVtools will not read the result",
     ],
     capabilities: Capabilities {
         reads: true,
-        writes: true,
+        writes: false,
         per_layer_exposure: true,
         per_layer_lift: true,
         thumbnails: true,

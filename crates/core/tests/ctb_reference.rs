@@ -159,15 +159,14 @@ fn a_reference_file_converts_to_goo_pixel_for_pixel() {
 /// wrong in both would still have to survive the file catibo wrote.
 #[test]
 fn a_reference_file_rewritten_as_ctb_keeps_every_pixel() {
-    use cheapazsla_core::convert;
-
     let src = fixture("catibo-plain.ctb");
     let dir = tempfile::tempdir().unwrap();
     let dst = dir.path().join("rewritten.ctb");
-    let plan = convert::plan(&src, "ctb", &dst).expect("plan");
-    convert::run(&plan).expect("convert");
-
     let before = registry::open(&src).expect("open source");
+    registry::by_id("ctb")
+        .expect("ctb")
+        .write(&dst, &before.print, before.layers.as_ref())
+        .expect("write");
     let after = registry::open(&dst).expect("open rewritten");
     assert_eq!(after.print.layer_count(), before.print.layer_count());
     assert_eq!(after.layers.dimensions(), before.layers.dimensions());
@@ -196,16 +195,14 @@ fn a_reference_file_rewritten_as_ctb_keeps_every_pixel() {
 /// A written file has to satisfy the checks that rejected the broken ones.
 #[test]
 fn a_written_file_points_everywhere_it_says_it_does() {
-    use cheapazsla_core::convert;
-    use cheapazsla_core::registry;
-
     let src = fixture("catibo-encrypted.ctb");
     let dir = tempfile::tempdir().unwrap();
     let dst = dir.path().join("out.ctb");
-    let plan = convert::plan(&src, "ctb", &dst).expect("plan");
-    convert::run(&plan).expect("convert");
-
     let handler = registry::by_id("ctb").expect("registered");
+    let source = registry::open(&src).expect("open source");
+    handler
+        .write(&dst, &source.print, source.layers.as_ref())
+        .expect("write");
     let notes = handler.validate(&dst).expect("validate");
     assert!(
         notes.is_empty(),

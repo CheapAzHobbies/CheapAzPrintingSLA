@@ -309,16 +309,16 @@ fn a_zero_resolution_is_refused() {
 }
 
 #[test]
-fn ctb_is_offered_for_both_reading_and_writing() {
+fn ctb_is_offered_for_reading_only() {
+    // The writer below works and is tested, but UVtools will not read what it
+    // produces, so nothing offers it. See the note at the top of ctb.rs.
     let info = registry::by_id("ctb").expect("registered").info();
     assert!(info.capabilities.reads);
-    assert!(info.capabilities.writes);
+    assert!(!info.capabilities.writes);
 }
 
 #[test]
 fn a_written_ctb_reads_back_with_the_same_metadata_and_pixels() {
-    use cheapazsla_core::convert;
-
     let mut builder = Builder {
         width: 32,
         height: 16,
@@ -333,10 +333,11 @@ fn a_written_ctb_reads_back_with_the_same_metadata_and_pixels() {
 
     let dir = tempfile::tempdir().unwrap();
     let dst = dir.path().join("out.ctb");
-    let plan = convert::plan(&src, "ctb", &dst).expect("plan");
-    convert::run(&plan).expect("convert");
-
     let before = registry::open(&src).expect("open source");
+    registry::by_id("ctb")
+        .expect("ctb")
+        .write(&dst, &before.print, before.layers.as_ref())
+        .expect("write");
     let after = registry::open(&dst).expect("open written");
 
     assert_eq!(after.print.geometry.resolution_x, 32);
