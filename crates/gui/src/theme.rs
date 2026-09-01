@@ -174,9 +174,10 @@ fn sheet(p: &Palette) -> String {
   min-height: 34px;
 }}
 
-/* The output control is a button and the input is not, so their metrics are
-   set together rather than left to two different defaults. Otherwise the two
-   columns sit at different heights and the row looks misaligned. */
+/* Both format controls, so they are one shape rather than two that happen to
+   be near each other. The input was once a styled box with a flat button
+   inside it, which put the hover highlight on the button and left it stopping
+   short of the box's border. */
 .cz-format-control {{
   min-height: 34px;
   padding: 0 12px;

@@ -286,19 +286,23 @@ fn build(app: &adw::Application) -> Rc<App> {
     let input_inner = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
     input_inner.append(&input_label);
     input_inner.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+
+    // Built exactly like the output control, because it is now the same kind
+    // of thing. It was a box carrying the field styling with a flat button
+    // inside it, from when the input could only be read: the hover highlight
+    // then belonged to the button and stopped short of the box's border, and
+    // the two controls were sized by different rules and came out different
+    // widths. One button, one set of metrics.
     let input_button = gtk::MenuButton::builder()
         .child(&input_inner)
         .hexpand(true)
         .build();
-    input_button.add_css_class("flat");
+    input_button.add_css_class("cz-format-control");
+    input_button.set_valign(gtk::Align::Center);
     input_button.set_tooltip_text(Some(
         "Detected from the file's contents. Click to read it as something else",
     ));
-    let input_field = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
-    input_field.add_css_class("cz-field");
-    input_field.add_css_class("cz-format-control");
-    input_field.set_valign(gtk::Align::Center);
-    input_field.append(&input_button);
+    let input_field = input_button.clone();
     let output_picker = format_picker::FormatPicker::new(format_picker::Direction::Write);
     let swap_btn = shell::icon_button("media-playlist-repeat-symbolic", "Swap formats");
     let output_info = format_picker::info_button({
@@ -1019,7 +1023,7 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
 fn build_convert_page(
     dropzone: &gtk::Box,
     queue_panel: &gtk::Box,
-    input_field: &gtk::Box,
+    input_field: &gtk::MenuButton,
     output_picker: &Rc<format_picker::FormatPicker>,
     swap_btn: &gtk::Button,
     output_info: &gtk::MenuButton,
@@ -2124,11 +2128,15 @@ fn select_file(ui: &Rc<App>, index: usize) {
             .as_ref()
             .map(|o| o.print.layer_count())
             .unwrap_or(0);
+        // Say how the format was arrived at, not just what it is. Read as
+        // "GOO (Automatically Detect)" the field answers both questions at
+        // once; a bare "GOO" left the menu's tick on "Detect automatically"
+        // looking like it disagreed with it.
         (
-            if f.format.is_empty() {
-                "—".to_string()
-            } else {
-                f.format.to_uppercase()
+            match (f.format.is_empty(), f.forced_format.is_some()) {
+                (true, _) => "—".to_string(),
+                (false, true) => f.format.to_uppercase(),
+                (false, false) => format!("{} (Automatically Detect)", f.format.to_uppercase()),
             },
             count,
             f.opened.is_some(),
