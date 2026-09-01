@@ -10,6 +10,7 @@ use crate::formats::ctb::CtbHandler;
 use crate::formats::goo::GooHandler;
 use crate::formats::phz::PhzHandler;
 use crate::formats::sl1::Sl1Handler;
+use crate::formats::uvj::UvjHandler;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -21,7 +22,8 @@ pub fn handlers() -> Vec<&'static dyn FormatHandler> {
     static GOO: GooHandler = GooHandler;
     static CTB: CtbHandler = CtbHandler;
     static PHZ: PhzHandler = PhzHandler;
-    vec![&SL1, &GOO, &CTB, &PHZ]
+    static UVJ: UvjHandler = UvjHandler;
+    vec![&SL1, &GOO, &CTB, &PHZ, &UVJ]
 }
 
 /// Handlers that can read, for the input format list.

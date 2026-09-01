@@ -85,6 +85,24 @@ independent code paths must produce the same image.
 | Negative layer height refused | `a_negative_layer_height_is_refused` |
 | Round trip preserves layers and settings | `an_sl1_survives_a_round_trip_through_our_own_writer` |
 
+### UVJ
+
+| What | Test |
+|---|---|
+| Detection by manifest, not by extension | `uvj.rs` |
+| A ZIP without a manifest is not claimed | `uvj.rs` |
+| **The round trip is exactly lossless** | `uvj.rs` |
+| Metadata survives a write and a read | `uvj.rs` |
+| Bottom layers get their own exposure | `uvj.rs` |
+| A manifest that is not JSON is refused clearly | `uvj.rs` |
+| A missing layer is reported, by open and by validate | `uvj.rs` |
+| UVJ to GOO, pixel for pixel | `uvj.rs` |
+| **A real file from UVtools** | `uvj.rs`, skipped without `CHEAPAZSLA_REAL_UVJ` |
+
+UVJ stores eight-bit PNGs, so unlike the binary formats a round trip through
+it must preserve values and not merely which pixels are lit. It is the
+strictest of these tables for that reason.
+
 ### PHZ
 
 | What | Test |

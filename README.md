@@ -163,6 +163,7 @@ time. The output is byte-identical apart from the timestamp in the header.
 | GOO reading and writing | done, verified against a real Elegoo file |
 | CTB reading and writing | done, verified against real files both ways |
 | PHZ reading and writing | done, verified against a real file from UVtools |
+| UVJ reading and writing | done, verified lossless against UVtools both ways |
 | Desktop interface | done |
 | Command line | done |
 | Packaging | not started |
@@ -211,6 +212,17 @@ times larger, and a cipher of the same shape with different constants. A real
 438 layer print converted to PHZ by UVtools reads here with the same lit-pixel
 counts as the source on every layer, and the same print written back out is
 read by UVtools and converts to SL1 with every lit pixel where it started.
+
+UVJ is the odd one out and useful for it. A ZIP of eight-bit greyscale PNGs
+and a JSON manifest, all of it published and none of it packed, so a file can
+be opened with an unzip tool and read without trusting any of this code. It is
+the only format here where a round trip must be *exactly* lossless rather than
+"the same pixels lit", and it is: a 438 layer print converted to UVJ by
+UVtools reads here with checksums identical to the source, and the same print
+written here, read by UVtools and converted back to SL1, comes out with the
+same checksums again. That makes it the thing to convert to when a print has
+gone wrong and nobody can say why, and a strict middle step for testing the
+formats that do round.
 
 A file from Chitubox itself would still be worth having, and the test for one
 is written and skips until it exists:

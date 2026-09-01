@@ -107,7 +107,7 @@ impl LayerProvider for Sl1Layers {
 ///
 /// PrusaSlicer writes 8-bit greyscale, but the decoder accepts the other
 /// colour types too rather than rejecting a file that is otherwise fine.
-fn decode_png_grey(bytes: &[u8], index: u32) -> Result<LayerImage> {
+pub(crate) fn decode_png_grey(bytes: &[u8], index: u32) -> Result<LayerImage> {
     let decoder = png::Decoder::new(bytes);
     let mut reader = decoder
         .read_info()

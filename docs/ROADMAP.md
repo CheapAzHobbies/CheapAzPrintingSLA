@@ -77,11 +77,8 @@ decodes every layer to greyscale, and it turns CheapAzSLA into something you
 can point at a file to find out what is actually in it. It is also the most
 useful thing possible when a print fails and nobody can say why.
 
-**UVJ**
-
-An open interchange format: a ZIP of PNG layers and a JSON manifest. Simple,
-documented, and the natural lossless intermediate. Valuable for testing as
-much as for users.
+**UVJ** — done. A ZIP of PNG layers and a JSON manifest, verified lossless
+against UVtools in both directions.
 
 **OSLA**
 
@@ -114,8 +111,11 @@ worth doing before someone has a printer that needs one.
 
 ### Deliberately not planned
 
-- **Encrypted CTB.** Working around a format's encryption to write files for
-  it is a different kind of project with a different set of questions attached.
+- **Encrypted CTB.** Reading it turned out to be in scope after all: the
+  obfuscation is a published XOR stream, versions 4 and 5 use it as a matter of
+  course, and refusing them would have meant refusing most real files. Writing
+  deliberately does not use it, since the slicer's own opt-out is to set the
+  key to zero.
 - **Anything that is not resin.** No FDM, no G-code. See the scope section of
   the README.
 

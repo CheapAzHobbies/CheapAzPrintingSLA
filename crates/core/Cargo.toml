@@ -15,6 +15,10 @@ thiserror.workspace = true
 log.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 png = "0.17"
+# Value-based, without the derive macros: the manifest is a handful of numbers
+# in a fixed shape, and a hand-rolled parser for untrusted input is exactly the
+# kind of thing that panics on a malformed file.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
