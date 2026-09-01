@@ -21,7 +21,7 @@ not a roadmap.
 |---|---|---|
 | 19 | CTB | Reading done and verified against real UVtools files, v3-v5. Writing implemented but not offered: UVtools rejects it, cause unknown. |
 | 20 | PHZ | Legacy Chitubox, closely related to CTB. |
-| 21 | Packaging | Flatpak, AppImage, deb, rpm, AUR. Nothing yet. |
+| 21 | Packaging | deb done, with dependencies read from the binary. Flatpak, AppImage, rpm, AUR not started. |
 | 22 | Final polish | Ongoing. |
 
 Smaller pieces of the specification still outstanding:

@@ -243,6 +243,33 @@ CHEAPAZSLA_REAL_SL1=/path/to/a/real.sl1 cargo test
 A converter that only reads files it wrote itself proves very little, so the
 suite is built to run against genuine slicer output.
 
+## Installing
+
+On Debian, Ubuntu, Mint and anything else that takes `.deb`:
+
+```bash
+tools/make-deb.sh
+sudo apt install ./target/cheapazsla_0.1.0_amd64.deb
+```
+
+The package declares what it needs rather than bundling it. GTK4 and
+libadwaita are in every distribution new enough to have them, and a bundled
+copy of a toolkit is a second one to keep patched. Its dependency list is not
+written by hand either: the script reads the binary's own `DT_NEEDED` entries
+and asks the package manager which package owns each, so the list cannot drift
+away from what the program actually links against.
+
+It also installs the MIME definitions, so a print file opens in CheapAzSLA
+when double-clicked, and refreshes the icon and desktop caches afterwards.
+
+Anywhere else, or to run from a working copy:
+
+```bash
+tools/install.sh          # into ~/.local, no root needed
+```
+
+Flatpak, AppImage, rpm and an AUR package are not done.
+
 ## Credits
 
 CheapAzSLA would not be possible without work other people did first and
