@@ -11,6 +11,13 @@ use std::rc::Rc;
 
 /// Long enough to read as the rail folding up, short enough not to be a wait.
 const COLLAPSE_MS: u32 = 340;
+/// How quickly the rail closes the distance to where it is heading: the gap
+/// left shrinks by about two thirds every tenth of a second, which settles in
+/// roughly the same time the fixed-duration version took.
+const RAIL_TAU: f64 = 0.11;
+/// The least the rail will move per second, so the last few pixels arrive
+/// rather than creeping.
+const RAIL_MIN_SPEED: f64 = 110.0;
 /// Labels and rail share one duration and start together, so unfolding is
 /// folding run backwards rather than its own arrangement. They used to differ,
 /// which is what made the two directions look unlike each other.
@@ -92,9 +99,13 @@ pub struct Shell {
     /// One per navigation label, plus the wordmark, so the rail folds up
     /// rather than snapping between two layouts.
     reveals: RefCell<Vec<gtk::Revealer>>,
-    /// Held so a second fold mid-animation replaces the first rather than
-    /// fighting it.
-    width_tick: RefCell<Option<gtk::TickCallbackId>>,
+    /// Runs while the rail is still moving. Held so the tick is not started
+    /// twice, and so it can retire itself when it arrives.
+    width_tick: Rc<RefCell<Option<gtk::TickCallbackId>>>,
+    /// Where the rail is heading, and where it has got to. Kept as a float so
+    /// small per-frame steps are not lost to rounding.
+    rail_target: Rc<Cell<f64>>,
+    rail_width: Rc<Cell<f64>>,
     /// Whether the labels should be showing, so a reveal held back for a
     /// moment does not fire into a rail that has folded again meanwhile.
     want_labels: Rc<Cell<bool>>,
@@ -200,7 +211,9 @@ impl Shell {
             on_change: RefCell::new(None),
             sidebar: sidebar.clone(),
             reveals: RefCell::new(vec![brand_reveal]),
-            width_tick: RefCell::new(None),
+            width_tick: Rc::new(RefCell::new(None)),
+            rail_target: Rc::new(Cell::new(theme::SIDEBAR_WIDTH as f64)),
+            rail_width: Rc::new(Cell::new(theme::SIDEBAR_WIDTH as f64)),
             want_labels: Rc::new(Cell::new(true)),
             about: RefCell::new(None),
             compact: Cell::new(false),
@@ -314,15 +327,11 @@ impl Shell {
         self.want_labels.set(!compact);
         self.slide_labels(!compact);
 
-        // From wherever it is now, not from the nominal width, so a toggle
-        // part way through the previous one carries on from there.
-        let from = self.sidebar.width_request().max(RAIL_WIDTH) as f64;
-        let to = if compact {
-            RAIL_WIDTH
+        self.set_rail_target(if compact {
+            RAIL_WIDTH as f64
         } else {
-            theme::SIDEBAR_WIDTH
-        } as f64;
-        self.animate_width(from, to);
+            theme::SIDEBAR_WIDTH as f64
+        });
     }
 
     /// Slide the labels in or out, once the rail is in a state to show it.
@@ -335,6 +344,8 @@ impl Shell {
     /// never comes, since a label in the wrong state is worse than one that
     /// arrived without sliding.
     ///
+    /// A revealer interpolates from wherever it currently is, so reversing
+    /// part way through needs nothing special here.
     fn slide_labels(&self, revealed: bool) {
         let reveals: Vec<gtk::Revealer> = self.reveals.borrow().clone();
         let want = self.want_labels.clone();
@@ -357,60 +368,78 @@ impl Shell {
         });
     }
 
-    /// Drive the rail's width from the window's frame clock.
+    /// Move the rail toward a width, and keep moving toward whatever the
+    /// width becomes.
     ///
-    /// This was an `AdwTimedAnimation` and looked right in isolation, but
-    /// libadwaita skips an animation whose widget is not mapped, and at the
-    /// moment a breakpoint fires during a window resize the sidebar reports
-    /// itself unmapped — realized, 207px wide, its window mapped, and still
-    /// unmapped. So the fold animated when it was triggered on its own and
-    /// jumped when it was triggered by dragging the window, which is the only
-    /// way anyone actually triggers it.
+    /// This was an animation from a start to an end over a fixed duration,
+    /// restarted whenever the target changed. Dragging an edge back and forth
+    /// across the step, that restarts the curve from a standstill several
+    /// times a second: the rail carried on the old way for a moment after the
+    /// window turned around, never reached either end, and hovered somewhere
+    /// in the middle — measured, it oscillated between 69 and 128 without ever
+    /// touching 63 or 151.
     ///
-    /// The window is mapped throughout, so its clock is what this runs on.
-    fn animate_width(&self, from: f64, to: f64) {
-        if let Some(id) = self.width_tick.borrow_mut().take() {
-            id.remove();
+    /// A target the rail chases instead has no start and nothing to restart.
+    /// Changing direction is a new target, and the next frame already moves
+    /// the other way.
+    fn set_rail_target(&self, to: f64) {
+        self.rail_target.set(to);
+        if self.width_tick.borrow().is_some() {
+            return;
         }
         let Some(root) = self.sidebar.root() else {
             self.sidebar.set_size_request(to as i32, -1);
             return;
         };
-        if (to - from).abs() < 1.0 {
-            self.sidebar.set_size_request(to as i32, -1);
-            return;
-        }
         let root: gtk::Widget = root.upcast();
         let sidebar = self.sidebar.clone();
         let stack = self.stack.clone();
-        let began = Cell::new(None::<i64>);
-        let span = (COLLAPSE_MS as i64) * 1000;
+        let target = self.rail_target.clone();
+        let width = self.rail_width.clone();
+        let tick = self.width_tick.clone();
+        let last = Cell::new(None::<i64>);
         let id = root.add_tick_callback(move |root, clock| {
             let now = clock.frame_time();
-            let start = match began.get() {
-                Some(t) => t,
-                None => {
-                    began.set(Some(now));
-                    now
-                }
+            // A long gap means the clock was not running, not that a long
+            // step is owed; clamp it so returning to the window does not
+            // teleport the rail.
+            let dt = match last.replace(Some(now)) {
+                Some(previous) => ((now - previous) as f64 / 1e6).clamp(0.0, 0.1),
+                None => 0.0,
             };
-            let t = ((now - start) as f64 / span as f64).clamp(0.0, 1.0);
-            // Ease out cubic: quick to leave, gentle to arrive.
-            let eased = 1.0 - (1.0 - t).powi(3);
-            let want = from + (to - from) * eased;
+
+            let want = target.get();
+            let mut next = width.get();
+            // Exponential approach: the distance left shrinks by the same
+            // proportion every second, whichever way it is going. Plus a floor
+            // on the speed, because on its own an exponential never quite
+            // arrives — the last dozen pixels crawled, and the rail sat a
+            // little short of folded for as long again as the fold had taken.
+            let remaining = want - next;
+            let step = remaining * (1.0 - (-dt / RAIL_TAU).exp());
+            let floor = RAIL_MIN_SPEED * dt;
+            next += if step.abs() < floor && remaining.abs() > floor {
+                floor * remaining.signum()
+            } else {
+                step
+            };
+            if (want - next).abs() < 0.5 || (want - next) * remaining < 0.0 {
+                next = want;
+            }
+            width.set(next);
 
             // Never wider than what is left once the workspace has what it
-            // needs. Dragging an edge quickly, the window can cross the step
-            // and keep going while the fold is still near its start, and the
-            // rail would sit at its full width over a window too narrow to
-            // hold it — everything squeezed, then a jump when the animation
-            // caught up, which reads as the fold having been skipped. Held to
-            // what fits, the rail simply folds as fast as the drag demands.
+            // needs. Dragging quickly, the window can cross the step and keep
+            // going while the rail is still near its old width, and it would
+            // sit too wide for the window to hold — everything squeezed, then
+            // a jump when it caught up.
             let (workspace, _, _, _) = stack.measure(gtk::Orientation::Horizontal, -1);
             let room = (root.width() - workspace).max(RAIL_WIDTH);
-            let width = want.min(room as f64).max(RAIL_WIDTH as f64);
-            sidebar.set_size_request(width.round() as i32, -1);
-            if t >= 1.0 {
+            let drawn = next.min(room as f64).max(RAIL_WIDTH as f64);
+            sidebar.set_size_request(drawn.round() as i32, -1);
+
+            if next == want {
+                *tick.borrow_mut() = None;
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue

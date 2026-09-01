@@ -500,20 +500,27 @@ fn debug_fold(window: &adw::ApplicationWindow) {
             w.unmaximize();
             let w = w.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                for step in 0..60u64 {
+                for step in 0..84u64 {
                     let w = w.clone();
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(400 + 30 * step),
                         move || {
-                            // Walk in slowly, settle back out, then walk in
-                            // again seven times as fast: the fold behaves
-                            // differently when the window outruns it.
+                            // Three phases. Walk in slowly; settle back out
+                            // and walk in seven times as fast, since the fold
+                            // behaves differently when the window outruns it;
+                            // then cross the step back and forth every few
+                            // frames, which is what catches a fold that
+                            // restarts instead of reversing.
                             let width = if step < 30 {
                                 830 - (step as i32 * 6)
-                            } else if step < 48 {
+                            } else if step < 44 {
+                                830
+                            } else if step < 52 {
+                                (830 - ((step as i32 - 44) * 140)).max(410)
+                            } else if (step - 52) % 8 < 4 {
                                 830
                             } else {
-                                (830 - ((step as i32 - 48) * 140)).max(410)
+                                700
                             };
                             w.set_default_size(width, 700);
                             let (rail, brand, label) = fold_parts(&w);

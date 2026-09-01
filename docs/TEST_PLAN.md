@@ -253,7 +253,11 @@ triggered any other way:
 
 For the fold, the numbers should descend and climb evenly. A repeated value is
 a stall, a large gap is a jump, and the two directions should read as reverses
-of each other. libadwaita also warns on stderr when the content is wider than
+of each other. It walks the window in three ways — slowly, faster than the
+fold settles, and back and forth across the step every few frames — because
+the fold has been wrong in a different way under each. In the last of those
+the rail will not reach either end, which is correct; what matters is that it
+changes direction on the next frame rather than carrying on the old way. libadwaita also warns on stderr when the content is wider than
 the window it was given, which is the fastest signal that a minimum has
 regressed.
 
