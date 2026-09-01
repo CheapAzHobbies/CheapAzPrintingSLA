@@ -134,6 +134,18 @@ impl Shell {
             .propagate_natural_width(false)
             .child(&content)
             .build();
+        // A scrolled window scrolls, and this one is only ever meant to clip.
+        // Left to itself it scrolled sideways to keep the focused navigation
+        // button in view as the rail narrowed, then unwound that as the rail
+        // opened again — which is the whole rail's contents sliding left and
+        // rubber-banding back, icons and all, on every expand.
+        sidebar.set_kinetic_scrolling(false);
+        let hadj = sidebar.hadjustment();
+        hadj.connect_value_changed(|a| {
+            if a.value() != 0.0 {
+                a.set_value(0.0);
+            }
+        });
         // On the clip rather than the contents, so the rail's right-hand
         // border stays at the rail's edge instead of being clipped away.
         sidebar.add_css_class("cz-sidebar");

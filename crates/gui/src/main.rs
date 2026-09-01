@@ -508,7 +508,7 @@ fn debug_fold(window: &adw::ApplicationWindow) {
                             };
                             w.set_default_size(width, 700);
                             let (rail, brand, label) = fold_parts(&w);
-                            eprintln!("fold {width} rail {rail} wordmark {brand} label {label}");
+                            eprintln!("fold {width} rail {rail} icon_x {brand} label_x {label}");
                         },
                     );
                 }
@@ -517,8 +517,11 @@ fn debug_fold(window: &adw::ApplicationWindow) {
     });
 }
 
-/// The rail's drawn width, the wordmark's drawn height and the first
-/// navigation label's drawn width.
+/// The rail's drawn width, and where the first navigation row's icon and
+/// label sit inside it.
+///
+/// The icon's position is the useful one: it should never move. When it does,
+/// the whole rail is sliding rather than the labels animating within it.
 fn fold_parts(window: &adw::ApplicationWindow) -> (i32, i32, i32) {
     fn find(w: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
         if w.has_css_class(class) {
@@ -541,15 +544,30 @@ fn fold_parts(window: &adw::ApplicationWindow) -> (i32, i32, i32) {
         .first_child()
         .and_then(|vp| vp.first_child())
         .unwrap_or_else(|| rail.clone());
-    let brand = content.first_child().map(|b| b.height()).unwrap_or(-1);
+    // The label inside the revealer, not the revealer: a label that is being
+    // re-ellipsized as its box grows shifts around inside it, which reads as
+    // the text rubber-banding into place.
     let label = content
         .first_child()
         .and_then(|b| b.next_sibling())
         .and_then(|btn| btn.first_child())
         .and_then(|row| row.last_child())
-        .map(|r| r.width())
+        .and_then(|rev| rev.first_child())
+        .and_then(|l| l.compute_bounds(&rail))
+        .map(|b| b.x().round() as i32)
         .unwrap_or(-1);
-    (rail.width(), brand, label)
+    // The icon's position too: if it moves, the whole rail is scrolling
+    // rather than the label sliding inside its row.
+    let icon = content
+        .first_child()
+        .and_then(|b| b.next_sibling())
+        .and_then(|btn| btn.first_child())
+        .and_then(|row| row.first_child())
+        .and_then(|marker| marker.next_sibling())
+        .and_then(|img| img.compute_bounds(&rail))
+        .map(|b| b.x().round() as i32)
+        .unwrap_or(-1);
+    (rail.width(), icon, label)
 }
 
 /// Report what is holding the window open, widest branch first.
