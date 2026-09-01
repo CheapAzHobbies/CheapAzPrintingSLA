@@ -20,7 +20,7 @@ not a roadmap.
 | Phase | | Notes |
 |---|---|---|
 | 19 | CTB | Done. Reading verified against real UVtools files v3-v5; writing verified by UVtools reading it back at every real printer resolution. |
-| 20 | PHZ | Legacy Chitubox, closely related to CTB. |
+| 20 | PHZ | Done. Read and written, verified against a real file from UVtools. |
 | 21 | Packaging | deb done, with dependencies read from the binary. Flatpak, AppImage, rpm, AUR not started. |
 | 22 | Final polish | Ongoing. |
 

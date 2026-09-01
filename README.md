@@ -162,7 +162,7 @@ time. The output is byte-identical apart from the timestamp in the header.
 | SL1 writing | not started |
 | GOO reading and writing | done, verified against a real Elegoo file |
 | CTB reading and writing | done, verified against real files both ways |
-| PHZ | not started |
+| PHZ reading and writing | done, verified against a real file from UVtools |
 | Desktop interface | done |
 | Command line | done |
 | Packaging | not started |
@@ -203,6 +203,14 @@ Two synthetic sizes are still refused by UVtools — 112x56 and 128x64, four
 layers — and refused identically whoever wrote them. No printer has a panel
 that size and no slicer produces one, so it is recorded here rather than
 worked around.
+
+PHZ went the same way and was quicker for it. Chitubox's older format: one
+216 byte header instead of CTB's three scattered records, the same preview
+encoding and layer table, a simpler run-length scheme that makes files several
+times larger, and a cipher of the same shape with different constants. A real
+438 layer print converted to PHZ by UVtools reads here with the same lit-pixel
+counts as the source on every layer, and the same print written back out is
+read by UVtools and converts to SL1 with every lit pixel where it started.
 
 A file from Chitubox itself would still be worth having, and the test for one
 is written and skips until it exists:

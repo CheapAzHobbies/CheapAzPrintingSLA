@@ -85,6 +85,21 @@ independent code paths must produce the same image.
 | Negative layer height refused | `a_negative_layer_height_is_refused` |
 | Round trip preserves layers and settings | `an_sl1_survives_a_round_trip_through_our_own_writer` |
 
+### PHZ
+
+| What | Test |
+|---|---|
+| Detection by magic and version | `phz.rs` |
+| Metadata and pixels survive a write and a read | `phz.rs` |
+| Run-length codec, including the documented examples | `phz_rle.rs` |
+| Repeat counts stay within what the printer is given | `phz_rle.rs` |
+| Runs stop at each half scanline | `phz_rle.rs` |
+| Layer cipher against independently computed keystream | `phz.rs` |
+| Weak keys leave the data alone | `phz.rs` |
+| Truncated, over-large and out-of-bounds files | `phz.rs` |
+| PHZ to GOO, pixel for pixel | `phz.rs` |
+| **A real file from UVtools** | `phz.rs`, skipped without `CHEAPAZSLA_REAL_PHZ` |
+
 ### CTB
 
 | What | Test |

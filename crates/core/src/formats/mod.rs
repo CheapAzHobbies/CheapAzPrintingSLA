@@ -6,4 +6,6 @@ pub mod ctb_rle;
 pub mod goo;
 pub mod goo_rle;
 pub mod ini;
+pub mod phz;
+pub mod phz_rle;
 pub mod sl1;
