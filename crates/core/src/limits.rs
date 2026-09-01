@@ -54,6 +54,23 @@ pub fn check_range(offset: u64, length: u64, file_size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Check that a thumbnail's dimensions are plausible.
+///
+/// A preview is decoration; a file claiming a billion-pixel one is either
+/// broken or trying to make the reader allocate for it.
+pub fn check_thumbnail(width: u32, height: u32) -> Result<()> {
+    let pixels = width as u64 * height as u64;
+    if pixels > MAX_THUMBNAIL_PIXELS {
+        return Err(FormatError::InvalidValue {
+            field: "preview size".into(),
+            value: format!("{width}x{height}"),
+            reason: format!("more than the {MAX_THUMBNAIL_PIXELS} pixel limit for a preview"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Check that a resolution is plausible and will not overflow when multiplied.
 pub fn check_resolution(width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {

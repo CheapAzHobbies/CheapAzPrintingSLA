@@ -14,17 +14,17 @@
 //! stream, described below. Handling it is what lets this read files people
 //! actually have rather than only ones written by other open tools.
 //!
-//! Writing is deliberately not implemented. A reader can be checked against a
-//! file Chitubox produced; a writer can only really be checked by a printer,
-//! and writing before the reader is confirmed would be guessing twice over.
+//! Writing produces version 3 with the layer data in the clear. The cipher is
+//! optional — the proprietary slicer turns it off simply by setting the key to
+//! zero — and a file nobody has to decipher is the easier one to trust.
 
-use super::ctb_rle;
+use super::{ctb_preview, ctb_rle};
 use crate::error::{Error, FormatError, Result};
 use crate::format::{Capabilities, Confidence, Detection, FormatHandler, FormatInfo, OpenedFile};
 use crate::layers::LayerProvider;
 use crate::limits;
 use crate::model::*;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const ID: &str = "ctb";
@@ -38,6 +38,13 @@ const MAX_VERSION: u32 = 4;
 
 /// Size of one entry in the layer table.
 const LAYER_ENTRY: u64 = 36;
+/// Size of the record in front of each preview image.
+const IMAGE_HEADER: usize = 0x20;
+/// Sizes of the two extension blocks, taken from files in the wild rather than
+/// from how much of them this reads: a printer that expects a block of a given
+/// size should get one.
+const EXT_CONFIG_BYTES: usize = 0x3C;
+const EXT2_BYTES: usize = 0x4C;
 
 static INFO: FormatInfo = FormatInfo {
     id: ID,
@@ -48,12 +55,12 @@ static INFO: FormatInfo = FormatInfo {
                   read. Layer images are run-length encoded with seven bits of grey per pixel.",
     limitations: &[
         "Stores seven bits of grey per pixel, so an eight-bit image loses its lowest bit",
-        "Reading only for now: CheapAzSLA cannot write CTB",
+        "Stores two preview images, at 400x300 and 200x125",
         "Not yet checked against a file produced by Chitubox itself",
     ],
     capabilities: Capabilities {
         reads: true,
-        writes: false,
+        writes: true,
         per_layer_exposure: true,
         per_layer_lift: true,
         thumbnails: true,
@@ -92,6 +99,18 @@ struct Header {
     encryption_key: u32,
     slicer_offset: u32,
     slicer_size: u32,
+}
+
+fn put_u16(b: &mut [u8], at: usize, v: u16) {
+    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_f32(b: &mut [u8], at: usize, v: f32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 fn le_u16(b: &[u8], at: usize) -> u16 {
@@ -177,10 +196,12 @@ struct PrintParams {
 }
 
 impl PrintParams {
-    const BYTES: usize = 0x28;
+    /// How much of the block this reads. The block itself is longer; the rest
+    /// is padding as far as anyone has established.
+    const READS: usize = 0x28;
 
     fn parse(b: &[u8]) -> Self {
-        if b.len() < Self::BYTES {
+        if b.len() < Self::READS {
             return Self::default();
         }
         Self {
@@ -439,6 +460,21 @@ impl FormatHandler for CtbHandler {
             entries.push((e.data_offset, e.data_size));
         }
 
+        // Both previews, when the file has them. A preview that will not
+        // decode is dropped rather than failing the open: it is a picture, and
+        // losing it should not cost somebody their layers.
+        let mut thumbnails = Vec::new();
+        for at in [header.preview_large_offset, header.preview_small_offset] {
+            if at == 0 {
+                continue;
+            }
+            match read_preview(&mut file, path, at as u64, size) {
+                Ok(Some(t)) => thumbnails.push(t),
+                Ok(None) => {}
+                Err(e) => log::debug!("ctb: preview at {at} ignored: {e}"),
+            }
+        }
+
         let mut extra = std::collections::BTreeMap::new();
         extra.insert("ctb_version".into(), header.version.to_string());
         if header.slicer_offset != 0 && header.slicer_size != 0 {
@@ -478,10 +514,7 @@ impl FormatHandler for CtbHandler {
                 bottom_retract_speed_mm_min: positive(params.retract_speed),
             },
             layers,
-            // The two previews are RGB565 and are not decoded yet; see the
-            // roadmap. They are recorded as present so a conversion can say it
-            // is dropping them.
-            thumbnails: Vec::new(),
+            thumbnails,
             print_time_s: (header.print_time_s > 0).then_some(header.print_time_s as u64),
             material_volume_ml: positive(params.volume_ml),
             material_grams: positive(params.weight_g),
@@ -489,8 +522,6 @@ impl FormatHandler for CtbHandler {
             machine_name: None,
             extra,
         };
-
-        let _ = (header.preview_large_offset, header.preview_small_offset);
 
         Ok(OpenedFile {
             print,
@@ -504,12 +535,241 @@ impl FormatHandler for CtbHandler {
         })
     }
 
-    fn write(&self, _path: &Path, _print: &PrintFile, _layers: &dyn LayerProvider) -> Result<()> {
-        Err(
-            FormatError::Other("CheapAzSLA cannot write CTB yet; it can only read it".into())
-                .into(),
-        )
+    fn write(&self, path: &Path, print: &PrintFile, layers: &dyn LayerProvider) -> Result<()> {
+        let count = layers.layer_count();
+        if count == 0 {
+            return Err(FormatError::Other("there are no layers to write".into()).into());
+        }
+        limits::check_layer_count(count as u64)?;
+        let (w, h) = layers.dimensions();
+        limits::check_resolution(w, h)?;
+
+        let e = &print.exposure;
+        let l = &print.lift;
+        let bottom_layers = e.bottom_layers.unwrap_or(0);
+
+        // Everything but the layer bitmaps is small, so it is laid out in
+        // memory first and the offsets computed from the sizes. The bitmaps
+        // are streamed afterwards, since a print can be gigabytes of them.
+        let big = ctb_preview::encode(
+            &ctb_preview::fit(
+                print.thumbnails.iter().max_by_key(|t| t.pixel_count()),
+                ctb_preview::LARGE.0,
+                ctb_preview::LARGE.1,
+            ),
+            ctb_preview::LARGE.0,
+            ctb_preview::LARGE.1,
+        );
+        let small = ctb_preview::encode(
+            &ctb_preview::fit(
+                print.thumbnails.iter().min_by_key(|t| t.pixel_count()),
+                ctb_preview::SMALL.0,
+                ctb_preview::SMALL.1,
+            ),
+            ctb_preview::SMALL.0,
+            ctb_preview::SMALL.1,
+        );
+
+        let params_at = HEADER_BYTES;
+        let ext2_at = params_at + EXT_CONFIG_BYTES;
+        let big_head_at = ext2_at + EXT2_BYTES;
+        let big_data_at = big_head_at + IMAGE_HEADER;
+        let small_head_at = big_data_at + big.len();
+        let small_data_at = small_head_at + IMAGE_HEADER;
+        let table_at = small_data_at + small.len();
+        let layers_at = table_at + count as usize * LAYER_ENTRY as usize;
+
+        let mut head = vec![0u8; HEADER_BYTES];
+        put_u32(&mut head, 0x00, MAGIC);
+        put_u32(&mut head, 0x04, 3);
+        put_f32(
+            &mut head,
+            0x08,
+            print.geometry.display_width_mm.unwrap_or(0.0),
+        );
+        put_f32(
+            &mut head,
+            0x0C,
+            print.geometry.display_height_mm.unwrap_or(0.0),
+        );
+        put_f32(&mut head, 0x10, print.geometry.machine_z_mm.unwrap_or(0.0));
+        put_f32(&mut head, 0x1C, print.height_mm().unwrap_or(0.0));
+        put_f32(&mut head, 0x20, e.layer_height_mm);
+        put_f32(&mut head, 0x24, e.exposure_s);
+        put_f32(&mut head, 0x28, e.bottom_exposure_s.unwrap_or(e.exposure_s));
+        put_f32(&mut head, 0x2C, e.light_off_delay_s.unwrap_or(0.0));
+        put_u32(&mut head, 0x30, bottom_layers);
+        put_u32(&mut head, 0x34, w);
+        put_u32(&mut head, 0x38, h);
+        put_u32(&mut head, 0x3C, big_head_at as u32);
+        put_u32(&mut head, 0x40, table_at as u32);
+        put_u32(&mut head, 0x44, count);
+        put_u32(&mut head, 0x48, small_head_at as u32);
+        put_u32(&mut head, 0x4C, print.print_time_s.unwrap_or(0) as u32);
+        put_u32(&mut head, 0x50, 1); // projection: normal rather than mirrored
+        put_u32(&mut head, 0x54, params_at as u32);
+        put_u32(&mut head, 0x58, EXT_CONFIG_BYTES as u32);
+        put_u32(&mut head, 0x5C, 1); // anti-alias level
+        put_u16(&mut head, 0x60, e.light_pwm.unwrap_or(255) as u16);
+        put_u16(&mut head, 0x62, e.bottom_light_pwm.unwrap_or(255) as u16);
+        put_u32(&mut head, 0x64, 0); // no cipher: the slicer's own opt-out
+        put_u32(&mut head, 0x68, ext2_at as u32);
+        put_u32(&mut head, 0x6C, EXT2_BYTES as u32);
+
+        let mut params = vec![0u8; EXT_CONFIG_BYTES];
+        put_f32(&mut params, 0x00, l.bottom_lift_height_mm.unwrap_or(0.0));
+        put_f32(&mut params, 0x04, l.bottom_lift_speed_mm_min.unwrap_or(0.0));
+        put_f32(&mut params, 0x08, l.lift_height_mm.unwrap_or(0.0));
+        put_f32(&mut params, 0x0C, l.lift_speed_mm_min.unwrap_or(0.0));
+        put_f32(&mut params, 0x10, l.retract_speed_mm_min.unwrap_or(0.0));
+        put_f32(&mut params, 0x14, print.material_volume_ml.unwrap_or(0.0));
+        put_f32(&mut params, 0x18, print.material_grams.unwrap_or(0.0));
+        put_f32(&mut params, 0x20, e.bottom_light_off_delay_s.unwrap_or(0.0));
+        put_f32(&mut params, 0x24, e.light_off_delay_s.unwrap_or(0.0));
+        put_u32(&mut params, 0x28, bottom_layers);
+
+        let mut ext2 = vec![0u8; EXT2_BYTES];
+        put_u32(&mut ext2, 0x24, 0); // encryption mode: none
+        put_u32(&mut ext2, 0x2C, 1); // anti-alias level
+
+        let image_head = |w: u32, h: u32, at: usize, len: usize| {
+            let mut b = vec![0u8; IMAGE_HEADER];
+            put_u32(&mut b, 0x00, w);
+            put_u32(&mut b, 0x04, h);
+            put_u32(&mut b, 0x08, at as u32);
+            put_u32(&mut b, 0x0C, len as u32);
+            b
+        };
+
+        let file = std::fs::File::create(path).map_err(|e| Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let mut out = std::io::BufWriter::new(file);
+        let io = |e: std::io::Error| Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        };
+        out.write_all(&head).map_err(io)?;
+        out.write_all(&params).map_err(io)?;
+        out.write_all(&ext2).map_err(io)?;
+        out.write_all(&image_head(
+            ctb_preview::LARGE.0,
+            ctb_preview::LARGE.1,
+            big_data_at,
+            big.len(),
+        ))
+        .map_err(io)?;
+        out.write_all(&big).map_err(io)?;
+        out.write_all(&image_head(
+            ctb_preview::SMALL.0,
+            ctb_preview::SMALL.1,
+            small_data_at,
+            small.len(),
+        ))
+        .map_err(io)?;
+        out.write_all(&small).map_err(io)?;
+
+        // Reserve the layer table before the bitmaps rather than seeking past
+        // it. The table's entries can only be written once every payload's
+        // length is known, but the space has to exist first: without it the
+        // bitmaps start where the table belongs, every offset in the table is
+        // one table too far along, and writing the table at the end lands on
+        // top of the first layers.
+        let mut table = vec![0u8; count as usize * LAYER_ENTRY as usize];
+        out.write_all(&table).map_err(io)?;
+
+        // Encoding is the whole cost and every layer is independent, so it runs
+        // on a pool while a single writer keeps the file in order.
+        let expected_pixels = w as u64 * h as u64;
+        let workers = crate::pipeline::workers_for(expected_pixels);
+        let mut at = layers_at;
+        crate::pipeline::in_order(
+            count,
+            workers,
+            |index| {
+                let img = layers.layer(index)?;
+                if img.width != w || img.height != h {
+                    return Err(FormatError::Other(format!(
+                        "layer {index} is {}x{} but the print is {w}x{h}",
+                        img.width, img.height
+                    ))
+                    .into());
+                }
+                let (payload, covered) = ctb_rle::encode(&img.pixels);
+                // Every pixel must be accounted for. A short layer leaves
+                // whatever the printer had in its buffer on the screen.
+                if covered != expected_pixels {
+                    return Err(FormatError::Other(format!(
+                        "layer {index} encoded {covered} pixels but the panel needs \
+                         {expected_pixels}"
+                    ))
+                    .into());
+                }
+                Ok(payload)
+            },
+            |index, payload| {
+                let z = print
+                    .layers
+                    .get(index as usize)
+                    .map(|l| l.z_mm)
+                    .unwrap_or_else(|| e.layer_height_mm * (index + 1) as f32);
+                let exposure = print.effective_exposure_s(index).unwrap_or(e.exposure_s);
+                let off = print
+                    .layers
+                    .get(index as usize)
+                    .and_then(|l| l.light_off_delay_s)
+                    .or(e.light_off_delay_s)
+                    .unwrap_or(0.0);
+                let entry = index as usize * LAYER_ENTRY as usize;
+                put_f32(&mut table, entry, z);
+                put_f32(&mut table, entry + 0x04, exposure);
+                put_f32(&mut table, entry + 0x08, off);
+                put_u32(&mut table, entry + 0x0C, at as u32);
+                put_u32(&mut table, entry + 0x10, payload.len() as u32);
+                at += payload.len();
+                out.write_all(&payload).map_err(io)
+            },
+        )?;
+
+        // The table sits in front of the bitmaps, so it can only be filled in
+        // once their lengths are known.
+        out.flush().map_err(io)?;
+        let mut file = out.into_inner().map_err(|e| Error::Io {
+            path: path.to_path_buf(),
+            source: e.into_error(),
+        })?;
+        file.seek(SeekFrom::Start(table_at as u64)).map_err(io)?;
+        file.write_all(&table).map_err(io)?;
+        file.flush().map_err(io)?;
+        Ok(())
     }
+}
+
+/// Read one preview: a small header, then the encoded pixels.
+fn read_preview(
+    file: &mut std::fs::File,
+    path: &Path,
+    at: u64,
+    size: u64,
+) -> Result<Option<Thumbnail>> {
+    limits::check_range(at, IMAGE_HEADER as u64, size)?;
+    let head = read_at(file, path, at, IMAGE_HEADER)?;
+    let (w, h) = (le_u32(&head, 0x00), le_u32(&head, 0x04));
+    let (offset, length) = (le_u32(&head, 0x08), le_u32(&head, 0x0C));
+    if w == 0 || h == 0 || length == 0 {
+        return Ok(None);
+    }
+    limits::check_thumbnail(w, h)?;
+    limits::check_range(offset as u64, length as u64, size)?;
+    let want = limits::check_allocation(length as u64)?;
+    let data = read_at(file, path, offset as u64, want)?;
+    let rgb = ctb_preview::decode(&data, (w * h) as usize)?;
+    Ok(Some(Thumbnail {
+        width: w,
+        height: h,
+        rgb,
+    }))
 }
 
 /// Undo the keyed XOR stream Chitubox puts over layer data.

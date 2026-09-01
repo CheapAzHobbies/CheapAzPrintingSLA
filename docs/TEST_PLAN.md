@@ -99,6 +99,9 @@ independent code paths must produce the same image.
 | Encrypted files refused, not misread | `ctb.rs` |
 | CTB to GOO, pixel for pixel | `ctb.rs` |
 | Files written by catibo, metadata and every pixel | `ctb_reference.rs` |
+| A file written here, rewritten and unchanged | `ctb_reference.rs` |
+| A written file's offsets all land inside it | `ctb_reference.rs` |
+| Preview images, both documented sizes | `ctb_preview.rs` |
 | The same, obfuscated with the layer cipher | `ctb_reference.rs` |
 | Layer cipher against independently computed keystream | `ctb.rs` |
 | **A file Chitubox produced** | `ctb.rs`, skipped without `CHEAPAZSLA_REAL_CTB` |

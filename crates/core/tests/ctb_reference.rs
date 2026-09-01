@@ -149,3 +149,82 @@ fn a_reference_file_converts_to_goo_pixel_for_pixel() {
         );
     }
 }
+
+/// Written by CheapAzSLA, read back by CheapAzSLA, starting from a file
+/// written by somebody else.
+///
+/// The pixels have to survive being decoded from catibo's encoding, re-encoded
+/// here and decoded again. Anything wrong in the writer that the reader does
+/// not make the matching mistake in shows up as a changed pixel; anything
+/// wrong in both would still have to survive the file catibo wrote.
+#[test]
+fn a_reference_file_rewritten_as_ctb_keeps_every_pixel() {
+    use cheapazsla_core::convert;
+
+    let src = fixture("catibo-plain.ctb");
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("rewritten.ctb");
+    let plan = convert::plan(&src, "ctb", &dst).expect("plan");
+    convert::run(&plan).expect("convert");
+
+    let before = registry::open(&src).expect("open source");
+    let after = registry::open(&dst).expect("open rewritten");
+    assert_eq!(after.print.layer_count(), before.print.layer_count());
+    assert_eq!(after.layers.dimensions(), before.layers.dimensions());
+    assert_eq!(after.print.geometry.resolution_x, WIDTH);
+
+    for i in 0..4u32 {
+        assert_eq!(
+            after.layers.layer(i).unwrap().pixels,
+            expected_layer(i),
+            "layer {i} changed on the way through CTB"
+        );
+    }
+
+    // The previews must survive too, since writing them is new.
+    assert_eq!(
+        after.print.thumbnails.len(),
+        2,
+        "a written CTB carries both previews"
+    );
+    for t in &after.print.thumbnails {
+        assert!(t.width > 0 && t.height > 0);
+        assert_eq!(t.rgb.len(), (t.width * t.height * 3) as usize);
+    }
+}
+
+/// A written file has to satisfy the checks that rejected the broken ones.
+#[test]
+fn a_written_file_points_everywhere_it_says_it_does() {
+    use cheapazsla_core::convert;
+    use cheapazsla_core::registry;
+
+    let src = fixture("catibo-encrypted.ctb");
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("out.ctb");
+    let plan = convert::plan(&src, "ctb", &dst).expect("plan");
+    convert::run(&plan).expect("convert");
+
+    let handler = registry::by_id("ctb").expect("registered");
+    let notes = handler.validate(&dst).expect("validate");
+    assert!(
+        notes.is_empty(),
+        "a file we wrote should validate: {notes:?}"
+    );
+
+    // And the layer table must not sit on top of the layer data, which is
+    // exactly what happened when its space was not reserved before writing.
+    let bytes = std::fs::read(&dst).unwrap();
+    let at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+    let (table, count) = (at(0x40), at(0x44));
+    let first_data = at(table + 0x0C);
+    assert!(
+        first_data >= table + count * 36,
+        "layer data starts at {first_data}, inside the table at {table} of {count} entries"
+    );
+    let last = table + (count - 1) * 36;
+    assert!(
+        at(last + 0x0C) + at(last + 0x10) <= bytes.len(),
+        "the last layer runs off the end of the file"
+    );
+}

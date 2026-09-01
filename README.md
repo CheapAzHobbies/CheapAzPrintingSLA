@@ -161,8 +161,8 @@ time. The output is byte-identical apart from the timestamp in the header.
 | SL1 reading | done, tested against real slicer output |
 | SL1 writing | not started |
 | GOO reading and writing | done, verified against a real Elegoo file |
-| CTB reading | done, checked against another implementation's files |
-| CTB writing, PHZ | not started |
+| CTB reading and writing | done, checked both ways against another implementation |
+| PHZ | not started |
 | Desktop interface | done |
 | Command line | done |
 | Packaging | not started |
@@ -182,6 +182,18 @@ every metadata field and every pixel of every layer, in both a plain file and
 one with the layer data obfuscated the way Chitubox does it. Header offsets,
 run-length encoding and cipher would all have to be right for those to pass,
 and they were not written by looking at this code.
+
+Writing was checked the other way round, by having catibo read a file written
+here: an SL1 of 438 layers at 11520x5120 converted to CTB, then decoded by
+catibo, layer by layer. Its reader accounts for every pixel of every layer, and
+the counts agree with the source.
+
+They agree exactly on any value the two readers widen the same way. catibo maps
+the stored seven-bit grey by masking off its lowest bit and scaling the other
+six; this maps all seven, which is what the format description says the field
+is. The bytes written are the same either way, and on the layers of the
+reference file where every pixel is an even value the two readings are
+identical to the pixel.
 
 That is good evidence, not proof: catibo is not Chitubox. A file from Chitubox
 itself remains the last word, and the test for it is written and skips until

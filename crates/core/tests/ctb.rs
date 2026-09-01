@@ -309,12 +309,72 @@ fn a_zero_resolution_is_refused() {
 }
 
 #[test]
-fn writing_ctb_says_plainly_that_it_cannot() {
-    // The capability flag says false, so nothing should offer it. If something
-    // calls it anyway, the message has to explain rather than corrupt a file.
+fn ctb_is_offered_for_both_reading_and_writing() {
     let info = registry::by_id("ctb").expect("registered").info();
     assert!(info.capabilities.reads);
-    assert!(!info.capabilities.writes, "CTB writing is not implemented");
+    assert!(info.capabilities.writes);
+}
+
+#[test]
+fn a_written_ctb_reads_back_with_the_same_metadata_and_pixels() {
+    use cheapazsla_core::convert;
+
+    let mut builder = Builder {
+        width: 32,
+        height: 16,
+        ..Default::default()
+    };
+    builder.layers = vec![
+        vec![0u8; 32 * 16],
+        vec![254u8; 32 * 16],
+        (0..32 * 16).map(|i| ((i * 3) % 256) as u8).collect(),
+    ];
+    let (_d, src) = builder.write();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("out.ctb");
+    let plan = convert::plan(&src, "ctb", &dst).expect("plan");
+    convert::run(&plan).expect("convert");
+
+    let before = registry::open(&src).expect("open source");
+    let after = registry::open(&dst).expect("open written");
+
+    assert_eq!(after.print.geometry.resolution_x, 32);
+    assert_eq!(after.print.geometry.resolution_y, 16);
+    assert_eq!(after.print.exposure.layer_height_mm, 0.05);
+    assert_eq!(after.print.exposure.exposure_s, 2.5);
+    assert_eq!(after.print.exposure.bottom_exposure_s, Some(30.0));
+    assert_eq!(after.print.exposure.bottom_layers, Some(1));
+    assert_eq!(after.print.lift.lift_height_mm, Some(6.0));
+    assert_eq!(after.print.print_time_s, Some(4321));
+    assert_eq!(after.print.layer_count(), before.print.layer_count());
+
+    for i in 0..before.print.layer_count() {
+        assert_eq!(
+            after.layers.layer(i).unwrap().pixels,
+            before.layers.layer(i).unwrap().pixels,
+            "layer {i} changed through a write and read"
+        );
+    }
+}
+
+#[test]
+fn writing_no_layers_is_refused() {
+    // Nothing should call this, but a zero-layer file would be a file the
+    // printer cannot do anything with.
+    use cheapazsla_core::layers::InMemoryLayers;
+
+    // Reuse a real file's metadata rather than inventing one; only the layers
+    // are the point here.
+    let (_d, src) = Builder::default().write();
+    let print = registry::open(&src).expect("open").print;
+    let handler = registry::by_id("ctb").expect("registered");
+    let dir = tempfile::tempdir().unwrap();
+    let empty = InMemoryLayers::new(Vec::new(), 16, 16);
+    let err = handler
+        .write(&dir.path().join("empty.ctb"), &print, &empty)
+        .expect_err("must refuse");
+    assert!(err.to_string().contains("no layers"), "{err}");
 }
 
 #[test]

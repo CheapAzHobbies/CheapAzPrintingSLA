@@ -20,6 +20,11 @@ use crate::error::{FormatError, Result};
 
 /// Seven-bit grey to eight. 0x7F must come back as 0xFF or white would decode
 /// slightly grey and every layer would be a shade off.
+///
+/// All seven bits are used. catibo masks the lowest one away and scales the
+/// remaining six, which is why its reader and this one differ by a bit or two
+/// on odd values — the stored bytes are identical either way, and the spec
+/// describes the field as 0 to 127.
 #[inline]
 fn expand(seven: u8) -> u8 {
     (seven << 1) | (seven >> 6)

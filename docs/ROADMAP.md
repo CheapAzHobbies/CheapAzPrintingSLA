@@ -19,7 +19,7 @@ not a roadmap.
 
 | Phase | | Notes |
 |---|---|---|
-| 19 | CTB | Reading done, checked against catibo's files. Writing not started. |
+| 19 | CTB | Reading and writing done, cross-checked against catibo both ways. |
 | 20 | PHZ | Legacy Chitubox, closely related to CTB. |
 | 21 | Packaging | Flatpak, AppImage, deb, rpm, AUR. Nothing yet. |
 | 22 | Final polish | Ongoing. |
