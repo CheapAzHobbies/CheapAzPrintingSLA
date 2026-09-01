@@ -26,21 +26,28 @@ not a roadmap.
 
 Smaller pieces of the specification still outstanding:
 
-- **Open the converted file** (§27). Only *Open Folder* is offered.
-- **File associations** (§33). The desktop entry declares a MIME type but no
-  MIME definitions are installed, so double-clicking an `.sl1` in a file
-  manager will not launch CheapAzSLA yet. The icon and desktop entry install
-  correctly; only the MIME half is missing.
-- **GOO previews are not decoded.** The reader ignores the two embedded
-  RGB565 images, so converting GOO to SL1 loses the thumbnails. The conversion
-  planner does not currently report that as a loss, which it should.
-- **Manual input format override** (§21). Detection is content-first and can be
-  ambiguous; there is no way to say "treat this as X".
 - **Architecture documentation** (§45). `ADDING_A_FORMAT.md` and
   `TEST_PLAN.md` exist; a document describing the engine as a whole does not.
 - **3D layer view.** Not in the specification, but asked for. A stacked view of
   subsampled layers, since a full voxel model of a real print is billions of
   voxels.
+- **Why UVtools will not read a CTB written here.** The files are structurally
+  sound by every check available — correct layer table, payloads byte for byte
+  the same length as UVtools' own, read completely by catibo and by this
+  reader — and UVtools reads their layer table as though it began somewhere
+  else. Until that is understood, CTB writing stays implemented and not
+  offered.
+
+Done since this list was last written, and recorded here because a roadmap
+that quietly deletes its own entries is not much of a record:
+
+- **Open the converted file** (§27). The toast opens the file, falling back to
+  its folder when nothing on the system claims the format.
+- **File associations** (§33). MIME definitions are installed and
+  `xdg-mime query filetype` now identifies all three formats.
+- **GOO previews.** Read as well as written, so a conversion keeps its picture.
+- **Manual input format override** (§21). The Input control on the Convert
+  page, and `--input-format` on the command line.
 
 ## Which formats next
 
