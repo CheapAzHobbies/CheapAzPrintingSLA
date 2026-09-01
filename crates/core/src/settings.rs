@@ -16,6 +16,12 @@ pub struct Settings {
     pub warn_on_information_loss: bool,
     /// Confirm before replacing an existing file.
     pub confirm_overwrite: bool,
+    /// Animate the interface: the sidebar folding, pages crossfading.
+    ///
+    /// Off means those changes happen at once rather than not at all. Some
+    /// people find motion distracting, and on a slow machine an animation
+    /// that cannot keep up is worse than none.
+    pub animations: bool,
     /// Where converted files went last time, reused as the default.
     pub last_output_dir: Option<PathBuf>,
     /// Output format chosen last time.
@@ -47,6 +53,7 @@ impl Default for Settings {
             // expressed a preference should be told before data is dropped.
             warn_on_information_loss: true,
             confirm_overwrite: true,
+            animations: true,
             last_output_dir: None,
             last_output_format: None,
             recent_output_dirs: Vec::new(),
@@ -88,6 +95,9 @@ impl Settings {
         }
         if let Some(v) = map.get("confirm_overwrite") {
             s.confirm_overwrite = v == "true";
+        }
+        if let Some(v) = map.get("animations") {
+            s.animations = v == "true";
         }
         s.last_output_dir = map
             .get("last_output_dir")
@@ -144,6 +154,7 @@ impl Settings {
             "# CheapAzSLA settings\n\
              warn_on_information_loss = {}\n\
              confirm_overwrite = {}\n\
+             animations = {}\n\
              last_output_dir = {}\n\
              last_output_format = {}\n\
              recent_output_dirs = {}\n\
@@ -153,6 +164,7 @@ impl Settings {
              pinned_subfolder = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
+            self.animations,
             self.last_output_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())

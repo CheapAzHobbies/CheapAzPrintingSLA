@@ -11,6 +11,21 @@ use std::rc::Rc;
 
 /// Long enough to read as the rail folding up, short enough not to be a wait.
 const COLLAPSE_MS: u32 = 340;
+/// Crossfade between pages: enough to read as motion, not a wait (§23).
+const STACK_MS: u32 = 160;
+
+/// Whether to log every step the rail takes, for `CHEAPAZSLA_DEBUG_FOLD`.
+///
+/// A scripted resize is far lighter than a hand on a window border, and the
+/// faults that only show up under a real drag cannot be reproduced from here.
+/// This lets the real gesture be recorded and read back.
+fn logging() -> bool {
+    thread_local! {
+        static ON: bool = std::env::var_os("CHEAPAZSLA_DEBUG_FOLD").is_some();
+    }
+    ON.with(|on| *on)
+}
+
 /// How quickly the rail closes the distance to where it is heading: the gap
 /// left shrinks by about two thirds every tenth of a second, which settles in
 /// roughly the same time the fixed-duration version took.
@@ -116,6 +131,9 @@ pub struct Shell {
     /// Whether the labels should be showing, so a reveal held back for a
     /// moment does not fire into a rail that has folded again meanwhile.
     want_labels: Rc<Cell<bool>>,
+    /// Whether to animate at all. Off, everything still happens — it just
+    /// happens at once.
+    animate: Rc<Cell<bool>>,
     /// The About button at the foot of the rail.
     about: RefCell<Option<gtk::Button>>,
     compact: Cell<bool>,
@@ -125,7 +143,7 @@ impl Shell {
     pub fn new() -> Rc<Self> {
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
-            .transition_duration(160) // §23: enough to read as motion, not a wait
+            .transition_duration(STACK_MS) // §23: motion, not a wait
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -222,6 +240,7 @@ impl Shell {
             rail_target: Rc::new(Cell::new(theme::SIDEBAR_WIDTH as f64)),
             rail_width: Rc::new(Cell::new(theme::SIDEBAR_WIDTH as f64)),
             want_labels: Rc::new(Cell::new(true)),
+            animate: Rc::new(Cell::new(true)),
             about: RefCell::new(None),
             compact: Cell::new(false),
         });
@@ -353,6 +372,7 @@ impl Shell {
         let reveals: Vec<gtk::Revealer> = self.reveals.borrow().clone();
         let want = self.want_labels.clone();
         let sidebar = self.sidebar.clone();
+        let animate = self.animate.clone();
         let mut waited = 0u64;
         glib::timeout_add_local(std::time::Duration::from_millis(POLL_MS), move || {
             waited += POLL_MS;
@@ -363,12 +383,35 @@ impl Shell {
             if !sidebar.is_mapped() && waited < GIVE_UP_MS {
                 return glib::ControlFlow::Continue;
             }
+            if logging() {
+                eprintln!(
+                    "  labels -> {revealed} after {waited}ms{}",
+                    if sidebar.is_mapped() {
+                        ""
+                    } else {
+                        " (GAVE UP, will snap)"
+                    }
+                );
+            }
             for reveal in &reveals {
-                reveal.set_transition_duration(COLLAPSE_MS);
+                reveal.set_transition_duration(if animate.get() { COLLAPSE_MS } else { 0 });
                 reveal.set_reveal_child(revealed);
             }
             glib::ControlFlow::Break
         });
+    }
+
+    /// Turn the interface's movement on or off.
+    ///
+    /// Everything still reaches the same state; without animation it simply
+    /// arrives there in one step.
+    pub fn set_animate(&self, on: bool) {
+        self.animate.set(on);
+        self.stack
+            .set_transition_duration(if on { STACK_MS } else { 0 });
+        for reveal in self.reveals.borrow().iter() {
+            reveal.set_transition_duration(if on { COLLAPSE_MS } else { 0 });
+        }
     }
 
     /// Point the rail at its folded or open width, without touching anything
@@ -381,6 +424,14 @@ impl Shell {
     /// it immediately is what stops a fast drag getting several frames ahead
     /// of the fold.
     pub fn aim(&self, compact: bool) {
+        if logging() {
+            eprintln!(
+                "aim compact={compact} window={} rail={} moving={}",
+                self.sidebar.root().map(|r| r.width()).unwrap_or(-1),
+                self.rail_width.get().round(),
+                self.rail_moving.get(),
+            );
+        }
         self.set_rail_target(if compact {
             RAIL_WIDTH as f64
         } else {
@@ -404,10 +455,18 @@ impl Shell {
     /// the other way.
     fn set_rail_target(&self, to: f64) {
         self.rail_target.set(to);
+        if !self.animate.get() {
+            self.rail_width.set(to);
+            self.sidebar.set_size_request(to as i32, -1);
+            return;
+        }
         if self.rail_moving.replace(true) {
             return;
         }
         let Some(root) = self.sidebar.root() else {
+            if logging() {
+                eprintln!("  no window yet, snapping to {to}");
+            }
             self.rail_moving.set(false);
             self.rail_width.set(to);
             self.sidebar.set_size_request(to as i32, -1);
@@ -455,6 +514,15 @@ impl Shell {
             let ceiling = travel * RAIL_MAX_STEP;
             step = step.clamp(-ceiling, ceiling);
 
+            if logging() {
+                eprintln!(
+                    "  tick dt={:.0}ms want={want:.0} at={next:.0} step={step:.1} \
+                     drawn={} win={}",
+                    dt * 1000.0,
+                    sidebar.width(),
+                    sidebar.root().map(|r| r.width()).unwrap_or(-1),
+                );
+            }
             if step.abs() >= remaining.abs() || remaining.abs() < 0.5 {
                 next = want;
             } else {
@@ -471,6 +539,9 @@ impl Shell {
             sidebar.set_size_request(next.round() as i32, -1);
 
             if next == want {
+                if logging() {
+                    eprintln!("  tick arrived at {want:.0}");
+                }
                 moving.set(false);
                 glib::ControlFlow::Break
             } else {

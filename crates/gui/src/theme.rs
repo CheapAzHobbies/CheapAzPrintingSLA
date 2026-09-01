@@ -90,6 +90,14 @@ fn sheet(p: &Palette) -> String {
   color: @cz_dim;
   transition: background-color 140ms ease, color 140ms ease;
 }}
+/* Folded, the rail is a clip over contents still laid out at full width, so a
+   highlight with a margin on its right ran under the rail's border and was cut
+   off mid-corner. Edge to edge instead, which is what a selected row in an icon
+   rail should look like anyway. */
+.compact .cz-nav-item {{
+  margin-right: 0;
+  border-radius: 6px 0 0 6px;
+}}
 .cz-nav-item:hover {{ background-color: {hover}; color: @cz_text; }}
 .cz-nav-item.selected {{
   background-color: alpha(@cz_accent, 0.16);

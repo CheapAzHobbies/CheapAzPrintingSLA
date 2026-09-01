@@ -472,6 +472,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         let window = ui.window.clone();
         ui.shell.connect_about(move || show_about(&window));
     }
+    ui.shell.set_animate(ui.settings.borrow().animations);
     wire_responsive(&ui);
     restore_session(&ui);
     refresh_history(&ui);
@@ -723,6 +724,9 @@ fn wire_responsive(ui: &Rc<App>) {
     let apply = {
         let ui = ui.clone();
         Rc::new(move |level: u8| {
+            if std::env::var_os("CHEAPAZSLA_DEBUG_FOLD").is_some() {
+                eprintln!("apply level={level} window={}", ui.window.width());
+            }
             ui.preview_side.set_visible(level == 0);
             let pad = match level {
                 0 => theme::SPACE_6,
@@ -831,7 +835,10 @@ fn wire_responsive(ui: &Rc<App>) {
         ui.window.add_breakpoint(bp);
     }
 
-    if std::env::var_os("CHEAPAZSLA_DEBUG_FOLD").is_some() {
+    // "1" drives a scripted resize; anything else just records what a real
+    // drag does, which is the only way to see the faults a script cannot
+    // provoke.
+    if std::env::var_os("CHEAPAZSLA_DEBUG_FOLD").is_some_and(|v| v == "1") {
         debug_fold(&ui.window);
     }
     if std::env::var_os("CHEAPAZSLA_DEBUG_SIZE").is_some() {
@@ -1064,7 +1071,7 @@ fn build_convert_page(
     (
         page_frame(
             "Convert",
-            "Convert resin print files between formats.",
+            "Open a file from your slicer, save it in your printer's format.",
             &content,
         ),
         controls,
@@ -3322,6 +3329,25 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     }
     conversion.add(&overwrite);
     page.add(&conversion);
+
+    let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+    let animate = adw::SwitchRow::builder()
+        .title("Animate the interface")
+        .subtitle("The sidebar folding and pages changing. Off, they happen at once")
+        .active(current.animations)
+        .build();
+    {
+        let ui = ui.clone();
+        animate.connect_active_notify(move |r| {
+            let on = r.is_active();
+            ui.shell.set_animate(on);
+            let mut s = ui.settings.borrow_mut();
+            s.animations = on;
+            let _ = s.save();
+        });
+    }
+    appearance.add(&animate);
+    page.add(&appearance);
 
     let opening = adw::PreferencesGroup::builder()
         .title("Opening files")
