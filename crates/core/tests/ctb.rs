@@ -309,12 +309,58 @@ fn a_zero_resolution_is_refused() {
 }
 
 #[test]
-fn ctb_is_offered_for_reading_only() {
-    // The writer below works and is tested, but UVtools will not read what it
-    // produces, so nothing offers it. See the note at the top of ctb.rs.
+fn ctb_is_offered_for_both_reading_and_writing() {
     let info = registry::by_id("ctb").expect("registered").info();
     assert!(info.capabilities.reads);
-    assert!(!info.capabilities.writes);
+    assert!(info.capabilities.writes);
+}
+
+#[test]
+fn every_layer_payload_is_preceded_by_its_extended_record() {
+    // Chitubox writes an 84 byte record in front of each payload, and UVtools
+    // reads it whether it is there or not. A file without it is read as though
+    // whatever bytes precede the payload were that record, which is how a file
+    // with a perfectly good layer table gets refused for having impossible
+    // layer heights.
+    const EXTRA: usize = 84;
+    let (_d, src) = Builder::default().write();
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("out.ctb");
+    let before = registry::open(&src).expect("open");
+    registry::by_id("ctb")
+        .expect("ctb")
+        .write(&dst, &before.print, before.layers.as_ref())
+        .expect("write");
+
+    let bytes = std::fs::read(&dst).unwrap();
+    let at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+    let (table, count) = (at(0x40), at(0x44));
+    for i in 0..count {
+        let entry = table + i * 36;
+        assert_eq!(
+            at(entry + 0x18),
+            EXTRA,
+            "layer {i} does not declare an extended record"
+        );
+        let data = at(entry + 0x0C);
+        assert!(
+            data >= EXTRA,
+            "layer {i} has no room for one in front of it"
+        );
+        // The record repeats the table entry, so the two must agree.
+        let copy = data - EXTRA;
+        assert_eq!(
+            bytes[copy..copy + 36],
+            bytes[entry..entry + 36],
+            "layer {i}'s extended record does not match its table entry"
+        );
+        // And states the size of itself plus the payload.
+        assert_eq!(
+            at(copy + 0x24),
+            EXTRA + at(entry + 0x10),
+            "layer {i}'s extended record has the wrong total size"
+        );
+    }
 }
 
 #[test]

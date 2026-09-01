@@ -19,7 +19,7 @@ not a roadmap.
 
 | Phase | | Notes |
 |---|---|---|
-| 19 | CTB | Reading done and verified against real UVtools files, v3-v5. Writing implemented but not offered: UVtools rejects it, cause unknown. |
+| 19 | CTB | Done. Reading verified against real UVtools files v3-v5; writing verified by UVtools reading it back at every real printer resolution. |
 | 20 | PHZ | Legacy Chitubox, closely related to CTB. |
 | 21 | Packaging | deb done, with dependencies read from the binary. Flatpak, AppImage, rpm, AUR not started. |
 | 22 | Final polish | Ongoing. |
@@ -31,12 +31,9 @@ Smaller pieces of the specification still outstanding:
 - **3D layer view.** Not in the specification, but asked for. A stacked view of
   subsampled layers, since a full voxel model of a real print is billions of
   voxels.
-- **Why UVtools will not read a CTB written here.** The files are structurally
-  sound by every check available — correct layer table, payloads byte for byte
-  the same length as UVtools' own, read completely by catibo and by this
-  reader — and UVtools reads their layer table as though it began somewhere
-  else. Until that is understood, CTB writing stays implemented and not
-  offered.
+- **UVtools refuses two synthetic resolutions**, 112x56 and 128x64 at four
+  layers, whoever wrote the file — catibo's included. No printer has a panel
+  that size. Recorded rather than chased.
 
 Done since this list was last written, and recorded here because a roadmap
 that quietly deletes its own entries is not much of a record:

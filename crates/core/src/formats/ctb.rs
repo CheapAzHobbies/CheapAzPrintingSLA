@@ -14,22 +14,16 @@
 //! stream, described below. Handling it is what lets this read files people
 //! actually have rather than only ones written by other open tools.
 //!
-//! Writing is implemented and tested but **not offered**, because UVtools will
-//! not read what it produces and I have not worked out why.
+//! Writing produces version 3 with the layer data in the clear. The cipher is
+//! optional — the proprietary slicer turns it off simply by setting the key to
+//! zero — and a file nobody has to decipher is the easier one to trust.
 //!
-//! What is known: the layer table it writes is correct — z strictly
-//! increasing, offsets contiguous, the last record ending exactly at the end
-//! of the file — and its run-length payloads come out the same length, byte
-//! for byte, as UVtools' own for the same input. catibo reads the files
-//! completely and correctly, and so does this reader. But UVtools reads the
-//! layer table as though it began somewhere else, reports impossible z values
-//! and refuses the file. It does that for some resolutions and not others,
-//! which no theory here explains.
-//!
-//! UVtools is what most people use to check a file before committing it to a
-//! printer, so a file it rejects is not one to hand anybody, whatever this
-//! reader thinks of it. The writer stays, with its tests, behind a capability
-//! flag that says no.
+//! Each layer's payload is preceded by an 84 byte extended record repeating
+//! that layer's table entry and its motion. Chitubox writes it; some open
+//! implementations do not, and UVtools will not read their files, so this
+//! writes it too. Without it UVtools reported impossible layer heights for
+//! some resolutions and not others, which is what reading a fixed distance in
+//! front of a payload looks like when there is nothing there to read.
 
 use super::{ctb_preview, ctb_rle};
 use crate::error::{Error, FormatError, Result};
@@ -69,11 +63,10 @@ static INFO: FormatInfo = FormatInfo {
     limitations: &[
         "Stores seven bits of grey per pixel, so an eight-bit image loses its lowest bit",
         "Stores two preview images, at 400x300 and 200x125",
-        "Reading only: writing is implemented but UVtools will not read the result",
     ],
     capabilities: Capabilities {
         reads: true,
-        writes: false,
+        writes: true,
         per_layer_exposure: true,
         per_layer_lift: true,
         thumbnails: true,
@@ -591,6 +584,15 @@ impl FormatHandler for CtbHandler {
         let small_data_at = small_head_at + IMAGE_HEADER;
         let table_at = small_data_at + small.len();
         let layers_at = table_at + count as usize * LAYER_ENTRY as usize;
+        // Each payload is preceded by an extended record repeating the table
+        // entry and the motion for that layer. Files from Chitubox have it and
+        // files from other open tools do not, and UVtools reads it at a fixed
+        // distance in front of the payload whether it is there or not: without
+        // it, it reads whatever bytes happen to be there, decides the layer is
+        // at some impossible height, and refuses the file. Whether the bytes
+        // it lands on are harmless depends on the payload lengths, which is
+        // why this looked like it depended on the resolution.
+        const LAYER_EXTRA: usize = 84;
 
         let mut head = vec![0u8; HEADER_BYTES];
         put_u32(&mut head, 0x00, MAGIC);
@@ -684,7 +686,7 @@ impl FormatHandler for CtbHandler {
         out.write_all(&small).map_err(io)?;
 
         // Reserve the layer table before the bitmaps rather than seeking past
-        // it. The table's entries can only be written once every payload's
+        // it, and leave room for each layer's extended record. The table's entries can only be written once every payload's
         // length is known, but the space has to exist first: without it the
         // bitmaps start where the table belongs, every offset in the table is
         // one table too far along, and writing the table at the end lands on
@@ -735,12 +737,46 @@ impl FormatHandler for CtbHandler {
                     .or(e.light_off_delay_s)
                     .unwrap_or(0.0);
                 let entry = index as usize * LAYER_ENTRY as usize;
+                let data_at = at + LAYER_EXTRA;
                 put_f32(&mut table, entry, z);
                 put_f32(&mut table, entry + 0x04, exposure);
                 put_f32(&mut table, entry + 0x08, off);
-                put_u32(&mut table, entry + 0x0C, at as u32);
+                put_u32(&mut table, entry + 0x0C, data_at as u32);
                 put_u32(&mut table, entry + 0x10, payload.len() as u32);
-                at += payload.len();
+                // The size of this record, which is how a reader knows it is
+                // there at all.
+                put_u32(&mut table, entry + 0x18, LAYER_EXTRA as u32);
+
+                // The extended record: the table entry again, the size of the
+                // whole thing, then this layer's motion. Written from the same
+                // values as the file-wide settings, so a printer that follows
+                // the per-layer numbers does what a printer that follows the
+                // file-wide ones does.
+                let mut extra = vec![0u8; LAYER_EXTRA];
+                extra[..LAYER_ENTRY as usize]
+                    .copy_from_slice(&table[entry..entry + LAYER_ENTRY as usize]);
+                put_u32(&mut extra, 0x24, (LAYER_EXTRA + payload.len()) as u32);
+                let bottom = index < bottom_layers;
+                let (lift_h, lift_v) = if bottom {
+                    (l.bottom_lift_height_mm, l.bottom_lift_speed_mm_min)
+                } else {
+                    (l.lift_height_mm, l.lift_speed_mm_min)
+                };
+                put_f32(&mut extra, 0x28, lift_h.unwrap_or(0.0));
+                put_f32(&mut extra, 0x2C, lift_v.unwrap_or(0.0));
+                put_f32(&mut extra, 0x38, l.retract_speed_mm_min.unwrap_or(0.0));
+                put_f32(
+                    &mut extra,
+                    0x50,
+                    if bottom {
+                        e.bottom_light_pwm.unwrap_or(255)
+                    } else {
+                        e.light_pwm.unwrap_or(255)
+                    } as f32,
+                );
+
+                at += LAYER_EXTRA + payload.len();
+                out.write_all(&extra).map_err(io)?;
                 out.write_all(&payload).map_err(io)
             },
         )?;

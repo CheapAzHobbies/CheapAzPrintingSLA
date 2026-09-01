@@ -161,8 +161,7 @@ time. The output is byte-identical apart from the timestamp in the header.
 | SL1 reading | done, tested against real slicer output |
 | SL1 writing | not started |
 | GOO reading and writing | done, verified against a real Elegoo file |
-| CTB reading | done, verified against real files from UVtools, v3 to v5 |
-| CTB writing | implemented, **not offered**: UVtools will not read it |
+| CTB reading and writing | done, verified against real files both ways |
 | PHZ | not started |
 | Desktop interface | done |
 | Command line | done |
@@ -171,29 +170,39 @@ time. The output is byte-identical apart from the timestamp in the header.
 Anything marked not started is absent, not stubbed. There are no buttons that
 do nothing.
 
-CTB is the pair of lines above worth expanding on.
+CTB is the line above worth expanding on, because it was verified in both
+directions and one of those found something.
 
-**Reading is verified properly.** UVtools, the reference implementation for
-these formats, converted a real 438 layer print at 11520x5120 to CTB at
-versions 3, 4 and 5, and this reader gives back pixel data identical to the
-source for every layer of each — the same lit-pixel counts and the same
-checksums. Version 4 and 5 files are obfuscated with the layer cipher, so that
-is verified against real files too. Two files written by
-[catibo](https://github.com/cbiffle/catibo), a separate reverse engineering
-verified by printing from it, are committed under `crates/core/tests/data` and
-read in the test suite down to individual pixels.
+**Reading.** UVtools, the reference implementation for these formats,
+converted a real 438 layer print at 11520x5120 to CTB at versions 3, 4 and 5,
+and this reader gives back pixel data identical to the source for every layer
+of each — the same lit-pixel counts, the same checksums. Versions 4 and 5
+obfuscate their layer data, so the cipher is verified against real files too.
+Two files written by [catibo](https://github.com/cbiffle/catibo) are committed
+under `crates/core/tests/data` and read in the test suite down to individual
+pixels.
 
-**Writing is implemented, tested, and deliberately not offered.** The files it
-produces have a correct layer table — z strictly increasing, offsets
-contiguous, the last record ending exactly at the end of the file — and their
-run-length payloads come out the same length, byte for byte, as UVtools' own
-for the same input. catibo reads them completely; so does this reader. UVtools
-does not: it reads the layer table as though it began somewhere else, reports
-impossible z positions and refuses the file, for some resolutions and not
-others, and I have not worked out why. UVtools is what most people use to
-check a file before committing it to a printer, so until that is understood,
-handing anyone such a file would be irresponsible. The writer and its tests
-stay; the capability flag says no.
+**Writing.** The same print written back out as CTB, read by UVtools and
+converted to SL1 again, comes back with every lit pixel in the same place as
+the original. Files written here are read by UVtools at every resolution a
+real printer has: 1440x2560, 2560x1620, 3840x2400, 4098x2560, 5760x3600 and
+11520x5120.
+
+That took working out, and the answer was not where it looked. Chitubox writes
+an 84 byte record in front of every layer's data, repeating that layer's table
+entry and its motion. UVtools reads that record whether it is there or not, so
+a file without it is read as though whatever bytes happen to precede the
+payload were that record — which produces impossible layer heights and a
+refused file, for some resolutions and not others depending on what those
+bytes happen to be. The tell was that UVtools refuses catibo's files in exactly
+the same cases, and catibo is an implementation its author verified by printing
+from it. A writer whose output is rejected by the same tool that rejects a
+known-good implementation's output is not obviously the one at fault.
+
+Two synthetic sizes are still refused by UVtools — 112x56 and 128x64, four
+layers — and refused identically whoever wrote them. No printer has a panel
+that size and no slicer produces one, so it is recorded here rather than
+worked around.
 
 A file from Chitubox itself would still be worth having, and the test for one
 is written and skips until it exists:
