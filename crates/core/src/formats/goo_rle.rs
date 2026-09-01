@@ -158,7 +158,7 @@ pub fn decode(payload: &[u8], expected_pixels: usize) -> Result<Vec<u8>, String>
             if out.len() as u64 + len as u64 > expected_pixels as u64 {
                 return Err(format!("runs describe more than {expected_pixels} pixels"));
             }
-            out.extend(std::iter::repeat(value).take(len as usize));
+            out.extend(std::iter::repeat_n(value, len as usize));
             previous = value;
             continue;
         }
@@ -207,7 +207,7 @@ pub fn decode(payload: &[u8], expected_pixels: usize) -> Result<Vec<u8>, String>
         if out.len() as u64 + len as u64 > expected_pixels as u64 {
             return Err(format!("runs describe more than {expected_pixels} pixels"));
         }
-        out.extend(std::iter::repeat(value).take(len as usize));
+        out.extend(std::iter::repeat_n(value, len as usize));
     }
     Ok(out)
 }

@@ -5,7 +5,9 @@ members = ["crates/core", "crates/cli", "crates/gui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.85 is the floor the dependency tree sets, not a preference: crates in
+# it now use edition 2024, which older Cargo cannot even parse.
+rust-version = "1.85"
 license = "GPL-3.0-or-later"
 authors = ["CheapAzHobbies"]
 repository = "https://github.com/CheapAzHobbies/CheapAzPrintingSLA"

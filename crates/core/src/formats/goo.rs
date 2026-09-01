@@ -390,7 +390,7 @@ fn text(out: &mut Vec<u8>, s: &str, width: usize) {
     let bytes = s.as_bytes();
     let take = bytes.len().min(width.saturating_sub(1));
     out.extend_from_slice(&bytes[..take]);
-    out.extend(std::iter::repeat(0u8).take(width - take));
+    out.extend(std::iter::repeat_n(0u8, width - take));
 }
 
 fn be_u16(out: &mut Vec<u8>, v: u16) {

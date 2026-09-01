@@ -24,8 +24,24 @@ step() {
     fi
 }
 
+# CI builds the engine on the oldest supported Rust as well as stable, and
+# that job has failed on its own before now: a dependency moved to edition
+# 2024, which older Cargo cannot parse, without anything here changing.
+msrv="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+if rustup toolchain list 2>/dev/null | grep -q "^${msrv}"; then
+    step "Build engine (${msrv})" cargo "+${msrv}" build -p cheapazsla-core
+    step "Test engine (${msrv})"  cargo "+${msrv}" test -p cheapazsla-core
+else
+    printf '\n=== Oldest supported Rust (%s)\n    skipped: rustup toolchain install %s\n' "$msrv" "$msrv"
+fi
+
 step "Build engine"        cargo build -p cheapazsla-core
 step "Test engine"         cargo test -p cheapazsla-core
+# Clippy caches its findings, so a second run over unchanged sources reports
+# nothing and looks like a pass. Touching the crate roots forces it to think
+# again — a run that reported clean this way had three real lints waiting.
+touch crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true
+
 step "Clippy engine"       cargo clippy -p cheapazsla-core -- -D warnings
 step "Formatting"          cargo fmt --all -- --check
 step "Build everything"    cargo build --workspace
