@@ -98,11 +98,16 @@ independent code paths must produce the same image.
 | Layers pointing outside the file | `ctb.rs` |
 | Encrypted files refused, not misread | `ctb.rs` |
 | CTB to GOO, pixel for pixel | `ctb.rs` |
+| Files written by catibo, metadata and every pixel | `ctb_reference.rs` |
+| The same, obfuscated with the layer cipher | `ctb_reference.rs` |
+| Layer cipher against independently computed keystream | `ctb.rs` |
 | **A file Chitubox produced** | `ctb.rs`, skipped without `CHEAPAZSLA_REAL_CTB` |
 
-Every row but the last reads a file this project built, so they prove the
-reader agrees with itself rather than with Chitubox. The last row is the one
-that decides whether CTB works.
+The rows naming `ctb.rs` and `ctb_rle.rs` read files this project built, so
+they show the reader agrees with itself. The `ctb_reference.rs` rows read files
+another implementation wrote, which is what shows it agrees with anyone else;
+regenerate them with `tools/make_ctb_fixtures.sh`. The last row is still the
+one that would settle it, since catibo is not Chitubox either.
 
 ### GOO
 

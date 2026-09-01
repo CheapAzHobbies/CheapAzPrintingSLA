@@ -10,16 +10,13 @@
 //! see the credits in the README. Where this file says a field is unknown, it
 //! means the published description does not name it, not that it is unused.
 //!
-//! Two things are deliberately not supported yet, and both say so rather than
-//! producing something wrong:
+//! Layer data in files from Chitubox itself is obfuscated with a keyed XOR
+//! stream, described below. Handling it is what lets this read files people
+//! actually have rather than only ones written by other open tools.
 //!
-//! * **Encrypted files.** Version 4 files may carry a non-zero encryption key,
-//!   and their layer data is enciphered with it. Reading one without
-//!   deciphering yields noise that decodes into a plausible-looking but wrong
-//!   image, which is worse than refusing.
-//! * **Writing.** The reader can be checked against a file Chitubox produced;
-//!   a writer can only be checked by a printer. Until this reader has been
-//!   confirmed against real files, a writer would be guessing twice over.
+//! Writing is deliberately not implemented. A reader can be checked against a
+//! file Chitubox produced; a writer can only really be checked by a printer,
+//! and writing before the reader is confirmed would be guessing twice over.
 
 use super::ctb_rle;
 use crate::error::{Error, FormatError, Result};
@@ -51,7 +48,6 @@ static INFO: FormatInfo = FormatInfo {
                   read. Layer images are run-length encoded with seven bits of grey per pixel.",
     limitations: &[
         "Stores seven bits of grey per pixel, so an eight-bit image loses its lowest bit",
-        "Encrypted files, which some version 4 printers use, cannot be read yet",
         "Reading only for now: CheapAzSLA cannot write CTB",
         "Not yet checked against a file produced by Chitubox itself",
     ],
@@ -242,6 +238,8 @@ struct CtbLayers {
     height: u32,
     /// Offset and size of each layer's encoded bitmap.
     entries: Vec<(u32, u32)>,
+    /// Zero when the layer data is in the clear.
+    encryption_key: u32,
 }
 
 impl LayerProvider for CtbLayers {
@@ -268,7 +266,9 @@ impl LayerProvider for CtbLayers {
             source: e,
         })?;
         let want = limits::check_allocation(size as u64)?;
-        let data = read_at(&mut file, &self.path, offset as u64, want)?;
+        let mut data = read_at(&mut file, &self.path, offset as u64, want)?;
+        // Each layer is enciphered with its own index as the IV.
+        uncipher(&mut data, self.encryption_key, index);
         let expected = self.width as usize * self.height as usize;
         let pixels = ctb_rle::decode(&data, expected)
             .map_err(|e| FormatError::LayerDecode(format!("layer {index}: {e}")))?;
@@ -301,12 +301,6 @@ fn open_header(path: &Path) -> Result<(Header, std::fs::File, u64)> {
     })?;
     let header = Header::parse(&head)?;
 
-    if header.encryption_key != 0 {
-        return Err(FormatError::Other(
-            "this file is encrypted, which CheapAzSLA cannot read yet".into(),
-        )
-        .into());
-    }
     limits::check_layer_count(header.layer_count as u64)?;
     limits::check_resolution(header.resolution_x, header.resolution_y)?;
     limits::check_range(
@@ -505,6 +499,7 @@ impl FormatHandler for CtbHandler {
                 width: header.resolution_x,
                 height: header.resolution_y,
                 entries,
+                encryption_key: header.encryption_key,
             }),
         })
     }
@@ -517,7 +512,108 @@ impl FormatHandler for CtbHandler {
     }
 }
 
+/// Undo the keyed XOR stream Chitubox puts over layer data.
+///
+/// A degenerate linear congruential generator produces a word of keystream at
+/// a time, each XORed with a little-endian word of the data. It is symmetric,
+/// so this both applies and removes it, and a key of zero means the data is
+/// already in the clear.
+///
+/// The layer's own index is the initialisation vector, so layers cannot be
+/// deciphered out of order or in bulk — each needs its own keystream.
+///
+/// The constant below is `0xD8A8_3423`. Catibo's prose documentation says
+/// `0xD8A8_3424`, but its implementation — the one that round trips real
+/// files — says `3423`, and an off-by-one there turns every layer into noise.
+fn uncipher(data: &mut [u8], key: u32, iv: u32) {
+    if key == 0 {
+        return;
+    }
+    let step = key.wrapping_mul(0x2D83_CDAC).wrapping_add(0xD8A8_3423);
+    let mut state = iv
+        .wrapping_mul(0x1E15_30CD)
+        .wrapping_add(0xEC3D_47CD)
+        .wrapping_mul(step);
+    for chunk in data.chunks_mut(4) {
+        // A trailing part-word is treated as the start of a whole one, which
+        // works because the cipher carries nothing between bits.
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte ^= (state >> (i * 8)) as u8;
+        }
+        state = state.wrapping_add(step);
+    }
+}
+
 /// A value the format writes as zero when it has nothing to say.
 fn positive(v: f32) -> Option<f32> {
     (v.is_finite() && v > 0.0).then_some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keystream words worked out independently from the published recurrence,
+    /// so this checks the arithmetic rather than checking the code against
+    /// itself. XORing zeroes leaves the keystream in the clear.
+    #[test]
+    fn the_keystream_matches_the_published_recurrence() {
+        let mut data = vec![0u8; 16];
+        uncipher(&mut data, 0x1234_5678, 3);
+        let words: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(words, [0xCEB6_859C, 0x232E_EA5F, 0x77A7_4F22, 0xCC1F_B3E5]);
+
+        let mut data = vec![0u8; 12];
+        uncipher(&mut data, 1, 0);
+        let words: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(words, [0x6810_DBC3, 0x6E3C_DD92, 0x7468_DF61]);
+    }
+
+    #[test]
+    fn the_cipher_is_its_own_inverse() {
+        let original: Vec<u8> = (0..=200u8).collect();
+        let mut data = original.clone();
+        uncipher(&mut data, 0xABCD_1234, 7);
+        assert_ne!(data, original, "enciphering must change the data");
+        uncipher(&mut data, 0xABCD_1234, 7);
+        assert_eq!(data, original, "applying it twice must return the original");
+    }
+
+    #[test]
+    fn a_part_word_at_the_end_is_handled() {
+        // Lengths either side of a word boundary, since the tail is the part
+        // most likely to be got wrong.
+        for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 9] {
+            let original: Vec<u8> = (0..len as u8).collect();
+            let mut data = original.clone();
+            uncipher(&mut data, 0x9999_1111, 2);
+            uncipher(&mut data, 0x9999_1111, 2);
+            assert_eq!(data, original, "length {len}");
+        }
+    }
+
+    #[test]
+    fn every_layer_gets_a_different_keystream() {
+        // The layer index is the IV, so the same plaintext in two layers must
+        // not encipher to the same bytes.
+        let mut first = vec![0u8; 32];
+        let mut second = vec![0u8; 32];
+        uncipher(&mut first, 0x2222_3333, 0);
+        uncipher(&mut second, 0x2222_3333, 1);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_key_of_zero_leaves_the_data_alone() {
+        let original: Vec<u8> = (0..64u8).collect();
+        let mut data = original.clone();
+        uncipher(&mut data, 0, 5);
+        assert_eq!(data, original);
+    }
 }

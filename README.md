@@ -161,7 +161,7 @@ time. The output is byte-identical apart from the timestamp in the header.
 | SL1 reading | done, tested against real slicer output |
 | SL1 writing | not started |
 | GOO reading and writing | done, verified against a real Elegoo file |
-| CTB reading | done, **not yet verified against a Chitubox file** |
+| CTB reading | done, checked against another implementation's files |
 | CTB writing, PHZ | not started |
 | Desktop interface | done |
 | Command line | done |
@@ -170,17 +170,24 @@ time. The output is byte-identical apart from the timestamp in the header.
 Anything marked not started is absent, not stubbed. There are no buttons that
 do nothing.
 
-CTB is the one line above that needs reading twice. The reader is written and
-tested: it round trips through its own encoder, converts to GOO pixel for
-pixel, and refuses truncated, over-large, encrypted and out-of-bounds files
-without panicking. What none of that proves is that the layout matches what
-Chitubox writes, because every one of those tests reads a file this project
-built. The test that would prove it is written and skips until a real file is
-available:
+CTB is the one line above worth expanding on, because "tested" can mean two
+quite different things. Most of its tests read files CheapAzSLA itself built,
+which only shows the reader agrees with itself — the same trap that hid a
+byte-order mistake in the GOO writer until a real file caught it.
+
+So the CTB tests also read two files this project did not write. They come from
+[catibo](https://github.com/cbiffle/catibo), a separate reverse engineering of
+the format whose author verified it by printing from it, and the tests check
+every metadata field and every pixel of every layer, in both a plain file and
+one with the layer data obfuscated the way Chitubox does it. Header offsets,
+run-length encoding and cipher would all have to be right for those to pass,
+and they were not written by looking at this code.
+
+That is good evidence, not proof: catibo is not Chitubox. A file from Chitubox
+itself remains the last word, and the test for it is written and skips until
+one exists:
 
     CHEAPAZSLA_REAL_CTB=/path/to/from-chitubox.ctb cargo test -p cheapazsla-core
-
-Until that has run, CTB is not supported, only implemented.
 
 What is coming and in what order is in [docs/ROADMAP.md](docs/ROADMAP.md),
 including which of the thirty-odd resin formats are worth adding and which
@@ -256,6 +263,18 @@ is the hard part and it was not mine to make.
   CheapAzSLA reads are understood the same way a known-good implementation
   understands them. If you need a format CheapAzSLA does not support yet,
   UVtools very likely already has it.
+
+- **[catibo](https://github.com/cbiffle/catibo)** by Cliff L. Biffle is a Rust
+  implementation of CTB, CBDDLP and PHZ, and its `doc/cbddlp-ctb.adoc` is the
+  clearest description of the CTB layout in the open. The reader here was
+  written against it and checked field by field against it, including the
+  layer cipher, whose constants that document records to the bit. Where its
+  prose and its code disagreed on one of those constants, the code was right.
+
+  Two files its encoder produced are committed under `crates/core/tests/data`
+  and read by the test suite, which is what lets the CTB tests check this
+  reader against an understanding of the format that is not its own. catibo is
+  BSD-2-Clause, Copyright (c) 2020 Cliff L. Biffle.
 
 ### Assets
 

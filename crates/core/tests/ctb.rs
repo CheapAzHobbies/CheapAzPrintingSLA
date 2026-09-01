@@ -14,6 +14,25 @@ use cheapazsla_core::registry;
 use std::path::PathBuf;
 
 const MAGIC: u32 = 0x12FD_0086;
+
+/// The same keyed XOR stream the reader undoes, so a test file can be built
+/// the way Chitubox builds one.
+fn encipher(data: &mut [u8], key: u32, iv: u32) {
+    if key == 0 {
+        return;
+    }
+    let step = key.wrapping_mul(0x2D83_CDAC).wrapping_add(0xD8A8_3423);
+    let mut state = iv
+        .wrapping_mul(0x1E15_30CD)
+        .wrapping_add(0xEC3D_47CD)
+        .wrapping_mul(step);
+    for chunk in data.chunks_mut(4) {
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte ^= (state >> (i * 8)) as u8;
+        }
+        state = state.wrapping_add(step);
+    }
+}
 const HEADER: usize = 0x70;
 const PARAMS: usize = 0x28;
 const LAYER_ENTRY: usize = 36;
@@ -91,7 +110,11 @@ impl Builder {
         let mut table = vec![0u8; self.layers.len() * LAYER_ENTRY];
         let mut blobs: Vec<u8> = Vec::new();
         for (i, pixels) in self.layers.iter().enumerate() {
-            let (payload, _) = ctb_rle::encode(pixels);
+            let (mut payload, _) = ctb_rle::encode(pixels);
+            // Chitubox enciphers each layer with its index as the IV. The
+            // cipher is symmetric, so applying it here produces exactly what a
+            // real file holds.
+            encipher(&mut payload, self.encryption_key, i as u32);
             let at = i * LAYER_ENTRY;
             putf(&mut table, at, 0.05 * (i as f32 + 1.0));
             putf(&mut table, at + 0x04, 2.5);
@@ -181,14 +204,51 @@ fn asking_past_the_last_layer_is_an_error_not_a_panic() {
 }
 
 #[test]
-fn an_encrypted_file_is_refused_rather_than_misread() {
-    let (_d, path) = Builder {
+fn an_enciphered_file_reads_the_same_as_a_plain_one() {
+    // Files from Chitubox itself have their layer data obfuscated. This is the
+    // common case, not the exotic one, so it has to give identical pixels.
+    let plain = Builder::default();
+    let (_d1, plain_path) = plain.write();
+    let (_d2, secret_path) = Builder {
         encryption_key: 0xDEAD_BEEF,
         ..Default::default()
     }
     .write();
-    let err = registry::open(&path).expect_err("must refuse");
-    assert!(err.to_string().contains("encrypted"), "{err}");
+
+    // The files must genuinely differ on disk, or the test proves nothing.
+    assert_ne!(
+        std::fs::read(&plain_path).unwrap(),
+        std::fs::read(&secret_path).unwrap(),
+        "the enciphered file must not be byte-identical to the plain one"
+    );
+
+    let a = registry::open(&plain_path).expect("open plain");
+    let b = registry::open(&secret_path).expect("open enciphered");
+    assert_eq!(a.print.layer_count(), b.print.layer_count());
+    for i in 0..a.print.layer_count() {
+        assert_eq!(
+            a.layers.layer(i).unwrap().pixels,
+            b.layers.layer(i).unwrap().pixels,
+            "layer {i} differs between the plain and enciphered files"
+        );
+    }
+}
+
+#[test]
+fn each_layer_is_enciphered_with_its_own_index() {
+    // Two identical layers must decipher correctly despite having different
+    // bytes on disk, which is what proves the index is used as the IV.
+    let mut builder = Builder {
+        encryption_key: 0x0BAD_F00D,
+        ..Default::default()
+    };
+    builder.layers = vec![vec![0x40u8; 32], vec![0x40u8; 32]];
+    let (_d, path) = builder.write();
+    let opened = registry::open(&path).expect("open");
+    let first = opened.layers.layer(0).unwrap().pixels;
+    let second = opened.layers.layer(1).unwrap().pixels;
+    assert_eq!(first, second, "identical layers must decipher identically");
+    assert!(first.iter().all(|&p| p == 0x40 | 0x01 || p == 0x40));
 }
 
 #[test]
