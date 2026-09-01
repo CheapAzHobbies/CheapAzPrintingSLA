@@ -85,6 +85,25 @@ independent code paths must produce the same image.
 | Negative layer height refused | `a_negative_layer_height_is_refused` |
 | Round trip preserves layers and settings | `an_sl1_survives_a_round_trip_through_our_own_writer` |
 
+### CTB
+
+| What | Test |
+|---|---|
+| Detection by magic and version | `ctb.rs` |
+| Extension alone is not enough | `ctb.rs` |
+| Metadata survives a round trip | `ctb.rs` |
+| Layers decode to the right pixels | `ctb.rs` |
+| Run-length codec, every length class | `ctb_rle.rs` |
+| Truncated, over-large, zero-resolution files | `ctb.rs` |
+| Layers pointing outside the file | `ctb.rs` |
+| Encrypted files refused, not misread | `ctb.rs` |
+| CTB to GOO, pixel for pixel | `ctb.rs` |
+| **A file Chitubox produced** | `ctb.rs`, skipped without `CHEAPAZSLA_REAL_CTB` |
+
+Every row but the last reads a file this project built, so they prove the
+reader agrees with itself rather than with Chitubox. The last row is the one
+that decides whether CTB works.
+
 ### GOO
 
 | Check | Test |

@@ -161,13 +161,26 @@ time. The output is byte-identical apart from the timestamp in the header.
 | SL1 reading | done, tested against real slicer output |
 | SL1 writing | not started |
 | GOO reading and writing | done, verified against a real Elegoo file |
-| CTB, PHZ | not started |
+| CTB reading | done, **not yet verified against a Chitubox file** |
+| CTB writing, PHZ | not started |
 | Desktop interface | done |
 | Command line | done |
 | Packaging | not started |
 
 Anything marked not started is absent, not stubbed. There are no buttons that
 do nothing.
+
+CTB is the one line above that needs reading twice. The reader is written and
+tested: it round trips through its own encoder, converts to GOO pixel for
+pixel, and refuses truncated, over-large, encrypted and out-of-bounds files
+without panicking. What none of that proves is that the layout matches what
+Chitubox writes, because every one of those tests reads a file this project
+built. The test that would prove it is written and skips until a real file is
+available:
+
+    CHEAPAZSLA_REAL_CTB=/path/to/from-chitubox.ctb cargo test -p cheapazsla-core
+
+Until that has run, CTB is not supported, only implemented.
 
 What is coming and in what order is in [docs/ROADMAP.md](docs/ROADMAP.md),
 including which of the thirty-odd resin formats are worth adding and which
