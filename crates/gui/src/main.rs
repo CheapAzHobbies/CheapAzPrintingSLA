@@ -994,13 +994,39 @@ fn build_dropzone() -> (gtk::Box, gtk::Label) {
     browse.set_margin_bottom(theme::SPACE_5);
     browse.set_widget_name("dropzone-browse");
 
-    let readable: Vec<String> = registry::readable()
-        .iter()
-        .map(|i| i.extension.to_uppercase())
-        .collect();
-    let formats = gtk::Label::new(Some(&format!("Opens {}", readable.join(" · "))));
-    formats.add_css_class("caption");
-    formats.add_css_class("cz-dim");
+    // One format per line rather than a row of names separated by dots. There
+    // were two when that was written and there are four now, and a run-on list
+    // of extensions is harder to read than a short column of them. The line
+    // has room for the format's real name as well, which the dots never did.
+    let formats = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    formats.set_halign(gtk::Align::Center);
+    let opens = gtk::Label::new(Some("Opens"));
+    opens.add_css_class("caption");
+    opens.add_css_class("cz-dim");
+    opens.set_margin_bottom(theme::SPACE_1);
+    formats.append(&opens);
+
+    // A grid rather than one label per line, so the names end and the
+    // extensions begin in the same place down the column. Centred lines of
+    // differing length leave both edges ragged, which is the sort of thing
+    // that reads as untidy without it being obvious why.
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(theme::SPACE_2 as u32);
+    grid.set_halign(gtk::Align::Center);
+    for (row, info) in registry::readable().iter().enumerate() {
+        let name = gtk::Label::builder().label(info.name).xalign(1.0).build();
+        let ext = gtk::Label::builder()
+            .label(format!(".{}", info.extension))
+            .xalign(0.0)
+            .build();
+        for l in [&name, &ext] {
+            l.add_css_class("caption");
+            l.add_css_class("cz-dim");
+        }
+        grid.attach(&name, 0, row as i32, 1, 1);
+        grid.attach(&ext, 1, row as i32, 1, 1);
+    }
+    formats.append(&grid);
 
     zone.append(&icon);
     zone.append(&title);
