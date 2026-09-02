@@ -1070,7 +1070,7 @@ fn build_nearby_panel() -> (
     // instead of cutting.
     let clip = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
         .vexpand(false)
         .build();
@@ -1078,8 +1078,6 @@ fn build_nearby_panel() -> (
     let expander = adw::ExpanderRow::builder()
         .title("Quick Access")
         .expanded(false)
-        .title_lines(1)
-        .subtitle_lines(1)
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
 
@@ -2190,7 +2188,6 @@ fn refresh_nearby(ui: &Rc<App>) {
             // the panel labouring the point rather than offering the fix.
             let row = adw::ActionRow::builder()
                 .title("Choose a folder or drive to look in")
-                .title_lines(1)
                 .activatable(true)
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
@@ -2201,8 +2198,6 @@ fn refresh_nearby(ui: &Rc<App>) {
             let row = adw::ActionRow::builder()
                 .title("No convertible files found")
                 .subtitle("Add a folder, or refresh after your slicer writes one")
-                .title_lines(1)
-                .subtitle_lines(1)
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
             row
@@ -2252,8 +2247,6 @@ fn refresh_nearby(ui: &Rc<App>) {
                     .map(render::human_age)
                     .unwrap_or_else(|| "date unknown".to_string()),
             ))
-            .title_lines(1)
-            .subtitle_lines(1)
             .activatable(true)
             .build();
         row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
@@ -2295,17 +2288,25 @@ fn refresh_nearby(ui: &Rc<App>) {
 const NEARBY_TAU: f64 = 0.06;
 const NEARBY_MIN_SPEED: f64 = 260.0;
 
-/// Park the list at the height of its contents.
+/// Hand the list's height back to the list.
 ///
-/// The minimum is pinned rather than left alone because a scrolled window's
-/// own minimum height is zero - that is the whole point of it, and it is what
-/// makes the clipping possible - and a box will happily allocate zero to a
-/// child that says it can live with zero. Left unpinned the panel vanished
-/// altogether. The maximum goes back to unset, so the list is free to follow
-/// its own content again until the next change.
-fn settle_nearby(clip: &gtk::ScrolledWindow, height: i32) {
-    clip.set_min_content_height(height);
+/// A scrolled window that may scroll can be any height it likes, which is what
+/// makes the clipping possible and is also the whole problem when it is not
+/// animating: it will happily take zero, or stay at the height it had while
+/// the expander opens underneath it. `Never` makes it measure exactly as the
+/// list inside it does, so at rest it is not really a scrolled window at all -
+/// it is the list, and it grows and shrinks with its own contents.
+fn settle_nearby(clip: &gtk::ScrolledWindow) {
+    clip.set_vscrollbar_policy(gtk::PolicyType::Never);
+    clip.set_min_content_height(-1);
     clip.set_max_content_height(-1);
+}
+
+/// Hold the list at one height, whatever its contents now measure.
+fn hold_nearby(clip: &gtk::ScrolledWindow, height: i32) {
+    clip.set_vscrollbar_policy(gtk::PolicyType::External);
+    clip.set_min_content_height(height);
+    clip.set_max_content_height(height);
 }
 
 /// Walk the Quick Access list from the height it had to the height it wants.
@@ -2321,8 +2322,6 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         return;
     };
 
-    // Rows are held to one line each, so their height does not depend on the
-    // width they are measured at and this answer keeps holding after a resize.
     let width = clip.width();
     let for_width = if width > 0 { width } else { -1 };
     let (_, to, _, _) = child.measure(gtk::Orientation::Vertical, for_width);
@@ -2334,18 +2333,17 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         return;
     }
     if from <= 0 || from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
-        settle_nearby(&clip, to);
+        settle_nearby(&clip);
         return;
     }
     let Some(root) = clip.root() else {
-        settle_nearby(&clip, to);
+        settle_nearby(&clip);
         return;
     };
 
     ui.nearby_target.set(to as f64);
     ui.nearby_h.set(from as f64);
-    clip.set_min_content_height(from);
-    clip.set_max_content_height(from);
+    hold_nearby(&clip, from);
     ui.nearby_moving.set(true);
 
     let root: gtk::Widget = root.upcast();
@@ -2373,15 +2371,13 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
 
         if remaining.abs() < 1.0 || step.abs() >= remaining.abs() {
             height.set(want);
-            settle_nearby(&clip, want.round() as i32);
+            settle_nearby(&clip);
             moving.set(false);
             return glib::ControlFlow::Break;
         }
 
         height.set(at + step);
-        let reached = (at + step).round() as i32;
-        clip.set_min_content_height(reached);
-        clip.set_max_content_height(reached);
+        hold_nearby(&clip, (at + step).round() as i32);
         glib::ControlFlow::Continue
     });
 }
