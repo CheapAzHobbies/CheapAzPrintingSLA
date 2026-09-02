@@ -143,6 +143,13 @@ struct App {
     nearby_expander: adw::ExpanderRow,
     /// Opens the list of folders and drives Quick Access may look in.
     nearby_sources: gtk::MenuButton,
+    /// Holds the list at whatever height the animation is currently on.
+    nearby_clip: gtk::ScrolledWindow,
+    /// Where that height is now, where it is heading, and whether a tick
+    /// callback is already walking it there.
+    nearby_h: Rc<Cell<f64>>,
+    nearby_target: Rc<Cell<f64>>,
+    nearby_moving: Rc<Cell<bool>>,
     /// The rows currently inside the expander, so a refresh can take them out
     /// again without rebuilding the row and losing whether it was open.
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
@@ -300,7 +307,7 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
-    let (nearby_panel, nearby_expander, nearby_sources) = build_nearby_panel();
+    let (nearby_panel, nearby_expander, nearby_sources, nearby_clip) = build_nearby_panel();
     let queue_list = gtk::ListBox::new();
     queue_list.set_selection_mode(gtk::SelectionMode::Single);
     queue_list.add_css_class("cz-queue");
@@ -505,6 +512,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone_title,
         nearby_panel: nearby_panel.clone(),
         nearby_expander,
+        nearby_clip,
+        nearby_h: Rc::new(Cell::new(0.0)),
+        nearby_target: Rc::new(Cell::new(0.0)),
+        nearby_moving: Rc::new(Cell::new(false)),
         nearby_sources: nearby_sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
@@ -1038,13 +1049,31 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
 /// Collapsed by default, and hidden entirely when the scan finds nothing, so
 /// it costs one row of height rather than a list. That matters at the small
 /// window sizes this layout was fought into fitting.
-fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow, gtk::MenuButton) {
+fn build_nearby_panel() -> (
+    gtk::Box,
+    adw::ExpanderRow,
+    gtk::MenuButton,
+    gtk::ScrolledWindow,
+) {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     panel.set_visible(false);
 
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
+
+    // The list sits in a scrolled window that never scrolls. It is here for
+    // its one other property: a scrolled window is allowed to be a different
+    // height than the thing inside it, and a box is not. That is what lets
+    // `animate_nearby_height` hold the panel at a height the rebuilt list has
+    // already left behind, and walk it to the new one over a few frames
+    // instead of cutting.
+    let clip = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::External)
+        .propagate_natural_height(true)
+        .vexpand(false)
+        .build();
 
     let expander = adw::ExpanderRow::builder()
         .title("Quick Access")
@@ -1067,9 +1096,10 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow, gtk::MenuButton) {
     expander.add_suffix(&refresh);
 
     list.append(&expander);
-    panel.append(&list);
+    clip.set_child(Some(&list));
+    panel.append(&clip);
 
-    (panel, expander, folder)
+    (panel, expander, folder, clip)
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -2105,6 +2135,12 @@ fn choose_scan_folder(ui: &Rc<App>) {
 /// The expander itself is reused rather than rebuilt, so a refresh does not
 /// snap it shut while the user is reading it.
 fn refresh_nearby(ui: &Rc<App>) {
+    // Read before the rows go, so the animation knows where it is starting
+    // from. Mid-flight this is the animated height rather than the content's,
+    // which is what makes a second change during the first one continue from
+    // where the panel actually is instead of snapping back.
+    let was = ui.nearby_clip.height();
+
     for row in ui.nearby_rows.borrow_mut().drain(..) {
         ui.nearby_expander.remove(&row);
     }
@@ -2147,9 +2183,11 @@ fn refresh_nearby(ui: &Rc<App>) {
         // the row says so and opens the picker; when sources are selected but
         // hold nothing, there is no choice to make, so it only reports.
         let row = if on.is_empty() {
+            // No subtitle. The expander directly above already says nothing is
+            // selected, and repeating it underneath in longer words reads as
+            // the panel labouring the point rather than offering the fix.
             let row = adw::ActionRow::builder()
                 .title("Choose a folder or drive to look in")
-                .subtitle("Nothing is selected, so there is nowhere to read from")
                 .activatable(true)
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
@@ -2173,6 +2211,7 @@ fn refresh_nearby(ui: &Rc<App>) {
         // Expansion is the user's state to hold, and only choosing a file
         // hands it back.
         ui.nearby_panel.set_visible(true);
+        animate_nearby_height(ui, was);
         return;
     }
 
@@ -2240,6 +2279,90 @@ fn refresh_nearby(ui: &Rc<App>) {
         ui.nearby_rows.borrow_mut().push(row);
     }
     ui.nearby_panel.set_visible(true);
+    animate_nearby_height(ui, was);
+}
+
+/// How fast the list settles on its new height. The distance left shrinks by
+/// the same proportion every second, with a floor underneath so the last few
+/// pixels do not crawl - an exponential never quite arrives on its own.
+const NEARBY_TAU: f64 = 0.06;
+const NEARBY_MIN_SPEED: f64 = 260.0;
+
+/// Walk the Quick Access list from the height it had to the height it wants.
+///
+/// Switching a source off takes its rows out on the next frame and everything
+/// below jumps up to meet the gap. Nothing in GTK animates that: a list box is
+/// exactly as tall as its rows. So the list is held inside a scrolled window,
+/// whose natural height can be capped at a value of our choosing, and the cap
+/// is walked from the old height to the new one and then released.
+fn animate_nearby_height(ui: &Rc<App>, from: i32) {
+    let clip = ui.nearby_clip.clone();
+
+    // Nothing to ease from: first draw, animations off, or the panel is not
+    // on screen to be looked at.
+    if from <= 0 || !clip.is_mapped() || !ui.settings.borrow().animations {
+        clip.set_max_content_height(-1);
+        ui.nearby_moving.set(false);
+        return;
+    }
+    let (Some(child), Some(root)) = (clip.child(), clip.root()) else {
+        clip.set_max_content_height(-1);
+        return;
+    };
+
+    // The child is measured directly, so the cap already on the scrolled
+    // window does not colour the answer.
+    let width = clip.width();
+    let for_width = if width > 0 { width } else { -1 };
+    let (_, to, _, _) = child.measure(gtk::Orientation::Vertical, for_width);
+    if to == from {
+        return;
+    }
+
+    ui.nearby_target.set(to as f64);
+    ui.nearby_h.set(from as f64);
+    clip.set_max_content_height(from);
+    if ui.nearby_moving.replace(true) {
+        // Already walking; it will pick up the new target on its next frame.
+        return;
+    }
+
+    let root: gtk::Widget = root.upcast();
+    let target = ui.nearby_target.clone();
+    let height = ui.nearby_h.clone();
+    let moving = ui.nearby_moving.clone();
+    let last = Cell::new(None::<i64>);
+    root.add_tick_callback(move |_, clock| {
+        let now = clock.frame_time();
+        // A long gap means the clock was stopped, not that a long step is
+        // owed; clamped so coming back to the window does not teleport it.
+        let dt = match last.replace(Some(now)) {
+            Some(previous) => ((now - previous) as f64 / 1e6).clamp(0.0, 0.1),
+            None => 0.0,
+        };
+
+        let want = target.get();
+        let at = height.get();
+        let remaining = want - at;
+        let mut step = remaining * (1.0 - (-dt / NEARBY_TAU).exp());
+        let floor = NEARBY_MIN_SPEED * dt;
+        if step.abs() < floor {
+            step = floor * remaining.signum();
+        }
+
+        if remaining.abs() < 1.0 || step.abs() >= remaining.abs() {
+            height.set(want);
+            // Released rather than pinned at the final number, so the list is
+            // free to size itself again the moment the animation is over.
+            clip.set_max_content_height(-1);
+            moving.set(false);
+            return glib::ControlFlow::Break;
+        }
+
+        height.set(at + step);
+        clip.set_max_content_height((at + step).round() as i32);
+        glib::ControlFlow::Continue
+    });
 }
 
 fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
