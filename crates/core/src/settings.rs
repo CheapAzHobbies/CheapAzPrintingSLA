@@ -52,6 +52,16 @@ pub struct Settings {
     /// Offer readable files found in the open folder and on mounted drives,
     /// so a file can be picked without opening a file dialog for it.
     pub show_nearby_files: bool,
+    /// Extra folders Quick Access looks in, beyond the one the file chooser
+    /// starts from.
+    pub quick_access_folders: Vec<PathBuf>,
+    /// Sources Quick Access has been told to skip, by key: a folder's path,
+    /// or `drive:LABEL` for a mounted drive.
+    ///
+    /// Stored as an off-list rather than an on-list so a drive plugged in for
+    /// the first time is scanned without being enabled by hand, which is the
+    /// behaviour that makes the feature worth having.
+    pub quick_access_off: Vec<String>,
     /// Drives the user has marked as never ejectable, by name.
     ///
     /// This is a second lock, not the only one. Filesystems the system needs
@@ -77,6 +87,8 @@ impl Default for Settings {
             pinned_subfolder: String::new(),
             auto_lock_new_drives: false,
             show_nearby_files: true,
+            quick_access_folders: Vec::new(),
+            quick_access_off: Vec::new(),
             never_eject: Vec::new(),
         }
     }
@@ -140,6 +152,20 @@ impl Settings {
         if let Some(v) = map.get("show_nearby_files") {
             s.show_nearby_files = v == "true";
         }
+        if let Some(v) = map.get("quick_access_folders") {
+            s.quick_access_folders = v
+                .split('\x1f')
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
+        if let Some(v) = map.get("quick_access_off") {
+            s.quick_access_off = v
+                .split('\x1f')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+        }
         if let Some(v) = map.get("never_eject") {
             s.never_eject = v
                 .split('\x1f')
@@ -194,7 +220,9 @@ impl Settings {
              pinned_subfolder = {}\n\
              auto_lock_new_drives = {}\n\
              show_nearby_files = {}\n\
-             never_eject = {}\n",
+             never_eject = {}\n\
+             quick_access_folders = {}\n\
+             quick_access_off = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -217,6 +245,12 @@ impl Settings {
             self.auto_lock_new_drives,
             self.show_nearby_files,
             self.never_eject.join("\x1f"),
+            self.quick_access_folders
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\x1f"),
+            self.quick_access_off.join("\x1f"),
         );
         std::fs::write(path, body)
     }

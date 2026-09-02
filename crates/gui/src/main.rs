@@ -141,6 +141,8 @@ struct App {
     /// Collapsed by default: it is an alternative to the file dialog, not
     /// something to read every time the page is opened.
     nearby_expander: adw::ExpanderRow,
+    /// Opens the list of folders and drives Quick Access may look in.
+    nearby_sources: gtk::MenuButton,
     /// The rows currently inside the expander, so a refresh can take them out
     /// again without rebuilding the row and losing whether it was open.
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
@@ -298,7 +300,7 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
-    let (nearby_panel, nearby_expander) = build_nearby_panel();
+    let (nearby_panel, nearby_expander, nearby_sources) = build_nearby_panel();
     let queue_list = gtk::ListBox::new();
     queue_list.set_selection_mode(gtk::SelectionMode::Single);
     queue_list.add_css_class("cz-queue");
@@ -503,6 +505,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone_title,
         nearby_panel: nearby_panel.clone(),
         nearby_expander,
+        nearby_sources: nearby_sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
         queue_panel,
@@ -1035,7 +1038,7 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
 /// Collapsed by default, and hidden entirely when the scan finds nothing, so
 /// it costs one row of height rather than a list. That matters at the small
 /// window sizes this layout was fought into fitting.
-fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
+fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow, gtk::MenuButton) {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     panel.set_visible(false);
 
@@ -1049,9 +1052,13 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
 
-    let folder = shell::icon_button("folder-symbolic", "Choose the folder to look in");
-    folder.set_widget_name("nearby-folder");
-    folder.set_valign(gtk::Align::Center);
+    let folder = gtk::MenuButton::builder()
+        .icon_name("folder-symbolic")
+        .tooltip_text("Choose which folders and drives to look in")
+        .valign(gtk::Align::Center)
+        .build();
+    folder.add_css_class("flat");
+    folder.set_widget_name("nearby-sources");
     expander.add_suffix(&folder);
 
     let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
@@ -1062,7 +1069,7 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
     list.append(&expander);
     panel.append(&list);
 
-    (panel, expander)
+    (panel, expander, folder)
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -1633,12 +1640,9 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         });
     }
 
-    // Choosing which folder the suggestions come from, at the point they are
-    // shown rather than buried in Settings.
-    if let Some(btn) = find_named(&ui.nearby_panel, "nearby-folder") {
-        let ui = ui.clone();
-        btn.connect_clicked(move |_| choose_scan_folder(&ui));
-    }
+    // Choosing where the suggestions come from, at the point they are shown
+    // rather than buried in Settings.
+    build_sources_menu(ui, &ui.nearby_sources.clone());
 
     refresh_nearby(ui);
 
@@ -1937,11 +1941,121 @@ fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
         .add_toast(adw::Toast::new(&format!("Saving to {name}")));
 }
 
-/// Pick the folder the suggestions are drawn from.
+/// The "look in" menu: every folder and drive Quick Access could scan, each
+/// with a switch.
 ///
-/// The same setting as "Folder to open from" in preferences, offered again
-/// where its effect is visible. Mounted drives are always scanned on top of
-/// it, so this chooses the one place that is not found automatically.
+/// Rebuilt every time it opens, because drives appear and disappear while the
+/// window is up and a stale list would offer somewhere that is no longer
+/// there.
+fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.set_size_request(320, -1);
+    content.set_margin_top(theme::SPACE_2);
+    content.set_margin_bottom(theme::SPACE_2);
+    let popover = gtk::Popover::builder().child(&content).build();
+    button.set_popover(Some(&popover));
+
+    let ui = ui.clone();
+    let pop = popover.clone();
+    popover.connect_show(move |_| {
+        while let Some(child) = content.first_child() {
+            content.remove(&child);
+        }
+
+        let heading = shell::section_label("Look in");
+        heading.set_margin_start(theme::SPACE_3);
+        heading.set_margin_bottom(theme::SPACE_2);
+        content.append(&heading);
+
+        let (open_dir, extra, off) = {
+            let s = ui.settings.borrow();
+            (
+                s.open_start_dir(),
+                s.quick_access_folders.clone(),
+                s.quick_access_off.clone(),
+            )
+        };
+        let sources = nearby::sources(open_dir.as_deref(), &extra, &off);
+
+        if sources.is_empty() {
+            let none = gtk::Label::new(Some("Nowhere to look yet"));
+            none.add_css_class("dim-label");
+            none.set_margin_start(theme::SPACE_3);
+            none.set_xalign(0.0);
+            content.append(&none);
+        }
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("boxed-list");
+        list.set_margin_start(theme::SPACE_2);
+        list.set_margin_end(theme::SPACE_2);
+        for source in sources {
+            let row = adw::SwitchRow::builder()
+                .title(&source.label)
+                .subtitle(source.path.display().to_string())
+                .active(source.enabled)
+                .build();
+            {
+                let ui = ui.clone();
+                let key = source.key.clone();
+                row.connect_active_notify(move |r| {
+                    {
+                        let mut s = ui.settings.borrow_mut();
+                        s.quick_access_off.retain(|k| *k != key);
+                        if !r.is_active() {
+                            s.quick_access_off.push(key.clone());
+                        }
+                        let _ = s.save();
+                    }
+                    refresh_nearby(&ui);
+                });
+            }
+            // A drive is on the list because it is plugged in; only folders
+            // the user added are theirs to take off it.
+            if source.removable_entry {
+                let drop =
+                    shell::icon_button("list-remove-symbolic", "Stop looking in this folder");
+                drop.set_valign(gtk::Align::Center);
+                let ui2 = ui.clone();
+                let path = source.path.clone();
+                let pop2 = pop.clone();
+                drop.connect_clicked(move |_| {
+                    {
+                        let mut s = ui2.settings.borrow_mut();
+                        s.quick_access_folders.retain(|p| *p != path);
+                        let _ = s.save();
+                    }
+                    refresh_nearby(&ui2);
+                    pop2.popdown();
+                });
+                row.add_suffix(&drop);
+            }
+            list.append(&row);
+        }
+        content.append(&list);
+
+        let add = gtk::Button::builder().build();
+        add.set_child(Some(&labelled_icon("list-add-symbolic", "Add Folder…")));
+        add.add_css_class("flat");
+        add.set_margin_top(theme::SPACE_2);
+        {
+            let ui = ui.clone();
+            let pop2 = pop.clone();
+            add.connect_clicked(move |_| {
+                pop2.popdown();
+                choose_scan_folder(&ui);
+            });
+        }
+        content.append(&add);
+    });
+}
+
+/// Add a folder to the places Quick Access looks.
+///
+/// Folders chosen here sit alongside the folder the file chooser starts from
+/// and every mounted drive; the switches in the menu decide which of them are
+/// actually scanned.
 fn choose_scan_folder(ui: &Rc<App>) {
     let dialog = gtk::FileDialog::builder()
         .title("Look for files in")
@@ -1959,7 +2073,16 @@ fn choose_scan_folder(ui: &Rc<App>) {
                 if let Some(path) = folder.path() {
                     {
                         let mut s = ui.settings.borrow_mut();
-                        s.default_open_dir = Some(path);
+                        // Added alongside the others rather than replacing
+                        // them: the point of the picker is holding more than
+                        // one place at a time.
+                        if !s.quick_access_folders.contains(&path) {
+                            s.quick_access_folders.push(path.clone());
+                        }
+                        // Adding a folder that was previously switched off is
+                        // a request to look in it again.
+                        let key = path.to_string_lossy().into_owned();
+                        s.quick_access_off.retain(|k| *k != key);
                         let _ = s.save();
                     }
                     refresh_nearby(&ui);
@@ -1991,23 +2114,32 @@ fn refresh_nearby(ui: &Rc<App>) {
         return;
     }
 
-    let open_dir = ui.settings.borrow().open_start_dir();
+    let (open_dir, extra, off) = {
+        let s = ui.settings.borrow();
+        (
+            s.open_start_dir(),
+            s.quick_access_folders.clone(),
+            s.quick_access_off.clone(),
+        )
+    };
+    let sources = nearby::sources(open_dir.as_deref(), &extra, &off);
     let queued: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
-    let found = nearby::scan(open_dir.as_deref(), &queued);
+    let found = nearby::scan(&sources, &queued);
 
     if found.is_empty() {
         // Still shown, collapsed and empty. Hiding it took the folder picker
         // with it, which is precisely the control wanted at the moment there
         // is nothing to offer - including right after the only suggestion has
         // been queued.
-        ui.nearby_expander.set_subtitle(&match open_dir {
-            Some(d) => format!(
-                "Nothing to convert in {}",
-                d.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| d.display().to_string())
-            ),
-            None => "Choose a folder to look in".to_string(),
+        let on: Vec<String> = sources
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.label.clone())
+            .collect();
+        ui.nearby_expander.set_subtitle(&if on.is_empty() {
+            "Nothing selected to look in".to_string()
+        } else {
+            format!("Nothing to convert in {}", on.join(", "))
         });
         ui.nearby_expander.set_expanded(false);
         ui.nearby_panel.set_visible(true);
