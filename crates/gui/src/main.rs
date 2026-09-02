@@ -16,6 +16,15 @@ mod shell;
 mod theme;
 mod viewer;
 
+/// How long the controls take to fade in once a file is queued. Short: this
+/// is motion that explains a change, not a wait to sit through.
+const CONTROLS_MS: u32 = 200;
+/// Roughly how long an AdwExpanderRow takes to fold. libadwaita exposes no
+/// "finished" signal for it, so the step that follows is timed to match
+/// rather than chained to it: being slightly late looks fine, being early is
+/// the clunk.
+const EXPANDER_MS: u64 = 220;
+
 use adw::prelude::*;
 use cheapazsla_core::history::{self, History};
 use cheapazsla_core::remedy::{self, Suggestion};
@@ -140,6 +149,8 @@ struct App {
     queue_panel: gtk::Box,
     queue_list: gtk::ListBox,
     controls: gtk::Box,
+    /// Wraps `controls` so the form fades in rather than appearing whole.
+    controls_reveal: gtk::Revealer,
     input_label: gtk::Label,
     /// Opens the list of formats the input can be read as.
     input_button: gtk::MenuButton,
@@ -301,7 +312,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     let add_more = gtk::Button::builder().label("Add Files").build();
     add_more.add_css_class("flat");
     add_more.set_hexpand(true);
-    // Matched to the height of the Quick Open row that sits under it.
+    // Matched to the height of the Quick Access row that sits under it.
     let add_label = labelled_icon("list-add-symbolic", "Add Files");
     add_label.set_halign(gtk::Align::Start);
     add_label.set_margin_top(theme::SPACE_3);
@@ -425,6 +436,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         &problem,
     );
     let controls = convert_page.1;
+    let controls_reveal = convert_page.5;
     let name_row = convert_page.2;
     let format_row = convert_page.3;
     let swap_col = convert_page.4;
@@ -496,6 +508,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         queue_panel,
         queue_list,
         controls,
+        controls_reveal,
         input_label,
         input_button: input_button.clone(),
         output_picker: output_picker.clone(),
@@ -554,7 +567,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         let window = ui.window.clone();
         ui.shell.connect_about(move || show_about(&window));
     }
-    ui.shell.set_animate(ui.settings.borrow().animations);
+    let animate = ui.settings.borrow().animations;
+    ui.shell.set_animate(animate);
+    ui.controls_reveal
+        .set_transition_duration(if animate { CONTROLS_MS } else { 0 });
     wire_responsive(&ui);
     restore_session(&ui);
     refresh_history(&ui);
@@ -1005,7 +1021,7 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
     b
 }
 
-/// The "Quick Open" panel: readable files already sitting somewhere the
+/// The "Quick Access" panel: readable files already sitting somewhere the
 /// program knows about, offered as one-click alternatives to the file dialog.
 ///
 /// Named for what it does rather than for what it contains. "Available
@@ -1028,7 +1044,7 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
     list.set_selection_mode(gtk::SelectionMode::None);
 
     let expander = adw::ExpanderRow::builder()
-        .title("Quick Open")
+        .title("Quick Access")
         .expanded(false)
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
@@ -1200,7 +1216,14 @@ fn build_convert_page(
     progress: &gtk::ProgressBar,
     penguin: &Rc<penguin::Penguin>,
     problem: &gtk::Box,
-) -> (gtk::Widget, gtk::Box, gtk::Box, gtk::Box, gtk::Box) {
+) -> (
+    gtk::Widget,
+    gtk::Box,
+    gtk::Box,
+    gtk::Box,
+    gtk::Box,
+    gtk::Revealer,
+) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
     content.append(dropzone);
     content.append(queue_panel);
@@ -1209,7 +1232,14 @@ fn build_convert_page(
     // Controls stay hidden until there is a file, so a new user sees one
     // instruction rather than a form (§2, §36).
     let controls = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
-    controls.set_visible(false);
+    // Revealed rather than shown, so the form fades in behind the queue
+    // instead of the whole page changing in one frame.
+    let controls_reveal = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::Crossfade)
+        .transition_duration(CONTROLS_MS)
+        .reveal_child(false)
+        .child(&controls)
+        .build();
 
     // INPUT  ⇄  OUTPUT
     let formats = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
@@ -1310,7 +1340,7 @@ fn build_convert_page(
     action.append(progress);
     controls.append(&action);
 
-    content.append(&controls);
+    content.append(&controls_reveal);
     (
         page_frame(
             "Convert",
@@ -1321,6 +1351,7 @@ fn build_convert_page(
         name_row,
         formats,
         swap_col,
+        controls_reveal,
     )
 }
 
@@ -1941,7 +1972,7 @@ fn choose_scan_folder(ui: &Rc<App>) {
     );
 }
 
-/// Rebuild the "Quick Open" list.
+/// Rebuild the "Quick Access" list.
 ///
 /// Cheap enough to call on any event that might have changed the answer: a
 /// drive appearing, the window regaining focus, a file being queued. It reads
@@ -2028,7 +2059,20 @@ fn refresh_nearby(ui: &Rc<App>) {
                     exp.set_expanded(false);
                 }
             }
-            add_files(&ui2, vec![path.clone()]);
+            // One change at a time. Folding the list and swapping the page in
+            // the same frame reads as everything moving at once, which is the
+            // clunk; letting the fold finish first makes the two steps legible
+            // as cause and effect.
+            if !ui2.settings.borrow().animations {
+                add_files(&ui2, vec![path.clone()]);
+                return;
+            }
+            let ui3 = ui2.clone();
+            let queued = path.clone();
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(EXPANDER_MS),
+                move || add_files(&ui3, vec![queued]),
+            );
         });
         ui.nearby_expander.add_row(&row);
         ui.nearby_rows.borrow_mut().push(row);
@@ -2074,6 +2118,7 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
         ui.dropzone.set_visible(false);
         ui.queue_panel.set_visible(true);
         ui.controls.set_visible(true);
+        ui.controls_reveal.set_reveal_child(true);
         if ui.files.borrow().len() == added {
             select_file(ui, 0);
         }
@@ -2508,6 +2553,7 @@ fn remove_file(ui: &Rc<App>, path: &Path) {
         ui.dropzone.set_visible(true);
         ui.queue_panel.set_visible(false);
         ui.controls.set_visible(false);
+        ui.controls_reveal.set_reveal_child(false);
         ui.preview_stack.set_visible_child_name("empty");
         // Drop the texture as well, so the last layer of a removed file is
         // not still sitting in memory waiting to reappear.
@@ -4078,6 +4124,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         animate.connect_active_notify(move |r| {
             let on = r.is_active();
             ui.shell.set_animate(on);
+            ui.controls_reveal
+                .set_transition_duration(if on { CONTROLS_MS } else { 0 });
             let mut s = ui.settings.borrow_mut();
             s.animations = on;
             let _ = s.save();
@@ -4143,7 +4191,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add(&open_row);
 
     let nearby_row = adw::SwitchRow::builder()
-        .title("Quick Open list")
+        .title("Quick Access list")
         .subtitle("Offer convertible files from your chosen folder and mounted drives, on the Convert page")
         .active(current.show_nearby_files)
         .build();
