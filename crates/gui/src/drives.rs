@@ -162,13 +162,19 @@ pub fn is_ejectable(name: &str, protected: &[String]) -> bool {
 /// The flush is the point of the whole feature. Pulling a stick with dirty
 /// buffers is how a print file arrives at the printer truncated, and the
 /// truncation shows up as a failed print rather than as a copy error.
-pub fn eject<F: Fn(Result<(), String>) + 'static>(name: &str, done: F) {
+pub fn eject<F: Fn(Result<(), String>) + 'static>(drive: &Drive, done: F) {
+    let name = drive.name.clone();
     let monitor = gio::VolumeMonitor::get();
+    // Matched on the mount point, not the label. Two unlabelled sticks are
+    // both called the same thing by the desktop, and ejecting the wrong one
+    // of a matched pair is exactly the mistake this must not make. The mount
+    // point is unique while the drive is attached, which is the only window
+    // in which ejecting means anything.
     let Some(mount) = monitor
         .mounts()
         .into_iter()
         .filter(|m| !m.is_shadowed())
-        .find(|m| m.name() == name)
+        .find(|m| m.root().path().as_deref() == Some(drive.path.as_path()))
     else {
         done(Err(format!("{name} is no longer connected")));
         return;

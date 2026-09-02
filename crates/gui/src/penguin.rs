@@ -157,9 +157,20 @@ mod tests {
 ///
 /// Returns a widget plus handles to start and stop it. Nothing runs while it
 /// is stopped, so an idle window costs nothing.
+/// How long work must last before the indicator appears at all.
+///
+/// Reading a small file finishes in a few tens of milliseconds. Showing a
+/// busy animation for that long is worse than showing nothing: it registers
+/// as a flicker, which reads as a fault rather than as progress. Nothing is
+/// drawn unless the work outlives this.
+const SHOW_AFTER_MS: u64 = 400;
+
 pub struct Penguin {
     pub widget: gtk::Picture,
     timer: RefCell<Option<gtk::glib::SourceId>>,
+    /// Waiting to find out whether this job is slow enough to be worth
+    /// showing. Cancelled by `stop` if it is not.
+    pending: RefCell<Option<gtk::glib::SourceId>>,
     frames: Option<Rc<Vec<gdk::Texture>>>,
     index: RefCell<usize>,
 }
@@ -180,6 +191,7 @@ impl Penguin {
         Rc::new(Self {
             widget,
             timer: RefCell::new(None),
+            pending: RefCell::new(None),
             frames,
             index: RefCell::new(0),
         })
@@ -190,7 +202,25 @@ impl Penguin {
         self.frames.is_some()
     }
 
+    /// Arm the indicator. It appears only if the work is still going after
+    /// `SHOW_AFTER_MS`; a fast job shows nothing at all.
     pub fn start(self: &Rc<Self>) {
+        if self.frames.is_none() || self.timer.borrow().is_some() || self.pending.borrow().is_some()
+        {
+            return;
+        }
+        let me = self.clone();
+        let id = gtk::glib::timeout_add_local_once(
+            std::time::Duration::from_millis(SHOW_AFTER_MS),
+            move || {
+                me.pending.borrow_mut().take();
+                me.show_now();
+            },
+        );
+        *self.pending.borrow_mut() = Some(id);
+    }
+
+    fn show_now(self: &Rc<Self>) {
         if self.frames.is_none() || self.timer.borrow().is_some() {
             return;
         }
@@ -210,6 +240,11 @@ impl Penguin {
     }
 
     pub fn stop(&self) {
+        // Cancelling before it is shown is the common case, and the point:
+        // the work finished quickly and nothing should have appeared.
+        if let Some(id) = self.pending.borrow_mut().take() {
+            id.remove();
+        }
         if let Some(id) = self.timer.borrow_mut().take() {
             id.remove();
         }

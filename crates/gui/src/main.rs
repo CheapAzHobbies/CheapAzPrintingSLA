@@ -1613,7 +1613,7 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             let ui2 = ui.clone();
             let btn = b.clone();
             let name = drive.name.clone();
-            drives::eject(&drive.name, move |res| {
+            drives::eject(&drive, move |res| {
                 btn.set_sensitive(true);
                 match res {
                     Ok(()) => {
@@ -3271,7 +3271,7 @@ fn build_destination_menu(ui: &Rc<App>) {
             // useful to make before plugging the drive in.
             add(
                 "drive-removable-media-symbolic",
-                "Connected drive".into(),
+                "Connected drive (Automatically Detect)".into(),
                 Some(match auto_drive(&ui2) {
                     Some(d) => format!(
                         "{} · {}",
@@ -4326,6 +4326,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             row.add_suffix(&lock);
             let ui3 = ui.clone();
             let name = d.name.clone();
+            let drive = d.clone();
             let btn = eject.clone();
             eject.connect_clicked(move |_| {
                 // Ejecting can take a moment while buffers flush; disabling
@@ -4334,7 +4335,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
                 let ui4 = ui3.clone();
                 let name2 = name.clone();
                 let btn2 = btn.clone();
-                drives::eject(&name, move |res| {
+                drives::eject(&drive, move |res| {
                     btn2.set_sensitive(true);
                     match res {
                         Ok(()) => {
