@@ -69,6 +69,17 @@ pub fn target_dir(name: &str, subfolder: &str) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// The mounted drive a path sits on, if any.
+///
+/// Longest match wins, so a drive mounted inside another drive's tree is
+/// reported rather than its parent.
+pub fn containing(path: &std::path::Path) -> Option<Drive> {
+    mounted()
+        .into_iter()
+        .filter(|d| path.starts_with(&d.path))
+        .max_by_key(|d| d.path.as_os_str().len())
+}
+
 /// Free and total bytes on the filesystem holding `dir`, when the OS says.
 pub fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     let info = gio::File::for_path(dir)

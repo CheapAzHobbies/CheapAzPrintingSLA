@@ -146,6 +146,11 @@ struct App {
     output_picker: Rc<format_picker::FormatPicker>,
     swap_btn: gtk::Button,
     dest_button: gtk::MenuButton,
+    /// Eject, beside the destination. Shown only while the output is going to
+    /// a drive that can be ejected, because that is the moment it is wanted:
+    /// saving to a stick and then hunting through Settings to release it is
+    /// the wrong shape for the task.
+    eject_btn: gtk::Button,
     dest_label: gtk::Label,
     dest_detail: gtk::Label,
     name_entry: gtk::Entry,
@@ -372,6 +377,9 @@ fn build(app: &adw::Application) -> Rc<App> {
     dest_content.append(&gtk::Image::from_icon_name("folder-symbolic"));
     dest_content.append(&dest_inner);
     dest_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    let eject_btn = shell::icon_button("media-eject-symbolic", "Eject this drive");
+    eject_btn.set_valign(gtk::Align::Center);
+    eject_btn.set_visible(false);
     let dest_button = gtk::MenuButton::builder().child(&dest_content).build();
     dest_button.set_tooltip_text(Some("Where converted files are saved"));
 
@@ -402,6 +410,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         &swap_btn,
         &output_info,
         &dest_button,
+        &eject_btn,
         &name_entry,
         &convert_btn,
         &progress,
@@ -485,6 +494,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         output_picker: output_picker.clone(),
         swap_btn: swap_btn.clone(),
         dest_button: dest_button.clone(),
+        eject_btn: eject_btn.clone(),
         dest_label,
         dest_detail,
         name_entry: name_entry.clone(),
@@ -1012,6 +1022,11 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
 
+    let folder = shell::icon_button("folder-symbolic", "Choose the folder to look in");
+    folder.set_widget_name("nearby-folder");
+    folder.set_valign(gtk::Align::Center);
+    expander.add_suffix(&folder);
+
     let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
     refresh.set_widget_name("nearby-refresh");
     refresh.set_valign(gtk::Align::Center);
@@ -1168,6 +1183,7 @@ fn build_convert_page(
     swap_btn: &gtk::Button,
     output_info: &gtk::MenuButton,
     dest_button: &gtk::MenuButton,
+    eject_btn: &gtk::Button,
     name_entry: &gtk::Entry,
     convert_btn: &gtk::Button,
     progress: &gtk::ProgressBar,
@@ -1261,7 +1277,11 @@ fn build_convert_page(
     // Destination and filename.
     let dest_col = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
     dest_col.append(&shell::section_label("Save to"));
-    dest_col.append(dest_button);
+    let dest_line = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    dest_button.set_hexpand(true);
+    dest_line.append(dest_button);
+    dest_line.append(eject_btn);
+    dest_col.append(&dest_line);
     controls.append(&dest_col);
 
     let name_row = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
@@ -1541,6 +1561,43 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             }
         });
     }
+    {
+        let ui = ui.clone();
+        ui.eject_btn.clone().connect_clicked(move |b| {
+            let Some(drive) = ui.out_dir.borrow().as_deref().and_then(drives::containing) else {
+                return;
+            };
+            b.set_sensitive(false);
+            let ui2 = ui.clone();
+            let btn = b.clone();
+            let name = drive.name.clone();
+            drives::eject(&drive.name, move |res| {
+                btn.set_sensitive(true);
+                match res {
+                    Ok(()) => {
+                        ui2.toasts
+                            .add_toast(adw::Toast::new(&format!("{name} is safe to remove")));
+                        // The destination just stopped existing; say so rather
+                        // than leaving it pointing at a drive that has gone.
+                        update_eject_button(&ui2);
+                        revalidate(&ui2);
+                        refresh_nearby(&ui2);
+                    }
+                    Err(e) => ui2
+                        .toasts
+                        .add_toast(adw::Toast::new(&format!("Could not eject {name}: {e}"))),
+                }
+            });
+        });
+    }
+
+    // Choosing which folder the suggestions come from, at the point they are
+    // shown rather than buried in Settings.
+    if let Some(btn) = find_named(&ui.nearby_panel, "nearby-folder") {
+        let ui = ui.clone();
+        btn.connect_clicked(move |_| choose_scan_folder(&ui));
+    }
+
     refresh_nearby(ui);
 
     // Output format.
@@ -1836,6 +1893,41 @@ fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
     set_out_dir(ui, Some(target));
     ui.toasts
         .add_toast(adw::Toast::new(&format!("Saving to {name}")));
+}
+
+/// Pick the folder the suggestions are drawn from.
+///
+/// The same setting as "Folder to open from" in preferences, offered again
+/// where its effect is visible. Mounted drives are always scanned on top of
+/// it, so this chooses the one place that is not found automatically.
+fn choose_scan_folder(ui: &Rc<App>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Look for files in")
+        .modal(true)
+        .build();
+    if let Some(dir) = ui.settings.borrow().open_start_dir() {
+        dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
+    }
+    let ui = ui.clone();
+    dialog.select_folder(
+        Some(&ui.window.clone()),
+        gio::Cancellable::NONE,
+        move |res| {
+            if let Ok(folder) = res {
+                if let Some(path) = folder.path() {
+                    {
+                        let mut s = ui.settings.borrow_mut();
+                        s.default_open_dir = Some(path);
+                        let _ = s.save();
+                    }
+                    refresh_nearby(&ui);
+                    // Opened, because choosing a folder is asking to see what
+                    // is in it.
+                    ui.nearby_expander.set_expanded(true);
+                }
+            }
+        },
+    );
 }
 
 /// Rebuild the "Available Files" list.
@@ -3276,8 +3368,28 @@ fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
     }
     *ui.out_dir.borrow_mut() = dir;
     ui.out_auto_drive.set(false);
+    update_eject_button(ui);
     suggest_name(ui);
     revalidate(ui);
+}
+
+/// Show eject beside the destination only when there is something to eject.
+fn update_eject_button(ui: &Rc<App>) {
+    let protected = ui.settings.borrow().never_eject.clone();
+    let drive = ui
+        .out_dir
+        .borrow()
+        .as_deref()
+        .and_then(drives::containing)
+        .filter(|d| d.removable && drives::is_ejectable(&d.name, &protected));
+    match drive {
+        Some(d) => {
+            ui.eject_btn
+                .set_tooltip_text(Some(&format!("Eject {}", d.name)));
+            ui.eject_btn.set_visible(true);
+        }
+        None => ui.eject_btn.set_visible(false),
+    }
 }
 
 fn suggest_name(ui: &Rc<App>) {
