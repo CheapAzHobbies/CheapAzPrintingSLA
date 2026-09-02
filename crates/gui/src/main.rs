@@ -299,7 +299,13 @@ fn build(app: &adw::Application) -> Rc<App> {
         .halign(gtk::Align::Start)
         .build();
     add_more.add_css_class("flat");
-    add_more.set_child(Some(&labelled_icon("list-add-symbolic", "Add Files")));
+    // Matched to the height of the Available Files row that now sits under
+    // it. Left as it was, the heavier row below made the primary way of
+    // adding a file read as the lesser of the two.
+    let add_label = labelled_icon("list-add-symbolic", "Add Files");
+    add_label.set_margin_top(theme::SPACE_3);
+    add_label.set_margin_bottom(theme::SPACE_3);
+    add_more.set_child(Some(&add_label));
     queue_panel.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     queue_panel.append(&add_more);
     queue_panel.set_visible(false);
@@ -1954,7 +1960,21 @@ fn refresh_nearby(ui: &Rc<App>) {
     let found = nearby::scan(open_dir.as_deref(), &queued);
 
     if found.is_empty() {
-        ui.nearby_panel.set_visible(false);
+        // Still shown, collapsed and empty. Hiding it took the folder picker
+        // with it, which is precisely the control wanted at the moment there
+        // is nothing to offer - including right after the only suggestion has
+        // been queued.
+        ui.nearby_expander.set_subtitle(&match open_dir {
+            Some(d) => format!(
+                "Nothing to convert in {}",
+                d.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| d.display().to_string())
+            ),
+            None => "Choose a folder to look in".to_string(),
+        });
+        ui.nearby_expander.set_expanded(false);
+        ui.nearby_panel.set_visible(true);
         return;
     }
 
