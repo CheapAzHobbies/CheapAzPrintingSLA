@@ -294,15 +294,16 @@ fn build(app: &adw::Application) -> Rc<App> {
     let queue_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     queue_panel.add_css_class("cz-panel");
     queue_panel.append(&queue_list);
-    let add_more = gtk::Button::builder()
-        .label("Add Files")
-        .halign(gtk::Align::Start)
-        .build();
+    // Fills the row rather than hugging its label, so the whole strip under
+    // the queue is the click target. The contents still sit at the left; it
+    // is only the button that is wide. A 110px target in an 834px row is a
+    // needle to hit for the main way of adding a file.
+    let add_more = gtk::Button::builder().label("Add Files").build();
     add_more.add_css_class("flat");
-    // Matched to the height of the Available Files row that now sits under
-    // it. Left as it was, the heavier row below made the primary way of
-    // adding a file read as the lesser of the two.
+    add_more.set_hexpand(true);
+    // Matched to the height of the Available Files row that sits under it.
     let add_label = labelled_icon("list-add-symbolic", "Add Files");
+    add_label.set_halign(gtk::Align::Start);
     add_label.set_margin_top(theme::SPACE_3);
     add_label.set_margin_bottom(theme::SPACE_3);
     add_more.set_child(Some(&add_label));
