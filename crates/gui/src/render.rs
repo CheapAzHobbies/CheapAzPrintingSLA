@@ -7,6 +7,7 @@
 
 use cheapazsla_core::LayerImage;
 use gtk::gdk;
+use gtk::glib;
 use gtk::glib::Bytes;
 use gtk::prelude::*;
 
@@ -203,9 +204,62 @@ pub fn human_time(s: u64) -> String {
     }
 }
 
+/// How long ago something happened, for telling a fresh file from a stale one.
+///
+/// Relative while that is the useful answer and absolute once it is not:
+/// "3 minutes ago" says what you want to know about a file the slicer just
+/// wrote, but "412 days ago" does not, and a date does.
+pub fn human_age(t: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs())
+        // A file dated in the future is a clock skew, not an error worth
+        // reporting here; treat it as brand new.
+        .unwrap_or(0);
+    let plural = |n: u64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => plural(secs / 60, "minute"),
+        3_600..=86_399 => plural(secs / 3_600, "hour"),
+        86_400..=604_799 => plural(secs / 86_400, "day"),
+        _ => absolute_date(t).unwrap_or_else(|| plural(secs / 86_400, "day")),
+    }
+}
+
+fn absolute_date(t: std::time::SystemTime) -> Option<String> {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    glib::DateTime::from_unix_local(secs as i64)
+        .ok()?
+        .format("%-d %b %Y")
+        .ok()
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ages_read_the_way_a_person_would_say_them() {
+        use std::time::{Duration, SystemTime};
+        let ago = |s: u64| human_age(SystemTime::now() - Duration::from_secs(s));
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(180), "3 minutes ago");
+        assert_eq!(ago(3_600), "1 hour ago");
+        assert_eq!(ago(86_400), "1 day ago");
+        assert_eq!(ago(3 * 86_400), "3 days ago");
+        // Past a week a relative age stops being informative, so it becomes a
+        // date. Only the shape is asserted: the text depends on the timezone.
+        let old = ago(400 * 86_400);
+        assert!(!old.ends_with("ago"), "expected a date, got {old}");
+    }
 
     fn img(w: u32, h: u32) -> LayerImage {
         let mut i = LayerImage::blank(w, h);

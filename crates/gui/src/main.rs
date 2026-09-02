@@ -186,6 +186,12 @@ struct App {
     files: RefCell<Vec<Queued>>,
     selected: RefCell<usize>,
     out_dir: RefCell<Option<PathBuf>>,
+    /// The output is following whichever removable drive is connected, rather
+    /// than a fixed folder. Re-resolved whenever a drive comes or goes.
+    out_auto_drive: Cell<bool>,
+    /// Label of the removable drive that mounted most recently, so "connected
+    /// drive" means the one just plugged in when several are attached.
+    last_drive: RefCell<Option<String>>,
     settings: RefCell<Settings>,
     history: RefCell<History>,
     playing: RefCell<Option<glib::SourceId>>,
@@ -507,6 +513,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         files: RefCell::new(Vec::new()),
         selected: RefCell::new(0),
         out_dir: RefCell::new(None),
+        out_auto_drive: Cell::new(false),
+        last_drive: RefCell::new(None),
         settings: RefCell::new(Settings::load()),
         history: RefCell::new(History::load()),
         playing: RefCell::new(None),
@@ -980,7 +988,7 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
     b
 }
 
-/// The "Found nearby" panel: readable files already sitting somewhere the
+/// The "Available Files" panel: readable files already sitting somewhere the
 /// program knows about, offered as one-click alternatives to the file dialog.
 ///
 /// It sits below the queue so that it falls directly under "Add Files" once
@@ -999,7 +1007,7 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
     list.set_selection_mode(gtk::SelectionMode::None);
 
     let expander = adw::ExpanderRow::builder()
-        .title("Found nearby")
+        .title("Available Files")
         .expanded(false)
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
@@ -1509,11 +1517,15 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             monitor.connect_mount_added(move |_, mount| {
                 refresh_nearby(&ui);
                 drive_arrived(&ui, mount);
+                reresolve_auto_drive(&ui);
             });
         }
         {
             let ui = ui.clone();
-            monitor.connect_mount_removed(move |_, _| refresh_nearby(&ui));
+            monitor.connect_mount_removed(move |_, _| {
+                refresh_nearby(&ui);
+                reresolve_auto_drive(&ui);
+            });
         }
         // The monitor is a process-wide singleton; holding it for the life of
         // the window keeps the handlers alive without a static.
@@ -1804,9 +1816,6 @@ fn choose_files(ui: &Rc<App>) {
 /// internal filesystem - a backup disk waking up, a network share
 /// reconnecting - would move the output somewhere the user never asked for.
 fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
-    if !ui.settings.borrow().auto_lock_new_drives {
-        return;
-    }
     let removable = mount.can_eject()
         || mount.can_unmount()
         || mount.drive().map(|d| d.is_removable()).unwrap_or(false);
@@ -1814,6 +1823,12 @@ fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
         return;
     }
     let name = mount.name().to_string();
+    // Remembered whatever the setting says: "connected drive" should mean the
+    // one just plugged in even when the output is not following drives.
+    *ui.last_drive.borrow_mut() = Some(name.clone());
+    if !ui.settings.borrow().auto_lock_new_drives {
+        return;
+    }
     let sub = ui.settings.borrow().pinned_subfolder.clone();
     let Some(target) = drives::target_dir(&name, &sub).or_else(|| mount.root().path()) else {
         return;
@@ -1823,7 +1838,7 @@ fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
         .add_toast(adw::Toast::new(&format!("Saving to {name}")));
 }
 
-/// Rebuild the "Found nearby" list.
+/// Rebuild the "Available Files" list.
 ///
 /// Cheap enough to call on any event that might have changed the answer: a
 /// drive appearing, the window regaining focus, a file being queued. It reads
@@ -1875,17 +1890,29 @@ fn refresh_nearby(ui: &Rc<App>) {
                     .unwrap_or_else(|| item.path.display().to_string()),
             )
             .subtitle(format!(
-                "{}  ·  {}  ·  {}",
+                "{}  ·  {}  ·  {}  ·  {}",
                 item.format,
                 render::human_bytes(item.size),
-                item.source
+                item.source,
+                item.modified
+                    .map(render::human_age)
+                    .unwrap_or_else(|| "date unknown".to_string()),
             ))
             .activatable(true)
             .build();
         row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
         let ui2 = ui.clone();
         let path = item.path.clone();
-        row.connect_activated(move |_| add_files(&ui2, vec![path.clone()]));
+        row.connect_activated(move |r| {
+            // Choosing is the end of browsing: fold the list away again so the
+            // page returns to the queue rather than staying open behind it.
+            if let Some(exp) = r.ancestor(adw::ExpanderRow::static_type()) {
+                if let Ok(exp) = exp.downcast::<adw::ExpanderRow>() {
+                    exp.set_expanded(false);
+                }
+            }
+            add_files(&ui2, vec![path.clone()]);
+        });
         ui.nearby_expander.add_row(&row);
         ui.nearby_rows.borrow_mut().push(row);
     }
@@ -2999,6 +3026,8 @@ enum Destination {
     BesideOriginal,
     /// Write into a specific folder.
     Folder(PathBuf),
+    /// Follow whichever removable drive is connected.
+    AutoDrive,
     /// Ask for a folder.
     Choose,
 }
@@ -3074,6 +3103,25 @@ fn build_destination_menu(ui: &Rc<App>) {
                 );
             }
 
+            // Offered whether or not a drive is attached: choosing it is a
+            // statement about where output should go from now on, which is
+            // useful to make before plugging the drive in.
+            add(
+                "drive-removable-media-symbolic",
+                "Connected drive".into(),
+                Some(match auto_drive(&ui2) {
+                    Some(d) => format!(
+                        "{} · {}",
+                        d.name,
+                        drives::space(&d.path)
+                            .map(|(free, _)| format!("{} available", render::human_bytes(free)))
+                            .unwrap_or_else(|| d.path.display().to_string())
+                    ),
+                    None => "Uses the drive you plug in next".into(),
+                }),
+                Destination::AutoDrive,
+            );
+
             let sub = ui2.settings.borrow().pinned_subfolder.clone();
             for d in drives::mounted() {
                 let icon = if d.removable {
@@ -3125,6 +3173,7 @@ fn build_destination_menu(ui: &Rc<App>) {
             match chosen {
                 Some(Destination::BesideOriginal) => set_out_dir(&ui3, None),
                 Some(Destination::Folder(d)) => set_out_dir(&ui3, Some(d)),
+                Some(Destination::AutoDrive) => set_out_auto_drive(&ui3),
                 Some(Destination::Choose) => choose_folder(&ui3),
                 None => {}
             }
@@ -3152,6 +3201,55 @@ fn choose_folder(ui: &Rc<App>) {
     );
 }
 
+/// The drive "connected drive" currently means.
+///
+/// The most recently mounted removable drive if it is still there, otherwise
+/// whichever removable drive is attached. Falling back matters on startup,
+/// when a drive plugged in before launch produced no mount event to remember.
+fn auto_drive(ui: &Rc<App>) -> Option<drives::Drive> {
+    let remembered = ui.last_drive.borrow().clone();
+    if let Some(name) = remembered {
+        if let Some(d) = drives::by_name(&name) {
+            if d.removable {
+                return Some(d);
+            }
+        }
+    }
+    drives::mounted().into_iter().find(|d| d.removable)
+}
+
+/// Point the output at whichever drive is connected, now and as that changes.
+fn set_out_auto_drive(ui: &Rc<App>) {
+    let sub = ui.settings.borrow().pinned_subfolder.clone();
+    let resolved = auto_drive(ui);
+    let dir = resolved
+        .as_ref()
+        .and_then(|d| drives::target_dir(&d.name, &sub).or_else(|| Some(d.path.clone())));
+    set_out_dir(ui, dir);
+    // set_out_dir clears the flag, so it goes back on afterwards.
+    ui.out_auto_drive.set(true);
+    match resolved {
+        Some(d) => {
+            ui.dest_label
+                .set_text(&format!("{} (Automatically Detect)", d.name));
+        }
+        None => {
+            ui.dest_label
+                .set_text("Connected drive (Automatically Detect)");
+            ui.dest_detail
+                .set_text("No drive connected. Plug one in and it will be used.");
+        }
+    }
+    revalidate(ui);
+}
+
+/// Re-point the output after a drive came or went, when following one.
+fn reresolve_auto_drive(ui: &Rc<App>) {
+    if ui.out_auto_drive.get() {
+        set_out_auto_drive(ui);
+    }
+}
+
 fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
     match &dir {
         Some(d) => {
@@ -3177,6 +3275,7 @@ fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
         }
     }
     *ui.out_dir.borrow_mut() = dir;
+    ui.out_auto_drive.set(false);
     suggest_name(ui);
     revalidate(ui);
 }
@@ -3266,6 +3365,16 @@ fn check(ui: &Rc<App>) -> Option<String> {
     let typed = ui.name_entry.text();
     if files.len() == 1 && typed.contains('/') {
         return Some("The file name cannot contain a slash.".into());
+    }
+
+    // Following a drive with nothing plugged in has no destination at all.
+    // Saying so beats falling through to "beside the original", which would
+    // put the file somewhere the user did not choose and would not look.
+    if ui.out_auto_drive.get() && ui.out_dir.borrow().is_none() {
+        return Some(
+            "No drive connected. Plug in the drive to save to, or choose another location."
+                .to_string(),
+        );
     }
 
     // Where would the output go, and can it?
@@ -3953,12 +4062,17 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
 
     let mounted = drives::mounted();
     if mounted.is_empty() {
-        drives_group.add(
-            &adw::ActionRow::builder()
-                .title("No drives detected")
-                .subtitle("Connect a USB drive or SD card and it will appear here")
-                .build(),
-        );
+        let empty = adw::ActionRow::builder()
+            .title("No drives detected")
+            .subtitle("Connect a USB drive or SD card and it will appear here")
+            .build();
+        // A disabled eject here shows the capability exists rather than
+        // leaving the group looking like it has no controls at all.
+        let eject = shell::icon_button("media-eject-symbolic", "No drive available to eject");
+        eject.set_sensitive(false);
+        eject.set_valign(gtk::Align::Center);
+        empty.add_suffix(&eject);
+        drives_group.add(&empty);
     }
     for d in &mounted {
         let space = drives::space(&d.path)
@@ -3992,10 +4106,20 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             }
             let _ = s.save();
         });
-        // Eject is offered only where the desktop can actually do it, so the
-        // button is never present just to fail.
-        if drives::can_remove(&d.name) {
-            let eject = shell::icon_button("media-eject-symbolic", "Eject this drive");
+        // The button is always drawn, and disabled with a reason when the
+        // desktop cannot eject this drive. An absent control looks like a
+        // missing feature; a greyed one that says why does not.
+        {
+            let removable = drives::can_remove(&d.name);
+            let eject = shell::icon_button(
+                "media-eject-symbolic",
+                if removable {
+                    "Eject this drive"
+                } else {
+                    "This drive cannot be ejected"
+                },
+            );
+            eject.set_sensitive(removable);
             eject.set_valign(gtk::Align::Center);
             let ui3 = ui.clone();
             let name = d.name.clone();

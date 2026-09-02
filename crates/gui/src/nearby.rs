@@ -25,7 +25,8 @@ pub struct Found {
     pub format: String,
     /// Where it was found, for the subtitle: a drive label or folder name.
     pub source: String,
-    modified: Option<SystemTime>,
+    /// Last modified, for telling a fresh file from a stale one.
+    pub modified: Option<SystemTime>,
 }
 
 /// Directories are scanned one level deep only.
