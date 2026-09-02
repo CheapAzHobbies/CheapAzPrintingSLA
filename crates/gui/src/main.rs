@@ -129,8 +129,12 @@ struct App {
     /// "Found nearby": readable files in the open folder and on mounted
     /// drives, offered so a file can be picked without a file dialog.
     nearby_panel: gtk::Box,
-    nearby_list: gtk::ListBox,
-    nearby_subtitle: gtk::Label,
+    /// Collapsed by default: it is an alternative to the file dialog, not
+    /// something to read every time the page is opened.
+    nearby_expander: adw::ExpanderRow,
+    /// The rows currently inside the expander, so a refresh can take them out
+    /// again without rebuilding the row and losing whether it was open.
+    nearby_rows: RefCell<Vec<adw::ActionRow>>,
     /// Held so the volume-monitor signal handlers outlive `wire`.
     volume_monitor: RefCell<Option<gio::VolumeMonitor>>,
     queue_panel: gtk::Box,
@@ -272,7 +276,7 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
-    let (nearby_panel, nearby_list, nearby_subtitle) = build_nearby_panel();
+    let (nearby_panel, nearby_expander) = build_nearby_panel();
     let queue_list = gtk::ListBox::new();
     queue_list.set_selection_mode(gtk::SelectionMode::Single);
     queue_list.add_css_class("cz-queue");
@@ -464,8 +468,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone,
         dropzone_title,
         nearby_panel: nearby_panel.clone(),
-        nearby_list: nearby_list.clone(),
-        nearby_subtitle,
+        nearby_expander,
+        nearby_rows: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
         queue_panel,
         queue_list,
@@ -979,36 +983,36 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
 /// The "Found nearby" panel: readable files already sitting somewhere the
 /// program knows about, offered as one-click alternatives to the file dialog.
 ///
-/// It is hidden whenever the scan finds nothing, so an empty list never takes
-/// space from the drop zone. That matters at the small window sizes this
-/// layout was fought into fitting.
-fn build_nearby_panel() -> (gtk::Box, gtk::ListBox, gtk::Label) {
+/// It sits below the queue so that it falls directly under "Add Files" once
+/// there are files, and directly under the drop zone when there are none -
+/// one position that reads correctly in both states.
+///
+/// Collapsed by default, and hidden entirely when the scan finds nothing, so
+/// it costs one row of height rather than a list. That matters at the small
+/// window sizes this layout was fought into fitting.
+fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     panel.set_visible(false);
-
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
-    header.append(&shell::section_label("Found nearby"));
-
-    let subtitle = gtk::Label::new(None);
-    subtitle.add_css_class("dim-label");
-    subtitle.add_css_class("caption");
-    subtitle.set_halign(gtk::Align::Start);
-    subtitle.set_hexpand(true);
-    subtitle.set_xalign(0.0);
-    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    header.append(&subtitle);
-
-    let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
-    refresh.set_widget_name("nearby-refresh");
-    header.append(&refresh);
-    panel.append(&header);
 
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
+
+    let expander = adw::ExpanderRow::builder()
+        .title("Found nearby")
+        .expanded(false)
+        .build();
+    expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
+
+    let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
+    refresh.set_widget_name("nearby-refresh");
+    refresh.set_valign(gtk::Align::Center);
+    expander.add_suffix(&refresh);
+
+    list.append(&expander);
     panel.append(&list);
 
-    (panel, list, subtitle)
+    (panel, expander)
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -1164,8 +1168,8 @@ fn build_convert_page(
 ) -> (gtk::Widget, gtk::Box, gtk::Box, gtk::Box, gtk::Box) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
     content.append(dropzone);
-    content.append(nearby);
     content.append(queue_panel);
+    content.append(nearby);
 
     // Controls stay hidden until there is a file, so a new user sees one
     // instruction rather than a form (§2, §36).
@@ -1794,17 +1798,11 @@ fn choose_files(ui: &Rc<App>) {
     );
 }
 
-/// Rebuild the "Found nearby" list.
-///
-/// Cheap enough to call on any event that might have changed the answer: a
-/// drive appearing, the window regaining focus, a file being queued. It reads
-/// directory entries and no file contents, so there is no reason to debounce
-/// it or push it onto a thread.
 /// React to a drive being plugged in.
 ///
 /// Only removable drives are followed. Auto-locking onto a newly mounted
-/// internal filesystem — a backup disk waking up, a network share
-/// reconnecting — would move the output somewhere the user never asked for.
+/// internal filesystem - a backup disk waking up, a network share
+/// reconnecting - would move the output somewhere the user never asked for.
 fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
     if !ui.settings.borrow().auto_lock_new_drives {
         return;
@@ -1825,9 +1823,18 @@ fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
         .add_toast(adw::Toast::new(&format!("Saving to {name}")));
 }
 
+/// Rebuild the "Found nearby" list.
+///
+/// Cheap enough to call on any event that might have changed the answer: a
+/// drive appearing, the window regaining focus, a file being queued. It reads
+/// directory entries and no file contents, so there is no reason to debounce
+/// it or push it onto a thread.
+///
+/// The expander itself is reused rather than rebuilt, so a refresh does not
+/// snap it shut while the user is reading it.
 fn refresh_nearby(ui: &Rc<App>) {
-    while let Some(child) = ui.nearby_list.first_child() {
-        ui.nearby_list.remove(&child);
+    for row in ui.nearby_rows.borrow_mut().drain(..) {
+        ui.nearby_expander.remove(&row);
     }
 
     if !ui.settings.borrow().show_nearby_files {
@@ -1844,10 +1851,20 @@ fn refresh_nearby(ui: &Rc<App>) {
         return;
     }
 
-    ui.nearby_subtitle.set_text(&match found.len() {
+    // Naming the places is what makes the collapsed row worth reading: it
+    // says where the files are without being opened.
+    let mut places: Vec<String> = Vec::new();
+    for f in &found {
+        if !places.contains(&f.source) {
+            places.push(f.source.clone());
+        }
+    }
+    let count = match found.len() {
         1 => "1 file".to_string(),
         n => format!("{n} files"),
-    });
+    };
+    ui.nearby_expander
+        .set_subtitle(&format!("{count} in {}", places.join(", ")));
 
     for item in found {
         let row = adw::ActionRow::builder()
@@ -1869,7 +1886,8 @@ fn refresh_nearby(ui: &Rc<App>) {
         let ui2 = ui.clone();
         let path = item.path.clone();
         row.connect_activated(move |_| add_files(&ui2, vec![path.clone()]));
-        ui.nearby_list.append(&row);
+        ui.nearby_expander.add_row(&row);
+        ui.nearby_rows.borrow_mut().push(row);
     }
     ui.nearby_panel.set_visible(true);
 }
