@@ -89,9 +89,40 @@ An open mSLA format with a published specification. Same argument as UVJ.
 **Anycubic** (`pws`, `pwmx`, `pm3`, `pm5`, `pwma` and around twenty more)
 
 Anycubic's Photon line is one of the largest installed bases in resin
-printing, and one handler covers all of those extensions because they share a
-structure with a version field. High value per unit of work, though the
-version differences need care.
+printing, and one handler covers all twenty-two extensions because they share a
+container with a version field. High value per unit of work — but more work
+than it looks, and here is what a first look established, so the next attempt
+starts further along.
+
+The container is sections, not a fixed header:
+
+```
+0x00  char[12]  "ANYCUBIC" and padding
+0x0C  u32       version: 1, or 515 to 518 for the newer machines
+0x10  u32       how many sections follow
+0x14  u32[]     one offset per section, at a stride of eight bytes
+                (four bytes used, four skipped, the last one not padded)
+
+each section:
+      char[12]  name: HEADER, PREVIEW, LAYERDEF, and the layer data
+      u32       payload length
+      payload
+```
+
+The version 1 HEADER is 80 bytes and legible: pixel size in micrometres,
+layer height, exposure, bottom exposure, bottom layer count as a float, lift
+height, then speeds **in millimetres per second** rather than per minute like
+every other format here, resolution, and resin mass.
+
+Two things make this more than an afternoon. The five versions differ
+structurally, and version 1 is the old Photon while 515 to 518 are what
+current machines read — supporting only version 1 would cover the extensions
+and none of the printers. And the newer variants identify the machine from its
+resolution and refuse a file whose panel size matches nothing they know, so
+they cannot be tested against synthetic sizes the way every other format here
+was; they need a real panel size for a real Anycubic printer.
+
+Worth doing, worth doing properly, and not worth doing halfway.
 
 **Creality CXDLP** (`cxdlp`, `cxdlpv4`)
 
