@@ -1078,6 +1078,8 @@ fn build_nearby_panel() -> (
     let expander = adw::ExpanderRow::builder()
         .title("Quick Access")
         .expanded(false)
+        .title_lines(1)
+        .subtitle_lines(1)
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
 
@@ -2188,6 +2190,7 @@ fn refresh_nearby(ui: &Rc<App>) {
             // the panel labouring the point rather than offering the fix.
             let row = adw::ActionRow::builder()
                 .title("Choose a folder or drive to look in")
+                .title_lines(1)
                 .activatable(true)
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
@@ -2198,6 +2201,8 @@ fn refresh_nearby(ui: &Rc<App>) {
             let row = adw::ActionRow::builder()
                 .title("No convertible files found")
                 .subtitle("Add a folder, or refresh after your slicer writes one")
+                .title_lines(1)
+                .subtitle_lines(1)
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
             row
@@ -2247,6 +2252,8 @@ fn refresh_nearby(ui: &Rc<App>) {
                     .map(render::human_age)
                     .unwrap_or_else(|| "date unknown".to_string()),
             ))
+            .title_lines(1)
+            .subtitle_lines(1)
             .activatable(true)
             .build();
         row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
@@ -2288,44 +2295,58 @@ fn refresh_nearby(ui: &Rc<App>) {
 const NEARBY_TAU: f64 = 0.06;
 const NEARBY_MIN_SPEED: f64 = 260.0;
 
+/// Park the list at the height of its contents.
+///
+/// The minimum is pinned rather than left alone because a scrolled window's
+/// own minimum height is zero - that is the whole point of it, and it is what
+/// makes the clipping possible - and a box will happily allocate zero to a
+/// child that says it can live with zero. Left unpinned the panel vanished
+/// altogether. The maximum goes back to unset, so the list is free to follow
+/// its own content again until the next change.
+fn settle_nearby(clip: &gtk::ScrolledWindow, height: i32) {
+    clip.set_min_content_height(height);
+    clip.set_max_content_height(-1);
+}
+
 /// Walk the Quick Access list from the height it had to the height it wants.
 ///
 /// Switching a source off takes its rows out on the next frame and everything
 /// below jumps up to meet the gap. Nothing in GTK animates that: a list box is
 /// exactly as tall as its rows. So the list is held inside a scrolled window,
-/// whose natural height can be capped at a value of our choosing, and the cap
-/// is walked from the old height to the new one and then released.
+/// which is allowed to be a height its child is not, and both ends of that
+/// height are walked from the old value to the new one and then released.
 fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let clip = ui.nearby_clip.clone();
-
-    // Nothing to ease from: first draw, animations off, or the panel is not
-    // on screen to be looked at.
-    if from <= 0 || !clip.is_mapped() || !ui.settings.borrow().animations {
-        clip.set_max_content_height(-1);
-        ui.nearby_moving.set(false);
-        return;
-    }
-    let (Some(child), Some(root)) = (clip.child(), clip.root()) else {
-        clip.set_max_content_height(-1);
+    let Some(child) = clip.child() else {
         return;
     };
 
-    // The child is measured directly, so the cap already on the scrolled
-    // window does not colour the answer.
+    // Rows are held to one line each, so their height does not depend on the
+    // width they are measured at and this answer keeps holding after a resize.
     let width = clip.width();
     let for_width = if width > 0 { width } else { -1 };
     let (_, to, _, _) = child.measure(gtk::Orientation::Vertical, for_width);
-    if to == from {
+
+    if ui.nearby_moving.get() {
+        // Already walking. Hand it the new destination and let it carry on
+        // from where the panel actually is, rather than starting again.
+        ui.nearby_target.set(to as f64);
         return;
     }
+    if from <= 0 || from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
+        settle_nearby(&clip, to);
+        return;
+    }
+    let Some(root) = clip.root() else {
+        settle_nearby(&clip, to);
+        return;
+    };
 
     ui.nearby_target.set(to as f64);
     ui.nearby_h.set(from as f64);
+    clip.set_min_content_height(from);
     clip.set_max_content_height(from);
-    if ui.nearby_moving.replace(true) {
-        // Already walking; it will pick up the new target on its next frame.
-        return;
-    }
+    ui.nearby_moving.set(true);
 
     let root: gtk::Widget = root.upcast();
     let target = ui.nearby_target.clone();
@@ -2352,15 +2373,15 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
 
         if remaining.abs() < 1.0 || step.abs() >= remaining.abs() {
             height.set(want);
-            // Released rather than pinned at the final number, so the list is
-            // free to size itself again the moment the animation is over.
-            clip.set_max_content_height(-1);
+            settle_nearby(&clip, want.round() as i32);
             moving.set(false);
             return glib::ControlFlow::Break;
         }
 
         height.set(at + step);
-        clip.set_max_content_height((at + step).round() as i32);
+        let reached = (at + step).round() as i32;
+        clip.set_min_content_height(reached);
+        clip.set_max_content_height(reached);
         glib::ControlFlow::Continue
     });
 }
