@@ -2141,7 +2141,37 @@ fn refresh_nearby(ui: &Rc<App>) {
         } else {
             format!("Nothing to convert in {}", on.join(", "))
         });
-        ui.nearby_expander.set_expanded(false);
+
+        // An empty list that only says "empty" leaves the user to work out
+        // that the fix is behind the folder button. When nothing is selected
+        // the row says so and opens the picker; when sources are selected but
+        // hold nothing, there is no choice to make, so it only reports.
+        let row = if on.is_empty() {
+            let row = adw::ActionRow::builder()
+                .title("Choose a folder or drive to look in")
+                .subtitle("Nothing is selected, so there is nowhere to read from")
+                .activatable(true)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
+            let ui2 = ui.clone();
+            row.connect_activated(move |_| ui2.nearby_sources.popup());
+            row
+        } else {
+            let row = adw::ActionRow::builder()
+                .title("No convertible files found")
+                .subtitle("Add a folder, or refresh after your slicer writes one")
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
+            row
+        };
+        ui.nearby_expander.add_row(&row);
+        ui.nearby_rows.borrow_mut().push(row);
+        // Deliberately not collapsed. A refresh happens while the user is
+        // working the "Look in" switches, and folding the list under them -
+        // then leaving it folded when they switch a source back on - makes
+        // the panel feel like it is fighting the controls attached to it.
+        // Expansion is the user's state to hold, and only choosing a file
+        // hands it back.
         ui.nearby_panel.set_visible(true);
         return;
     }
