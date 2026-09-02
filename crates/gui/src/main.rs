@@ -301,7 +301,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     let add_more = gtk::Button::builder().label("Add Files").build();
     add_more.add_css_class("flat");
     add_more.set_hexpand(true);
-    // Matched to the height of the Available Files row that sits under it.
+    // Matched to the height of the Quick Open row that sits under it.
     let add_label = labelled_icon("list-add-symbolic", "Add Files");
     add_label.set_halign(gtk::Align::Start);
     add_label.set_margin_top(theme::SPACE_3);
@@ -1005,8 +1005,12 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
     b
 }
 
-/// The "Available Files" panel: readable files already sitting somewhere the
+/// The "Quick Open" panel: readable files already sitting somewhere the
 /// program knows about, offered as one-click alternatives to the file dialog.
+///
+/// Named for what it does rather than for what it contains. "Available
+/// Files" read as a restatement of the drop zone above it, which also offers
+/// files; the useful distinction is that this one skips the dialog.
 ///
 /// It sits below the queue so that it falls directly under "Add Files" once
 /// there are files, and directly under the drop zone when there are none -
@@ -1024,7 +1028,7 @@ fn build_nearby_panel() -> (gtk::Box, adw::ExpanderRow) {
     list.set_selection_mode(gtk::SelectionMode::None);
 
     let expander = adw::ExpanderRow::builder()
-        .title("Available Files")
+        .title("Quick Open")
         .expanded(false)
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
@@ -1937,7 +1941,7 @@ fn choose_scan_folder(ui: &Rc<App>) {
     );
 }
 
-/// Rebuild the "Available Files" list.
+/// Rebuild the "Quick Open" list.
 ///
 /// Cheap enough to call on any event that might have changed the answer: a
 /// drive appearing, the window regaining focus, a file being queued. It reads
@@ -4139,8 +4143,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add(&open_row);
 
     let nearby_row = adw::SwitchRow::builder()
-        .title("Suggest nearby files")
-        .subtitle("List readable files from the open folder and mounted drives on the Convert page")
+        .title("Quick Open list")
+        .subtitle("Offer convertible files from your chosen folder and mounted drives, on the Convert page")
         .active(current.show_nearby_files)
         .build();
     {
