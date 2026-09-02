@@ -79,3 +79,58 @@ pub fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
         info.attribute_uint64("filesystem::size"),
     ))
 }
+
+/// Whether this drive can be removed by the desktop at all.
+///
+/// A drive that can neither eject nor unmount is a fixed disk; offering to
+/// eject it would be a button that always fails.
+pub fn can_remove(name: &str) -> bool {
+    let monitor = gio::VolumeMonitor::get();
+    monitor
+        .mounts()
+        .into_iter()
+        .filter(|m| !m.is_shadowed())
+        .find(|m| m.name() == name)
+        .map(|m| m.can_eject() || m.can_unmount())
+        .unwrap_or(false)
+}
+
+/// Eject a drive by name, reporting the outcome once the desktop is done.
+///
+/// Eject and unmount are different operations and a drive may support only
+/// one: a USB stick usually unmounts, an optical drive ejects. We prefer
+/// eject where it is offered and fall back to unmount, so the caller does not
+/// have to know which kind it has.
+///
+/// The flush is the point of the whole feature. Pulling a stick with dirty
+/// buffers is how a print file arrives at the printer truncated, and the
+/// truncation shows up as a failed print rather than as a copy error.
+pub fn eject<F: Fn(Result<(), String>) + 'static>(name: &str, done: F) {
+    let monitor = gio::VolumeMonitor::get();
+    let Some(mount) = monitor
+        .mounts()
+        .into_iter()
+        .filter(|m| !m.is_shadowed())
+        .find(|m| m.name() == name)
+    else {
+        done(Err(format!("{name} is no longer connected")));
+        return;
+    };
+
+    let op = gtk::gio::MountOperation::new();
+    if mount.can_eject() {
+        mount.eject_with_operation(
+            gio::MountUnmountFlags::NONE,
+            Some(&op),
+            gio::Cancellable::NONE,
+            move |res| done(res.map_err(|e| e.message().to_string())),
+        );
+    } else {
+        mount.unmount_with_operation(
+            gio::MountUnmountFlags::NONE,
+            Some(&op),
+            gio::Cancellable::NONE,
+            move |res| done(res.map_err(|e| e.message().to_string())),
+        );
+    }
+}

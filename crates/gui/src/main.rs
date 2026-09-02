@@ -8,6 +8,7 @@
 
 mod drives;
 mod format_picker;
+mod nearby;
 mod palette;
 mod penguin;
 mod render;
@@ -125,6 +126,13 @@ struct App {
     // convert page
     dropzone: gtk::Box,
     dropzone_title: gtk::Label,
+    /// "Found nearby": readable files in the open folder and on mounted
+    /// drives, offered so a file can be picked without a file dialog.
+    nearby_panel: gtk::Box,
+    nearby_list: gtk::ListBox,
+    nearby_subtitle: gtk::Label,
+    /// Held so the volume-monitor signal handlers outlive `wire`.
+    volume_monitor: RefCell<Option<gio::VolumeMonitor>>,
     queue_panel: gtk::Box,
     queue_list: gtk::ListBox,
     controls: gtk::Box,
@@ -264,6 +272,7 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
+    let (nearby_panel, nearby_list, nearby_subtitle) = build_nearby_panel();
     let queue_list = gtk::ListBox::new();
     queue_list.set_selection_mode(gtk::SelectionMode::Single);
     queue_list.add_css_class("cz-queue");
@@ -376,6 +385,7 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     let convert_page = build_convert_page(
         &dropzone,
+        &nearby_panel,
         &queue_panel,
         &input_field,
         &output_picker,
@@ -453,6 +463,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         toasts,
         dropzone,
         dropzone_title,
+        nearby_panel: nearby_panel.clone(),
+        nearby_list: nearby_list.clone(),
+        nearby_subtitle,
+        volume_monitor: RefCell::new(None),
         queue_panel,
         queue_list,
         controls,
@@ -962,6 +976,41 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
     b
 }
 
+/// The "Found nearby" panel: readable files already sitting somewhere the
+/// program knows about, offered as one-click alternatives to the file dialog.
+///
+/// It is hidden whenever the scan finds nothing, so an empty list never takes
+/// space from the drop zone. That matters at the small window sizes this
+/// layout was fought into fitting.
+fn build_nearby_panel() -> (gtk::Box, gtk::ListBox, gtk::Label) {
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
+    panel.set_visible(false);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    header.append(&shell::section_label("Found nearby"));
+
+    let subtitle = gtk::Label::new(None);
+    subtitle.add_css_class("dim-label");
+    subtitle.add_css_class("caption");
+    subtitle.set_halign(gtk::Align::Start);
+    subtitle.set_hexpand(true);
+    subtitle.set_xalign(0.0);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    header.append(&subtitle);
+
+    let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
+    refresh.set_widget_name("nearby-refresh");
+    header.append(&refresh);
+    panel.append(&header);
+
+    let list = gtk::ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    panel.append(&list);
+
+    (panel, list, subtitle)
+}
+
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
     let zone = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     zone.add_css_class("cz-dropzone");
@@ -1100,6 +1149,7 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
 #[allow(clippy::too_many_arguments)]
 fn build_convert_page(
     dropzone: &gtk::Box,
+    nearby: &gtk::Box,
     queue_panel: &gtk::Box,
     input_field: &gtk::MenuButton,
     output_picker: &Rc<format_picker::FormatPicker>,
@@ -1114,6 +1164,7 @@ fn build_convert_page(
 ) -> (gtk::Widget, gtk::Box, gtk::Box, gtk::Box, gtk::Box) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
     content.append(dropzone);
+    content.append(nearby);
     content.append(queue_panel);
 
     // Controls stay hidden until there is a file, so a new user sees one
@@ -1440,6 +1491,42 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     }
     ui.window.add_controller(drop);
 
+    // "Found nearby": manual refresh, plus the events that can change the
+    // answer. Drives are watched through GIO rather than polled, so nothing
+    // runs while the window sits idle.
+    if let Some(btn) = find_named(&ui.nearby_panel, "nearby-refresh") {
+        let ui = ui.clone();
+        btn.connect_clicked(move |_| refresh_nearby(&ui));
+    }
+    {
+        let monitor = gio::VolumeMonitor::get();
+        {
+            let ui = ui.clone();
+            monitor.connect_mount_added(move |_, mount| {
+                refresh_nearby(&ui);
+                drive_arrived(&ui, mount);
+            });
+        }
+        {
+            let ui = ui.clone();
+            monitor.connect_mount_removed(move |_, _| refresh_nearby(&ui));
+        }
+        // The monitor is a process-wide singleton; holding it for the life of
+        // the window keeps the handlers alive without a static.
+        ui.volume_monitor.replace(Some(monitor));
+    }
+    {
+        // Coming back to the window is the moment a file sliced elsewhere
+        // becomes interesting.
+        let ui = ui.clone();
+        ui.window.clone().connect_is_active_notify(move |w| {
+            if w.is_active() {
+                refresh_nearby(&ui);
+            }
+        });
+    }
+    refresh_nearby(ui);
+
     // Output format.
     {
         let picker = ui.output_picker.clone();
@@ -1707,6 +1794,86 @@ fn choose_files(ui: &Rc<App>) {
     );
 }
 
+/// Rebuild the "Found nearby" list.
+///
+/// Cheap enough to call on any event that might have changed the answer: a
+/// drive appearing, the window regaining focus, a file being queued. It reads
+/// directory entries and no file contents, so there is no reason to debounce
+/// it or push it onto a thread.
+/// React to a drive being plugged in.
+///
+/// Only removable drives are followed. Auto-locking onto a newly mounted
+/// internal filesystem — a backup disk waking up, a network share
+/// reconnecting — would move the output somewhere the user never asked for.
+fn drive_arrived(ui: &Rc<App>, mount: &gio::Mount) {
+    if !ui.settings.borrow().auto_lock_new_drives {
+        return;
+    }
+    let removable = mount.can_eject()
+        || mount.can_unmount()
+        || mount.drive().map(|d| d.is_removable()).unwrap_or(false);
+    if !removable {
+        return;
+    }
+    let name = mount.name().to_string();
+    let sub = ui.settings.borrow().pinned_subfolder.clone();
+    let Some(target) = drives::target_dir(&name, &sub).or_else(|| mount.root().path()) else {
+        return;
+    };
+    set_out_dir(ui, Some(target));
+    ui.toasts
+        .add_toast(adw::Toast::new(&format!("Saving to {name}")));
+}
+
+fn refresh_nearby(ui: &Rc<App>) {
+    while let Some(child) = ui.nearby_list.first_child() {
+        ui.nearby_list.remove(&child);
+    }
+
+    if !ui.settings.borrow().show_nearby_files {
+        ui.nearby_panel.set_visible(false);
+        return;
+    }
+
+    let open_dir = ui.settings.borrow().open_start_dir();
+    let queued: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
+    let found = nearby::scan(open_dir.as_deref(), &queued);
+
+    if found.is_empty() {
+        ui.nearby_panel.set_visible(false);
+        return;
+    }
+
+    ui.nearby_subtitle.set_text(&match found.len() {
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    });
+
+    for item in found {
+        let row = adw::ActionRow::builder()
+            .title(
+                item.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| item.path.display().to_string()),
+            )
+            .subtitle(format!(
+                "{}  ·  {}  ·  {}",
+                item.format,
+                render::human_bytes(item.size),
+                item.source
+            ))
+            .activatable(true)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
+        let ui2 = ui.clone();
+        let path = item.path.clone();
+        row.connect_activated(move |_| add_files(&ui2, vec![path.clone()]));
+        ui.nearby_list.append(&row);
+    }
+    ui.nearby_panel.set_visible(true);
+}
+
 fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
     let existing: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
     let mut added = 0;
@@ -1739,6 +1906,8 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
     }
     if added > 0 {
         refresh_queue(ui);
+        // A queued file should stop being offered as a suggestion.
+        refresh_nearby(ui);
         // Morph rather than jump: the drop zone gives way to the queue (§24).
         ui.dropzone.set_visible(false);
         ui.queue_panel.set_visible(true);
@@ -3708,6 +3877,24 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     open_row.add_suffix(&choose);
     open_row.add_suffix(&reset);
     opening.add(&open_row);
+
+    let nearby_row = adw::SwitchRow::builder()
+        .title("Suggest nearby files")
+        .subtitle("List readable files from the open folder and mounted drives on the Convert page")
+        .active(current.show_nearby_files)
+        .build();
+    {
+        let ui = ui.clone();
+        nearby_row.connect_active_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.show_nearby_files = r.is_active();
+                let _ = s.save();
+            }
+            refresh_nearby(&ui);
+        });
+    }
+    opening.add(&nearby_row);
     page.add(&opening);
 
     let drives_group = adw::PreferencesGroup::builder()
@@ -3730,6 +3917,21 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     drives_group.add(&sub_row);
+
+    let follow_row = adw::SwitchRow::builder()
+        .title("Follow new drives")
+        .subtitle("Point the output at a removable drive as soon as it is plugged in")
+        .active(current.auto_lock_new_drives)
+        .build();
+    {
+        let ui = ui.clone();
+        follow_row.connect_active_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.auto_lock_new_drives = r.is_active();
+            let _ = s.save();
+        });
+    }
+    drives_group.add(&follow_row);
 
     let mounted = drives::mounted();
     if mounted.is_empty() {
@@ -3772,6 +3974,39 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             }
             let _ = s.save();
         });
+        // Eject is offered only where the desktop can actually do it, so the
+        // button is never present just to fail.
+        if drives::can_remove(&d.name) {
+            let eject = shell::icon_button("media-eject-symbolic", "Eject this drive");
+            eject.set_valign(gtk::Align::Center);
+            let ui3 = ui.clone();
+            let name = d.name.clone();
+            let btn = eject.clone();
+            eject.connect_clicked(move |_| {
+                // Ejecting can take a moment while buffers flush; disabling
+                // the button says so and stops a second request.
+                btn.set_sensitive(false);
+                let ui4 = ui3.clone();
+                let name2 = name.clone();
+                let btn2 = btn.clone();
+                drives::eject(&name, move |res| {
+                    btn2.set_sensitive(true);
+                    match res {
+                        Ok(()) => {
+                            ui4.toasts
+                                .add_toast(adw::Toast::new(&format!("{name2} is safe to remove")));
+                            refresh_nearby(&ui4);
+                        }
+                        Err(e) => {
+                            ui4.toasts.add_toast(adw::Toast::new(&format!(
+                                "Could not eject {name2}: {e}"
+                            )));
+                        }
+                    }
+                });
+            });
+            row.add_suffix(&eject);
+        }
         drives_group.add(&row);
     }
     page.add(&drives_group);

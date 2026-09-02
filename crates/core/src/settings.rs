@@ -44,6 +44,14 @@ pub struct Settings {
     /// Subfolder to use inside a pinned drive, e.g. "prints". Empty means the
     /// root of the drive.
     pub pinned_subfolder: String,
+    /// Point the output at a removable drive as soon as it is plugged in.
+    ///
+    /// Off by default: it changes where the next conversion lands without
+    /// being asked, and a surprise destination is worse than an extra click.
+    pub auto_lock_new_drives: bool,
+    /// Offer readable files found in the open folder and on mounted drives,
+    /// so a file can be picked without opening a file dialog for it.
+    pub show_nearby_files: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +69,8 @@ impl Default for Settings {
             last_open_dir: None,
             pinned_volumes: Vec::new(),
             pinned_subfolder: String::new(),
+            auto_lock_new_drives: false,
+            show_nearby_files: true,
         }
     }
 }
@@ -117,6 +127,12 @@ impl Settings {
         if let Some(v) = map.get("pinned_subfolder") {
             s.pinned_subfolder = v.clone();
         }
+        if let Some(v) = map.get("auto_lock_new_drives") {
+            s.auto_lock_new_drives = v == "true";
+        }
+        if let Some(v) = map.get("show_nearby_files") {
+            s.show_nearby_files = v == "true";
+        }
         s.default_open_dir = map
             .get("default_open_dir")
             .filter(|v| !v.is_empty())
@@ -161,7 +177,9 @@ impl Settings {
              default_open_dir = {}\n\
              last_open_dir = {}\n\
              pinned_volumes = {}\n\
-             pinned_subfolder = {}\n",
+             pinned_subfolder = {}\n\
+             auto_lock_new_drives = {}\n\
+             show_nearby_files = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -181,6 +199,8 @@ impl Settings {
                 .unwrap_or_default(),
             self.pinned_volumes.join("\x1f"),
             self.pinned_subfolder,
+            self.auto_lock_new_drives,
+            self.show_nearby_files,
         );
         std::fs::write(path, body)
     }
