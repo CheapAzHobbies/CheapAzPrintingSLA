@@ -52,6 +52,12 @@ pub struct Settings {
     /// Offer readable files found in the open folder and on mounted drives,
     /// so a file can be picked without opening a file dialog for it.
     pub show_nearby_files: bool,
+    /// Drives the user has marked as never ejectable, by name.
+    ///
+    /// This is a second lock, not the only one. Filesystems the system needs
+    /// are refused whether or not they appear here, because the cost of
+    /// getting it wrong is unmounting the machine out from under itself.
+    pub never_eject: Vec<String>,
 }
 
 impl Default for Settings {
@@ -71,6 +77,7 @@ impl Default for Settings {
             pinned_subfolder: String::new(),
             auto_lock_new_drives: false,
             show_nearby_files: true,
+            never_eject: Vec::new(),
         }
     }
 }
@@ -133,6 +140,13 @@ impl Settings {
         if let Some(v) = map.get("show_nearby_files") {
             s.show_nearby_files = v == "true";
         }
+        if let Some(v) = map.get("never_eject") {
+            s.never_eject = v
+                .split('\x1f')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+        }
         s.default_open_dir = map
             .get("default_open_dir")
             .filter(|v| !v.is_empty())
@@ -179,7 +193,8 @@ impl Settings {
              pinned_volumes = {}\n\
              pinned_subfolder = {}\n\
              auto_lock_new_drives = {}\n\
-             show_nearby_files = {}\n",
+             show_nearby_files = {}\n\
+             never_eject = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -201,6 +216,7 @@ impl Settings {
             self.pinned_subfolder,
             self.auto_lock_new_drives,
             self.show_nearby_files,
+            self.never_eject.join("\x1f"),
         );
         std::fs::write(path, body)
     }

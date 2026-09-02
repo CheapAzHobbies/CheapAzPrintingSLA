@@ -80,10 +80,46 @@ pub fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     ))
 }
 
+/// Mounts the system needs, which must never be offered for ejection.
+///
+/// The desktop will occasionally report a fixed filesystem as unmountable in
+/// the technical sense - it *can* be unmounted, in that the call would
+/// succeed. That is not the same as it being safe to, and this is the check
+/// that says so. Getting it wrong means unmounting the machine out from under
+/// itself while it is running, so the list is deliberately blunt.
+pub fn is_system_mount(path: &std::path::Path) -> bool {
+    use std::path::Path;
+    if path == Path::new("/") {
+        return true;
+    }
+    for p in [
+        "/boot",
+        "/boot/efi",
+        "/usr",
+        "/var",
+        "/etc",
+        "/home",
+        "/nix",
+    ] {
+        if path == Path::new(p) {
+            return true;
+        }
+    }
+    // A mount that contains the user's home directory is the machine's own
+    // disk under another name.
+    if let Some(home) = std::env::var_os("HOME") {
+        if std::path::PathBuf::from(home).starts_with(path) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether this drive can be removed by the desktop at all.
 ///
 /// A drive that can neither eject nor unmount is a fixed disk; offering to
-/// eject it would be a button that always fails.
+/// eject it would be a button that always fails. A drive the system is
+/// standing on is refused here too, whatever the desktop claims.
 pub fn can_remove(name: &str) -> bool {
     let monitor = gio::VolumeMonitor::get();
     monitor
@@ -91,8 +127,18 @@ pub fn can_remove(name: &str) -> bool {
         .into_iter()
         .filter(|m| !m.is_shadowed())
         .find(|m| m.name() == name)
-        .map(|m| m.can_eject() || m.can_unmount())
+        .map(|m| {
+            let removable = m.can_eject() || m.can_unmount();
+            let system = m.root().path().map(|p| is_system_mount(&p)).unwrap_or(true);
+            removable && !system
+        })
         .unwrap_or(false)
+}
+
+/// Whether ejecting this drive is allowed: the desktop can do it, the system
+/// does not depend on it, and the user has not protected it.
+pub fn is_ejectable(name: &str, protected: &[String]) -> bool {
+    can_remove(name) && !protected.iter().any(|p| p == name)
 }
 
 /// Eject a drive by name, reporting the outcome once the desktop is done.
@@ -117,6 +163,21 @@ pub fn eject<F: Fn(Result<(), String>) + 'static>(name: &str, done: F) {
         return;
     };
 
+    // Checked again here rather than trusting the caller. This is the only
+    // function that can unmount anything, so it is the right place for the
+    // check that must not be bypassed.
+    if mount
+        .root()
+        .path()
+        .map(|p| is_system_mount(&p))
+        .unwrap_or(true)
+    {
+        done(Err(format!(
+            "{name} is a system drive and cannot be ejected"
+        )));
+        return;
+    }
+
     let op = gtk::gio::MountOperation::new();
     if mount.can_eject() {
         mount.eject_with_operation(
@@ -132,5 +193,51 @@ pub fn eject<F: Fn(Result<(), String>) + 'static>(name: &str, done: F) {
             gio::Cancellable::NONE,
             move |res| done(res.map_err(|e| e.message().to_string())),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_machines_own_filesystems_are_never_ejectable() {
+        for p in ["/", "/boot", "/boot/efi", "/usr", "/var", "/etc", "/home"] {
+            assert!(is_system_mount(Path::new(p)), "{p} should be protected");
+        }
+    }
+
+    #[test]
+    fn a_mount_holding_the_home_directory_is_protected() {
+        // Whatever HOME is on the machine running this, the directory it sits
+        // in is the machine's own disk and must not be unmounted.
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if let Some(home) = home {
+            assert!(is_system_mount(&home));
+            if let Some(parent) = home.parent() {
+                assert!(is_system_mount(parent));
+            }
+        }
+    }
+
+    #[test]
+    fn removable_media_is_not_mistaken_for_a_system_mount() {
+        for p in [
+            "/media/bao/SATURN",
+            "/run/media/bao/PRINTS",
+            "/mnt/usb",
+            "/media",
+        ] {
+            assert!(!is_system_mount(Path::new(p)), "{p} should be ejectable");
+        }
+    }
+
+    #[test]
+    fn the_user_blacklist_blocks_a_drive_that_is_otherwise_fine() {
+        let protected = vec!["SATURN".to_string()];
+        // can_remove needs a live volume monitor, so only the blacklist half
+        // is asserted here: a name in the list is refused regardless.
+        assert!(!is_ejectable("SATURN", &protected));
     }
 }

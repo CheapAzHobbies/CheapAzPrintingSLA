@@ -4062,17 +4062,12 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
 
     let mounted = drives::mounted();
     if mounted.is_empty() {
-        let empty = adw::ActionRow::builder()
-            .title("No drives detected")
-            .subtitle("Connect a USB drive or SD card and it will appear here")
-            .build();
-        // A disabled eject here shows the capability exists rather than
-        // leaving the group looking like it has no controls at all.
-        let eject = shell::icon_button("media-eject-symbolic", "No drive available to eject");
-        eject.set_sensitive(false);
-        eject.set_valign(gtk::Align::Center);
-        empty.add_suffix(&eject);
-        drives_group.add(&empty);
+        drives_group.add(
+            &adw::ActionRow::builder()
+                .title("No drives detected")
+                .subtitle("Connect a USB drive or SD card and it will appear here")
+                .build(),
+        );
     }
     for d in &mounted {
         let space = drives::space(&d.path)
@@ -4106,21 +4101,44 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             }
             let _ = s.save();
         });
-        // The button is always drawn, and disabled with a reason when the
-        // desktop cannot eject this drive. An absent control looks like a
-        // missing feature; a greyed one that says why does not.
-        {
-            let removable = drives::can_remove(&d.name);
-            let eject = shell::icon_button(
-                "media-eject-symbolic",
-                if removable {
-                    "Eject this drive"
-                } else {
-                    "This drive cannot be ejected"
-                },
-            );
-            eject.set_sensitive(removable);
+        // Eject appears only on drives that can actually be ejected. A drive
+        // the system depends on never qualifies, whatever the desktop says
+        // about it, and neither does one the user has locked.
+        if drives::can_remove(&d.name) {
+            let protected = current.never_eject.contains(&d.name);
+
+            let eject = shell::icon_button("media-eject-symbolic", "Eject this drive");
             eject.set_valign(gtk::Align::Center);
+            // One function decides this, so the button and the action that
+            // follows it can never disagree about whether it is allowed.
+            eject.set_visible(drives::is_ejectable(&d.name, &current.never_eject));
+
+            // The lock is what makes the blacklist reachable: a drive you
+            // never want ejected is marked here rather than in a text file.
+            let lock = gtk::ToggleButton::builder()
+                .icon_name("changes-prevent-symbolic")
+                .tooltip_text("Protect this drive from being ejected")
+                .valign(gtk::Align::Center)
+                .active(protected)
+                .build();
+            lock.add_css_class("flat");
+            {
+                let ui = ui.clone();
+                let name = d.name.clone();
+                let eject = eject.clone();
+                lock.connect_toggled(move |b| {
+                    {
+                        let mut s = ui.settings.borrow_mut();
+                        s.never_eject.retain(|p| *p != name);
+                        if b.is_active() {
+                            s.never_eject.push(name.clone());
+                        }
+                        let _ = s.save();
+                    }
+                    eject.set_visible(!b.is_active());
+                });
+            }
+            row.add_suffix(&lock);
             let ui3 = ui.clone();
             let name = d.name.clone();
             let btn = eject.clone();
