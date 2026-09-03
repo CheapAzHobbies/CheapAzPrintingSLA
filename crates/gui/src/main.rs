@@ -8063,6 +8063,13 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
                 ui.output_picker.set_hidden(Vec::new());
                 set_out_auto_drive(&ui);
                 refresh_nearby(&ui);
+                // WatchDog is a running thing, not only a stored one. Putting
+                // the setting back to off while leaving the folder monitor
+                // armed would give a program that says it is not watching and
+                // is. This drops the monitor, clears what was queued, and puts
+                // the eye and the switch back in step with the setting.
+                rearm_auto(&ui);
+                refresh_dropzone_text(&ui);
                 while let Some(child) = container.first_child() {
                     container.remove(&child);
                 }
