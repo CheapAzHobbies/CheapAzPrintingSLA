@@ -6,6 +6,7 @@
 //! Anything the engine cannot do is presented as unavailable rather than
 //! mocked up (§47 of the product specification).
 
+mod auto;
 mod drives;
 mod format_picker;
 mod nearby;
@@ -286,6 +287,24 @@ struct App {
     /// A tick box per history row, in the order the rows are shown, so several
     /// can be taken out in one go rather than one X at a time.
     history_ticks: RefCell<Vec<gtk::CheckButton>>,
+    /// Held so the folder monitor outlives the function that made it.
+    auto_watch: RefCell<Option<gio::FileMonitor>>,
+    /// Files seen but not yet finished being written.
+    auto_settling: RefCell<Vec<auto::Settling>>,
+    /// Files ready to convert, and whether one is being converted now.
+    ///
+    /// One at a time, always. Six files landing together on a four-core
+    /// machine that is also running a slicer is how an automatic feature
+    /// becomes the reason somebody's computer stopped responding.
+    auto_queue: RefCell<std::collections::VecDeque<PathBuf>>,
+    auto_busy: Cell<bool>,
+    /// Whether the settling loop is already running, so a folder that fires
+    /// twenty change events does not end up with twenty timers.
+    auto_ticking: Cell<bool>,
+    /// What has already been converted, so nothing is done twice. Keyed by
+    /// path, size and modification time - a file re-sliced over the same name
+    /// is a different file and is converted again.
+    auto_done: RefCell<Vec<String>>,
     /// The Settings switch for the overwrite question, so turning the question
     /// off from the question itself is visible next time Settings is opened.
     /// The page is built once, so it cannot find out on its own.
@@ -691,6 +710,12 @@ fn build(app: &adw::Application) -> Rc<App> {
         history_list,
         history_ticks: RefCell::new(Vec::new()),
         overwrite_switch: RefCell::new(None),
+        auto_watch: RefCell::new(None),
+        auto_settling: RefCell::new(Vec::new()),
+        auto_queue: RefCell::new(std::collections::VecDeque::new()),
+        auto_busy: Cell::new(false),
+        auto_ticking: Cell::new(false),
+        auto_done: RefCell::new(Vec::new()),
         history_stack,
         files: RefCell::new(Vec::new()),
         selected: RefCell::new(0),
@@ -730,6 +755,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         .set_transition_duration(if animate { MORPH_MS } else { 0 });
     wire_responsive(&ui);
     restore_session(&ui);
+    rearm_auto(&ui);
+    auto_deliver(&ui);
     refresh_history(&ui);
     ui
 }
@@ -1904,6 +1931,7 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 reattach_out_drive(&ui);
                 refresh_dest_label(&ui);
                 update_eject_button(&ui);
+                auto_deliver(&ui);
             });
         }
         {
@@ -2588,6 +2616,380 @@ fn choose_scan_folder(ui: &Rc<App>) {
             }
         },
     );
+}
+
+/// Start or stop watching the folder that automatic mode reads.
+///
+/// A folder monitor rather than a timer: the interesting moment is a slicer
+/// finishing an export, and asking the filesystem to say when that happens
+/// costs nothing while nothing is happening.
+fn rearm_auto(ui: &Rc<App>) {
+    *ui.auto_watch.borrow_mut() = None;
+    ui.auto_settling.borrow_mut().clear();
+    ui.auto_queue.borrow_mut().clear();
+    ui.auto_ticking.set(false);
+
+    let (on, dir) = {
+        let s = ui.settings.borrow();
+        (s.auto_convert, s.auto_watch_dir.clone())
+    };
+    let (true, Some(dir)) = (on, dir) else { return };
+    if !dir.is_dir() {
+        return;
+    }
+    // A folder that is also where output goes would convert its own results
+    // round and round. The extension check catches the usual case; this
+    // catches the arrangement itself, before it has a chance to happen once.
+    for mode in [auto::Staging::Disk, auto::Staging::Ram] {
+        if auto::staging_dir(mode).is_some_and(|s| dir.starts_with(&s) || s.starts_with(&dir)) {
+            return;
+        }
+    }
+    // And a folder on a removable drive is a folder that can vanish under the
+    // monitor, which is a folder worth not watching.
+    if drives::containing(&dir).is_some_and(|d| d.removable) {
+        return;
+    }
+
+    // Only what arrives from now on. Switching this on should not convert
+    // every file that has ever been left in the folder.
+    let known: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        // Bounded, because somebody will point this at a folder with a hundred
+        // thousand files in it and the seed list is only there to stop old
+        // files being converted the moment this is switched on.
+        .take(20_000)
+        .filter_map(|e| auto_key(&e.path()))
+        .collect();
+    *ui.auto_done.borrow_mut() = known;
+
+    let Ok(monitor) = gio::File::for_path(&dir)
+        .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+    else {
+        return;
+    };
+    let ui2 = ui.clone();
+    monitor.connect_changed(move |_, file, _, _| {
+        let Some(path) = file.path() else { return };
+        auto_saw(&ui2, path);
+    });
+    *ui.auto_watch.borrow_mut() = Some(monitor);
+}
+
+/// What identifies a particular version of a particular file.
+fn auto_key(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let when = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(format!("{}|{}|{when}", path.display(), meta.len()))
+}
+
+/// A file has appeared or changed. Start watching it settle.
+fn auto_saw(ui: &Rc<App>, path: PathBuf) {
+    if !path.is_file() {
+        return;
+    }
+    // Only formats that can be read, and never the format being written - a
+    // folder that is both watched and written to would otherwise convert its
+    // own output round and round.
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return;
+    };
+    let to = ui.settings.borrow().auto_to_format.clone();
+    let readable = registry::by_extension(ext).is_some_and(|h| h.info().capabilities.reads);
+    let is_output = registry::by_extension(ext).map(|h| h.info().id) == Some(to.as_str());
+    if !readable || is_output {
+        return;
+    }
+    {
+        let mut settling = ui.auto_settling.borrow_mut();
+        if settling.len() >= AUTO_WATCH_MOST || settling.iter().any(|s| s.path == path) {
+            return;
+        }
+        let Some(watch) = auto::Settling::watch(path) else {
+            return;
+        };
+        settling.push(watch);
+    }
+    // Start the loop that checks whether it has finished being written. It
+    // used to be started only when the folder was armed, which is the one
+    // moment nothing is settling - so the first file to arrive was watched and
+    // then never looked at again.
+    auto_start_ticking(ui);
+}
+
+/// Begin checking settling files, if that is not already happening.
+fn auto_start_ticking(ui: &Rc<App>) {
+    if ui.auto_ticking.replace(true) {
+        return;
+    }
+    let ui2 = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+        auto_tick(&ui2)
+    });
+}
+
+/// How long a file has to stop changing before it is taken as finished.
+const AUTO_QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+/// And how long it is given to manage that before it is taken as something
+/// that is never going to.
+const AUTO_PATIENCE: std::time::Duration = std::time::Duration::from_secs(600);
+/// How many files may be waiting to settle at once. A folder someone drops a
+/// thousand files into should not become a thousand timers.
+const AUTO_WATCH_MOST: usize = 64;
+
+/// Look at everything waiting to settle, and queue what has.
+///
+/// This only runs while something is actually settling, and stops the moment
+/// nothing is. The rest of the time the folder monitor is doing the watching,
+/// and a monitor that nothing has happened to costs nothing at all - which is
+/// the whole reason to use one rather than look every few seconds.
+fn auto_tick(ui: &Rc<App>) {
+    let ready: Vec<PathBuf> = {
+        let mut settling = ui.auto_settling.borrow_mut();
+        let mut ready = Vec::new();
+        settling.retain_mut(|s| {
+            if s.given_up(AUTO_PATIENCE) {
+                return false;
+            }
+            if s.settled(AUTO_QUIET) {
+                ready.push(s.path.clone());
+                return false;
+            }
+            s.path.exists()
+        });
+        ready
+    };
+    for path in ready {
+        ui.auto_queue.borrow_mut().push_back(path);
+    }
+    auto_pump(ui);
+
+    // Kept ticking only while there is something to tick for. The rest of the
+    // time this costs nothing at all, which on a slow machine is the point.
+    if ui.auto_settling.borrow().is_empty() {
+        ui.auto_ticking.set(false);
+        return;
+    }
+    let ui2 = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+        auto_tick(&ui2)
+    });
+}
+
+/// Convert the next queued file, if nothing else is being converted.
+fn auto_pump(ui: &Rc<App>) {
+    if ui.auto_busy.get() {
+        return;
+    }
+    let Some(next) = ui.auto_queue.borrow_mut().pop_front() else {
+        return;
+    };
+    ui.auto_busy.set(true);
+    auto_convert_one(ui, next);
+}
+
+/// Convert one settled file, and either stage it or send it straight over.
+///
+/// Every way out of this releases the queue, including the ones that give up
+/// without converting anything. A path that forgets to would leave automatic
+/// mode looking switched on and doing nothing for the rest of the session.
+fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
+    let release = |ui: &Rc<App>| {
+        ui.auto_busy.set(false);
+        let ui2 = ui.clone();
+        // Next one on a fresh turn of the loop rather than straight down the
+        // stack, so a folder of fifty files cannot recurse into the ground.
+        glib::idle_add_local_once(move || auto_pump(&ui2));
+    };
+
+    let Some(key) = auto_key(&source) else {
+        release(ui);
+        return;
+    };
+    if ui.auto_done.borrow().contains(&key) {
+        release(ui);
+        return;
+    }
+
+    let (to, asked, cap_mb, keep_days, uuid, budget) = {
+        let s = ui.settings.borrow();
+        (
+            s.auto_to_format.clone(),
+            auto::Staging::from_id(&s.auto_staging),
+            s.auto_cap_mb as u64,
+            s.auto_keep_days as u64,
+            s.auto_target_uuid.clone(),
+            s.ram_budget_mb as u64,
+        )
+    };
+
+    // Removable only, and never a filesystem the system needs. Automatic mode
+    // writes without being asked each time, so the check that it is writing to
+    // a stick and not to somebody's root partition cannot be left to the
+    // configuration being sensible.
+    let drive = uuid
+        .as_deref()
+        .and_then(drives::by_uuid)
+        .filter(|d| d.removable && !drives::is_system_mount(&d.path));
+
+    let coming = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
+    let mode = auto::resolve_staging(asked, budget, coming);
+
+    // Nowhere to put it and no drive to put it on: leave the file alone and
+    // leave it unrecorded, so plugging the drive in and re-saving still works.
+    if drive.is_none() && mode == auto::Staging::OnDemand {
+        release(ui);
+        return;
+    }
+
+    let into = match (&drive, auto::usable_dir(mode)) {
+        // The drive is here, so there is nothing to stage: convert onto it.
+        (Some(d), _) => d.path.clone(),
+        (None, Some(dir)) => dir,
+        (None, None) => {
+            release(ui);
+            return;
+        }
+    };
+
+    if drive.is_none() {
+        auto::prune(
+            &into,
+            cap_mb * 1024 * 1024,
+            std::time::Duration::from_secs(keep_days * 86_400),
+        );
+        // Refusing rather than overflowing: a cap that gives way under
+        // pressure is a cap in name only. Not recorded as done either, so it
+        // is converted after the drive has been emptied.
+        if auto::waiting(&into).bytes + coming > cap_mb * 1024 * 1024 {
+            ui.toasts.add_toast(adw::Toast::new(
+                "Files waiting for the drive have filled their limit, so nothing was converted",
+            ));
+            release(ui);
+            return;
+        }
+    }
+
+    let Some(dest) = convert::destination_for(&source, &to, Some(&into)) else {
+        release(ui);
+        return;
+    };
+    // Never over the top of something already there. This is the one place
+    // that writes files nobody asked it to write, so it does not get to
+    // replace anything.
+    let dest = if dest.exists() {
+        convert::unique_path(&dest)
+    } else {
+        dest
+    };
+    let plan = match convert::plan(&source, &to, &dest) {
+        Ok(p) => p,
+        Err(e) => {
+            ui.toasts.add_toast(adw::Toast::new(&format!(
+                "{}: {e}",
+                source.file_name().unwrap_or_default().to_string_lossy()
+            )));
+            // Recorded, so a file that cannot be converted is not retried on
+            // every touch for the rest of the session.
+            ui.auto_done.borrow_mut().push(key);
+            release(ui);
+            return;
+        }
+    };
+    {
+        // Bounded. A long session converting a great many files should not
+        // turn its own memory of what it has done into the thing that grows.
+        let mut done = ui.auto_done.borrow_mut();
+        done.push(key);
+        if done.len() > 5_000 {
+            done.drain(..1_000);
+        }
+    }
+
+    let name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(convert::run(&plan).map_err(|e| e.to_string()));
+    });
+    let ui = ui.clone();
+    let landed = drive.is_some();
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await;
+        ui.auto_busy.set(false);
+        let ui2 = ui.clone();
+        glib::idle_add_local_once(move || auto_pump(&ui2));
+        let Ok(result) = result else { return };
+        match result {
+            Ok(_) => {
+                ui.toasts.add_toast(adw::Toast::new(&if landed {
+                    format!("{name} converted onto the drive")
+                } else {
+                    format!("{name} converted and waiting for the drive")
+                }));
+                refresh_nearby(&ui);
+            }
+            Err(e) => {
+                ui.toasts
+                    .add_toast(adw::Toast::new(&format!("{name}: {e}")));
+            }
+        }
+    });
+}
+
+/// Send anything waiting to the drive that has just turned up.
+fn auto_deliver(ui: &Rc<App>) {
+    let (on, mode, uuid) = {
+        let s = ui.settings.borrow();
+        (
+            s.auto_convert,
+            auto::Staging::from_id(&s.auto_staging),
+            s.auto_target_uuid.clone(),
+        )
+    };
+    if !on {
+        return;
+    }
+    let (Some(uuid), Some(dir)) = (uuid, auto::staging_dir(mode)) else {
+        return;
+    };
+    let Some(drive) =
+        drives::by_uuid(&uuid).filter(|d| d.removable && !drives::is_system_mount(&d.path))
+    else {
+        return;
+    };
+    let waiting = auto::waiting(&dir);
+    if waiting.files.is_empty() {
+        return;
+    }
+    let mut sent = 0;
+    for staged in waiting.files {
+        match auto::deliver(&staged, &drive.path) {
+            Ok(_) => sent += 1,
+            Err(e) => {
+                ui.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not copy to the drive: {e}"
+                )));
+                break;
+            }
+        }
+    }
+    if sent > 0 {
+        ui.toasts.add_toast(adw::Toast::new(&match sent {
+            1 => format!("1 file copied to {}", drive.name),
+            n => format!("{n} files copied to {}", drive.name),
+        }));
+        refresh_nearby(ui);
+    }
 }
 
 /// Notice sources that have been written again since they were converted.
@@ -6258,6 +6660,261 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             removed.add_row(&row);
         }
         opening.add_row(&removed);
+    }
+
+    // Automatic mode. Its own section, because it is the one thing here that
+    // acts without being asked and should be findable, readable and stoppable
+    // in one place.
+    let automatic = settings_section(
+        &mut sections,
+        "Automatic mode",
+        "Convert files the moment they are sliced, and copy them to your printer's drive",
+        "auto automatic watch folder unattended background staging ram memory",
+    );
+
+    let auto_on = adw::SwitchRow::builder()
+        .title("Convert new files by itself")
+        .subtitle("Off unless you turn it on. It only runs while this window is open.")
+        .active(current.auto_convert)
+        .build();
+    automatic.add_row(&auto_on);
+
+    let watch_row = adw::ActionRow::builder()
+        .title("Folder to watch")
+        .subtitle(
+            current
+                .auto_watch_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Not chosen yet".into()),
+        )
+        .build();
+    let pick = gtk::Button::with_label("Choose…");
+    pick.set_valign(gtk::Align::Center);
+    {
+        let ui = ui.clone();
+        let row = watch_row.clone();
+        pick.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::builder().title("Folder to watch").build();
+            let ui = ui.clone();
+            let row = row.clone();
+            dialog.select_folder(
+                Some(&ui.window.clone()),
+                gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(folder) = res {
+                        if let Some(path) = folder.path() {
+                            row.set_subtitle(&path.display().to_string());
+                            {
+                                let mut s = ui.settings.borrow_mut();
+                                s.auto_watch_dir = Some(path);
+                                let _ = s.save();
+                            }
+                            rearm_auto(&ui);
+                        }
+                    }
+                },
+            );
+        });
+    }
+    watch_row.add_suffix(&pick);
+    automatic.add_row(&watch_row);
+
+    let target_row = adw::ActionRow::builder()
+        .title("Drive to copy to")
+        .subtitle(
+            match (&current.auto_target_label, &current.auto_target_uuid) {
+                (Some(label), Some(_)) => {
+                    format!("{label} - remembered by its filesystem, not its name")
+                }
+                _ => "Not chosen yet. Plug the drive in and press Use This.".to_string(),
+            },
+        )
+        .build();
+    let use_this = gtk::Button::with_label("Use This");
+    use_this.set_valign(gtk::Align::Center);
+    {
+        let ui = ui.clone();
+        let row = target_row.clone();
+        use_this.connect_clicked(move |_| {
+            // The drive the output is pointed at, which is the one in front of
+            // them. Asking them to identify a drive twice over would be asking
+            // them to make the same decision twice.
+            let picked = ui
+                .out_dir
+                .borrow()
+                .as_deref()
+                .and_then(drives::containing)
+                .filter(|d| d.removable)
+                .or_else(|| drives::mounted().into_iter().find(|d| d.removable));
+            let Some(drive) = picked else {
+                ui.toasts
+                    .add_toast(adw::Toast::new("Plug the drive in first"));
+                return;
+            };
+            let Some(uuid) = drives::uuid_of(&drive.path) else {
+                ui.toasts.add_toast(adw::Toast::new(
+                    "That drive has no filesystem UUID, so it cannot be told apart from another",
+                ));
+                return;
+            };
+            row.set_subtitle(&format!(
+                "{} - remembered by its filesystem, not its name",
+                drive.name
+            ));
+            let mut s = ui.settings.borrow_mut();
+            s.auto_target_uuid = Some(uuid);
+            s.auto_target_label = Some(drive.name.clone());
+            let _ = s.save();
+        });
+    }
+    target_row.add_suffix(&use_this);
+    automatic.add_row(&target_row);
+
+    let staging_row = adw::ComboRow::builder()
+        .title("Where files wait")
+        .subtitle("Until the drive is plugged in")
+        .model(&gtk::StringList::new(&[
+            "On disk",
+            "In memory",
+            "Do not convert until the drive is in",
+        ]))
+        .selected(match auto::Staging::from_id(&current.auto_staging) {
+            auto::Staging::Disk => 0,
+            auto::Staging::Ram => 1,
+            auto::Staging::OnDemand => 2,
+        })
+        .build();
+    {
+        let ui = ui.clone();
+        staging_row.connect_selected_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.auto_staging = match r.selected() {
+                1 => auto::Staging::Ram,
+                2 => auto::Staging::OnDemand,
+                _ => auto::Staging::Disk,
+            }
+            .id()
+            .to_string();
+            let _ = s.save();
+        });
+    }
+    automatic.add_row(&staging_row);
+
+    let ram_row = adw::SpinRow::builder()
+        .title("Memory it may use for waiting files")
+        .subtitle(match auto::available_ram_mb() {
+            Some(free) => format!("This machine has about {free} MB free right now"),
+            None => "In megabytes".to_string(),
+        })
+        .adjustment(&gtk::Adjustment::new(
+            current.ram_budget_mb as f64,
+            64.0,
+            8192.0,
+            64.0,
+            256.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        ram_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.ram_budget_mb = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+    automatic.add_row(&ram_row);
+
+    let cap_row = adw::SpinRow::builder()
+        .title("Most it will keep waiting")
+        .subtitle("In megabytes. Past this it stops converting rather than filling the disk.")
+        .adjustment(&gtk::Adjustment::new(
+            current.auto_cap_mb as f64,
+            64.0,
+            50_000.0,
+            64.0,
+            512.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        cap_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.auto_cap_mb = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+    automatic.add_row(&cap_row);
+
+    let keep_row = adw::SpinRow::builder()
+        .title("How long a file waits")
+        .subtitle("In days. One nobody collected in that time is dropped.")
+        .adjustment(&gtk::Adjustment::new(
+            current.auto_keep_days as f64,
+            1.0,
+            365.0,
+            1.0,
+            7.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        keep_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.auto_keep_days = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+    automatic.add_row(&keep_row);
+
+    // What is actually sitting there, because a queue nobody can see is how
+    // somebody loses forty gigabytes without knowing where it went.
+    let held = auto::staging_dir(auto::Staging::from_id(&current.auto_staging))
+        .map(|d| auto::waiting(&d))
+        .unwrap_or(auto::Waiting {
+            files: Vec::new(),
+            bytes: 0,
+        });
+    let waiting_row = adw::ActionRow::builder()
+        .title("Waiting to be copied")
+        .subtitle(match held.files.len() {
+            0 => "Nothing".to_string(),
+            n => format!("{n} files, {}", render::human_bytes(held.bytes)),
+        })
+        .build();
+    automatic.add_row(&waiting_row);
+
+    // The rows above only describe a thing that is running.
+    {
+        let rows: Vec<gtk::Widget> = vec![
+            watch_row.clone().upcast(),
+            target_row.clone().upcast(),
+            staging_row.clone().upcast(),
+            ram_row.clone().upcast(),
+            cap_row.clone().upcast(),
+            keep_row.clone().upcast(),
+            waiting_row.clone().upcast(),
+        ];
+        let show = move |on: bool| {
+            for r in &rows {
+                r.set_visible(on);
+            }
+        };
+        show(current.auto_convert);
+        let ui = ui.clone();
+        auto_on.connect_active_notify(move |r| {
+            let on = r.is_active();
+            show(on);
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.auto_convert = on;
+                let _ = s.save();
+            }
+            rearm_auto(&ui);
+        });
     }
 
     let saving = settings_section(

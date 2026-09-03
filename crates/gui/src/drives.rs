@@ -179,6 +179,35 @@ pub fn device_of(path: &std::path::Path) -> Option<PathBuf> {
         .map(|s| PathBuf::from(s.as_str()))
 }
 
+/// The filesystem UUID of a mounted drive, e.g. `8AC6-F852`.
+///
+/// A label is what the desktop shows and what a person recognises, and it is
+/// the wrong thing to write files to unattended: two sticks can carry the same
+/// one, and the mount point they get depends on which was plugged in first. A
+/// UUID is made when the filesystem is formatted and does not change or
+/// collide. Anything that writes without being asked each time should be
+/// aiming at one of these.
+pub fn uuid_of(path: &std::path::Path) -> Option<String> {
+    let device = device_of(path)?;
+    let device = std::fs::canonicalize(&device).unwrap_or(device);
+    for entry in std::fs::read_dir("/dev/disk/by-uuid").ok()?.flatten() {
+        let Ok(points_at) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if points_at == device {
+            return Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// The mounted drive with this UUID, if it is attached.
+pub fn by_uuid(uuid: &str) -> Option<Drive> {
+    mounted()
+        .into_iter()
+        .find(|d| uuid_of(&d.path).as_deref() == Some(uuid))
+}
+
 /// Whether a mounted drive holds a FAT filesystem.
 ///
 /// Only FAT can be reordered, and only FAT is what a resin printer reads, so

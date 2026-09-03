@@ -63,6 +63,34 @@ pub struct Settings {
     pub hidden_input_formats: Vec<String>,
     /// And the same when writing.
     pub hidden_output_formats: Vec<String>,
+    /// Watch a folder and convert what lands in it, without being asked.
+    ///
+    /// Off by default, and deliberately so. This is the one thing here that
+    /// acts on its own, and a thing that acts on its own should be something
+    /// somebody turned on rather than something they inherited.
+    pub auto_convert: bool,
+    /// The folder being watched.
+    pub auto_watch_dir: Option<PathBuf>,
+    /// What to convert to.
+    pub auto_to_format: String,
+    /// The drive converted files are for, by filesystem UUID rather than by
+    /// label - see `drives::uuid_of` for why that distinction matters here and
+    /// nowhere else.
+    pub auto_target_uuid: Option<String>,
+    /// Its label, kept only so the interface can name it while it is unplugged.
+    pub auto_target_label: Option<String>,
+    /// Where converted files wait: `disk`, `ram`, or `wait` for converting
+    /// nothing until the drive is there.
+    pub auto_staging: String,
+    /// A ceiling on the staging area, in MB.
+    pub auto_cap_mb: u32,
+    /// And on how long anything waits in it, in days.
+    pub auto_keep_days: u32,
+    /// What this program may hold in memory for staging, in MB.
+    ///
+    /// Not a limit on the process - no program can honestly promise that about
+    /// itself - but on the one part that would otherwise grow without asking.
+    pub ram_budget_mb: u32,
     /// Put the drive's file list in newest-first order when ejecting it.
     ///
     /// A resin printer lists files in the order they were written to the
@@ -158,6 +186,15 @@ impl Default for Settings {
             // that is where a first run points. Changing it is remembered.
             follow_drive: true,
             sort_drive_on_eject: true,
+            auto_convert: false,
+            auto_watch_dir: None,
+            auto_to_format: "goo".into(),
+            auto_target_uuid: None,
+            auto_target_label: None,
+            auto_staging: "disk".into(),
+            auto_cap_mb: 2048,
+            auto_keep_days: 7,
+            ram_budget_mb: 512,
             startup_pinned: false,
             startup_follow_drive: true,
             startup_output_dir: None,
@@ -252,6 +289,43 @@ impl Settings {
                 } else {
                     s.hidden_output_formats = list;
                 }
+            }
+        }
+        if let Some(v) = map.get("auto_convert") {
+            s.auto_convert = v == "true";
+        }
+        if let Some(v) = map.get("auto_watch_dir") {
+            s.auto_watch_dir = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Some(v) = map.get("auto_to_format") {
+            if !v.is_empty() {
+                s.auto_to_format = v.to_string();
+            }
+        }
+        if let Some(v) = map.get("auto_target_uuid") {
+            s.auto_target_uuid = (!v.is_empty()).then(|| v.to_string());
+        }
+        if let Some(v) = map.get("auto_target_label") {
+            s.auto_target_label = (!v.is_empty()).then(|| v.to_string());
+        }
+        if let Some(v) = map.get("auto_staging") {
+            if !v.is_empty() {
+                s.auto_staging = v.to_string();
+            }
+        }
+        if let Some(v) = map.get("auto_cap_mb") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.auto_cap_mb = n.clamp(64, 100_000);
+            }
+        }
+        if let Some(v) = map.get("auto_keep_days") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.auto_keep_days = n.clamp(1, 365);
+            }
+        }
+        if let Some(v) = map.get("ram_budget_mb") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.ram_budget_mb = n.clamp(64, 32_000);
             }
         }
         if let Some(v) = map.get("sort_drive_on_eject") {
@@ -379,6 +453,15 @@ impl Settings {
              quick_access_limit = {}\n\
              follow_drive = {}\n\
              sort_drive_on_eject = {}\n\
+             auto_convert = {}\n\
+             auto_watch_dir = {}\n\
+             auto_to_format = {}\n\
+             auto_target_uuid = {}\n\
+             auto_target_label = {}\n\
+             auto_staging = {}\n\
+             auto_cap_mb = {}\n\
+             auto_keep_days = {}\n\
+             ram_budget_mb = {}\n\
              recent_output_shown = {}\n\
              hidden_input_formats = {}\n\
              hidden_output_formats = {}\n\
@@ -421,6 +504,18 @@ impl Settings {
             self.quick_access_limit,
             self.follow_drive,
             self.sort_drive_on_eject,
+            self.auto_convert,
+            self.auto_watch_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            self.auto_to_format,
+            self.auto_target_uuid.clone().unwrap_or_default(),
+            self.auto_target_label.clone().unwrap_or_default(),
+            self.auto_staging,
+            self.auto_cap_mb,
+            self.auto_keep_days,
+            self.ram_budget_mb,
             self.recent_output_shown,
             self.hidden_input_formats.join("\x1f"),
             self.hidden_output_formats.join("\x1f"),
