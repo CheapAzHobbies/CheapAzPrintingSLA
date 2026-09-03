@@ -289,10 +289,14 @@ struct App {
     history_ticks: RefCell<Vec<gtk::CheckButton>>,
     /// Held so the folder monitor outlives the function that made it.
     auto_watch: RefCell<Option<gio::FileMonitor>>,
-    /// The two places automatic mode announces itself: a badge in the title
-    /// bar, visible from anywhere, and a banner over the work it is doing.
-    auto_badge: gtk::Button,
+    /// The eye in the title bar: the switch and the indicator in one.
+    watchdog_eye: gtk::ToggleButton,
+    /// And the banner over the work it is doing, which says the whole
+    /// sentence the eye can only hint at.
     auto_banner: adw::Banner,
+    /// The Settings switch, kept in step with the eye. The page is built once,
+    /// so it cannot find out on its own that the eye has been pressed.
+    auto_switch: RefCell<Option<adw::SwitchRow>>,
     /// Files seen but not yet finished being written.
     auto_settling: RefCell<Vec<auto::Settling>>,
     /// Files ready to convert, and whether one is being converted now.
@@ -422,18 +426,17 @@ fn build(app: &adw::Application) -> Rc<App> {
     let palette_btn = shell::icon_button("system-search-symbolic", "Commands  (Ctrl+K)");
     header.pack_start(&palette_btn);
 
-    // Automatic mode showing in the title bar, so it is visible from every
-    // page and not only from the one it happens to act on. A mode that does
-    // things by itself and looks exactly like the mode that does not is the
-    // worst of both: the whole point of the indicator is that nobody should
-    // ever wonder which one they are in.
-    let auto_badge = gtk::Button::builder()
-        .child(&labelled_icon("emblem-synchronizing-symbolic", "Automatic"))
-        .tooltip_text("Automatic mode is on. Press to see what it is doing.")
-        .visible(false)
+    // WatchDog's eye, in the title bar, on every page. One control that both
+    // switches it on and says whether it is on - a separate indicator and a
+    // separate switch would be two things to keep in step and two things to
+    // look for. Shut and grey when it is not watching, open and lit when it
+    // is, so the state is the picture rather than something to read.
+    let watchdog_eye = gtk::ToggleButton::builder()
+        .child(&gtk::Image::from_icon_name("view-conceal-symbolic"))
+        .tooltip_text("WatchDog is off")
         .build();
-    auto_badge.add_css_class("cz-armed");
-    header.pack_end(&auto_badge);
+    watchdog_eye.set_widget_name("watchdog-eye");
+    header.pack_end(&watchdog_eye);
 
     // --- convert page -----------------------------------------------------
     // Says what automatic mode is doing, over the page it is doing it to, with
@@ -736,8 +739,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         history_ticks: RefCell::new(Vec::new()),
         overwrite_switch: RefCell::new(None),
         auto_watch: RefCell::new(None),
-        auto_badge: auto_badge.clone(),
+        watchdog_eye: watchdog_eye.clone(),
         auto_banner: auto_banner.clone(),
+        auto_switch: RefCell::new(None),
         auto_settling: RefCell::new(Vec::new()),
         auto_queue: RefCell::new(std::collections::VecDeque::new()),
         auto_busy: Cell::new(false),
@@ -2042,10 +2046,29 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     }
 
     {
-        // Straight to the section that explains it and can stop it.
         let ui2 = ui.clone();
-        ui.auto_badge
-            .connect_clicked(move |_| ui2.shell.show(Section::Settings));
+        ui.watchdog_eye.connect_toggled(move |b| {
+            let on = b.is_active();
+            {
+                let mut s = ui2.settings.borrow_mut();
+                if s.auto_convert == on {
+                    return;
+                }
+                s.auto_convert = on;
+                let _ = s.save();
+            }
+            rearm_auto(&ui2);
+            // Switched on with nothing to watch is a decision half made, so it
+            // goes where the other half is rather than sitting there armed and
+            // doing nothing.
+            let unfinished = {
+                let s = ui2.settings.borrow();
+                s.auto_watch_dir.is_none() || s.auto_target_uuid.is_none()
+            };
+            if on && unfinished {
+                ui2.shell.show(Section::Settings);
+            }
+        });
     }
     {
         let ui2 = ui.clone();
@@ -2064,8 +2087,7 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 let _ = s.save();
             }
             rearm_auto(&ui2);
-            ui2.toasts
-                .add_toast(adw::Toast::new("Automatic mode is off"));
+            ui2.toasts.add_toast(adw::Toast::new("WatchDog is off"));
         });
     }
 
@@ -2692,9 +2714,34 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
             s.auto_target_label.clone(),
         )
     };
-    ui.auto_badge.set_visible(on);
+    // The eye, and everything that has to agree with it. Set rather than
+    // toggled, and only when it disagrees, so nothing here can start a loop
+    // with the handler that brought it about.
+    if ui.watchdog_eye.is_active() != on {
+        ui.watchdog_eye.set_active(on);
+    }
+    ui.watchdog_eye
+        .set_child(Some(&gtk::Image::from_icon_name(if on {
+            "view-reveal-symbolic"
+        } else {
+            "view-conceal-symbolic"
+        })));
+    if on {
+        ui.watchdog_eye.add_css_class("cz-armed");
+    } else {
+        ui.watchdog_eye.remove_css_class("cz-armed");
+    }
+    if let Some(row) = ui.auto_switch.borrow().as_ref() {
+        if row.is_active() != on {
+            row.set_active(on);
+        }
+    }
+
     ui.auto_banner.set_revealed(on);
     if !on {
+        ui.watchdog_eye.set_tooltip_text(Some(
+            "WatchDog is off. Press to have it watch a folder for you.",
+        ));
         return;
     }
 
@@ -2709,9 +2756,10 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
         Some(label) => format!("for {label}"),
         None => "but no drive is chosen, so they will wait".into(),
     };
-    ui.auto_banner.set_title(&format!(
-        "Watching {where_}. New files become {format} {onto}."
-    ));
+    let said = format!("Watching {where_}. New files become {format} {onto}.");
+    ui.auto_banner.set_title(&said);
+    ui.watchdog_eye
+        .set_tooltip_text(Some(&format!("WatchDog is watching. {said}")));
 
     // A setup that is switched on but cannot work says so with its button
     // rather than with a colour. Two tints of the same accent are not a
@@ -6770,22 +6818,25 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         opening.add_row(&removed);
     }
 
-    // Automatic mode. Its own section, because it is the one thing here that
-    // acts without being asked and should be findable, readable and stoppable
-    // in one place.
+    // WatchDog. Its own section, because it is the one thing here that acts
+    // without being asked and should be findable, readable and stoppable in
+    // one place.
     let automatic = settings_section(
         &mut sections,
-        "Automatic mode",
-        "Convert files the moment they are sliced, and copy them to your printer's drive",
-        "auto automatic watch folder unattended background staging ram memory",
+        "WatchDog mode",
+        "Watches a folder and converts what your slicer leaves there, then copies it to your printer's drive",
+        "watchdog auto automatic watch folder unattended background staging ram memory eye",
     );
 
     let auto_on = adw::SwitchRow::builder()
-        .title("Convert new files by itself")
-        .subtitle("Off unless you turn it on. It only runs while this window is open.")
+        .title("Let WatchDog watch")
+        .subtitle(
+            "The same switch as the eye in the title bar. Only runs while this window is open.",
+        )
         .active(current.auto_convert)
         .build();
     automatic.add_row(&auto_on);
+    *ui.auto_switch.borrow_mut() = Some(auto_on.clone());
 
     let watch_row = adw::ActionRow::builder()
         .title("Folder to watch")

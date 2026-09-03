@@ -1,4 +1,8 @@
-//! Convert on sight, deliver on plug-in.
+//! WatchDog: convert on sight, deliver on plug-in.
+//!
+//! Called WatchDog everywhere a person can see it, and `auto` everywhere in
+//! here - the settings keys included, which are not renamed because renaming
+//! them would throw away what anyone has already configured.
 //!
 //! Watching a folder and converting what lands in it is the one feature here
 //! that acts without being asked, so the whole design is about being able to
