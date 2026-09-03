@@ -286,6 +286,10 @@ struct App {
     /// A tick box per history row, in the order the rows are shown, so several
     /// can be taken out in one go rather than one X at a time.
     history_ticks: RefCell<Vec<gtk::CheckButton>>,
+    /// The Settings switch for the overwrite question, so turning the question
+    /// off from the question itself is visible next time Settings is opened.
+    /// The page is built once, so it cannot find out on its own.
+    overwrite_switch: RefCell<Option<adw::SwitchRow>>,
     history_stack: gtk::Stack,
 
     // state
@@ -686,6 +690,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         compact: Cell::new(false),
         history_list,
         history_ticks: RefCell::new(Vec::new()),
+        overwrite_switch: RefCell::new(None),
         history_stack,
         files: RefCell::new(Vec::new()),
         selected: RefCell::new(0),
@@ -5398,6 +5403,17 @@ fn ask_overwrite(
         .heading("Some files already exist")
         .body(body)
         .build();
+    // Turning the question off from inside the question itself, which is where
+    // anyone who is tired of it actually is. It only counts if they answer:
+    // ticking it and then cancelling is not a decision about future files.
+    let never = gtk::CheckButton::with_label("Do not ask me again");
+    never.set_margin_top(theme::SPACE_2);
+    never.set_tooltip_text(Some(
+        "Files of the same name will be replaced without asking. \
+         Settings can turn the question back on.",
+    ));
+    d.set_extra_child(Some(&never));
+
     d.add_response("cancel", "Cancel");
     d.add_response("both", "Keep Both");
     d.add_response("replace", "Replace");
@@ -5417,6 +5433,22 @@ fn ask_overwrite(
                 }
             }
             _ => return,
+        }
+        if never.is_active() {
+            {
+                let mut s = ui2.settings.borrow_mut();
+                s.confirm_overwrite = false;
+                let _ = s.save();
+            }
+            // The switch in Settings is put in step here rather than left to
+            // find out later: a setting that disagrees with what the program
+            // is doing is worse than no setting at all.
+            if let Some(row) = ui2.overwrite_switch.borrow().as_ref() {
+                row.set_active(false);
+            }
+            ui2.toasts.add_toast(adw::Toast::new(
+                "Files of the same name will be replaced from now on. Settings can undo this.",
+            ));
         }
         if warn && !losses.is_empty() {
             ask_losses(
@@ -5909,8 +5941,11 @@ fn filter_settings(sections: &[SettingsSection], typed: &str) {
     let needle = typed.trim().to_lowercase();
     for section in sections {
         if needle.is_empty() {
+            // Shown again, but not shut. Which sections are open is the
+            // reader's state to hold: leaving Settings to go and look at what
+            // a switch actually did, and coming back to find the page folded
+            // up again, means finding the place a second time.
             section.group.set_visible(true);
-            section.row.set_expanded(false);
             continue;
         }
         let hit = needle
@@ -5962,6 +5997,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     conversion.add_row(&overwrite);
+    *ui.overwrite_switch.borrow_mut() = Some(overwrite.clone());
 
     let appearance = settings_section(
         &mut sections,
@@ -6122,10 +6158,11 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     let layout_row = adw::ComboRow::builder()
         .title("Where file details go")
         .subtitle("The format, size, folder and age of each file")
-        .model(&gtk::StringList::new(&[
-            "In columns beside the name",
-            "On a line under the name",
-        ]))
+        // Short enough to be read whole. A combo row shows its value on the
+        // right of the same line as its title, in whatever is left over, and
+        // the long form was being cut in half exactly where the difference
+        // between the two answers lives.
+        .model(&gtk::StringList::new(&["In columns", "Under the name"]))
         .selected(if current.quick_access_columns { 0 } else { 1 })
         .build();
     {
@@ -6141,37 +6178,85 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     }
     opening.add_row(&layout_row);
 
+    // The three rows above only describe a list that is being shown. With
+    // Quick Access off they are settings for something that is not there, so
+    // they go with it.
+    {
+        let rows: Vec<gtk::Widget> = vec![
+            visible_row.clone().upcast(),
+            limit_row.clone().upcast(),
+            layout_row.clone().upcast(),
+        ];
+        let show = move |on: bool| {
+            for r in &rows {
+                r.set_visible(on);
+            }
+        };
+        show(current.show_nearby_files);
+        nearby_row.connect_active_notify(move |r| show(r.is_active()));
+    }
+
     // A removed folder can be added again through the picker; a removed drive
     // is only ever offered because it is attached, so without this there would
     // be no way back at all. It lives here rather than in the menu it undoes,
     // which is a menu for choosing where to look and not for administering it.
+    //
+    // Listed one per row rather than counted, because a count leaves the
+    // reader to take on trust both which places are hidden and that more than
+    // one can be - and each one is put back on its own, which a single "show
+    // them all" button could not do.
     if !current.quick_access_hidden.is_empty() {
-        let removed = current.quick_access_hidden.len();
-        let row = adw::ActionRow::builder()
+        let removed = adw::ExpanderRow::builder()
             .title("Folders you removed")
-            .subtitle(match removed {
-                1 => "One folder or drive is no longer offered".to_string(),
-                n => format!("{n} folders and drives are no longer offered"),
+            .subtitle(match current.quick_access_hidden.len() {
+                1 => "One place is no longer offered".to_string(),
+                n => format!("{n} places are no longer offered"),
             })
             .build();
-        let restore = gtk::Button::with_label("Show Again");
-        restore.set_valign(gtk::Align::Center);
-        {
-            let ui = ui.clone();
-            let row = row.clone();
-            restore.connect_clicked(move |b| {
-                {
-                    let mut s = ui.settings.borrow_mut();
-                    s.quick_access_hidden.clear();
-                    let _ = s.save();
-                }
-                refresh_nearby(&ui);
-                b.set_sensitive(false);
-                row.set_subtitle("All of them are offered again");
-            });
+        for key in &current.quick_access_hidden {
+            // A drive is stored as "drive:LABEL"; a folder as its path.
+            let (name, where_) = match key.strip_prefix("drive:") {
+                Some(label) => (label.to_string(), "Drive".to_string()),
+                None => (
+                    std::path::Path::new(key)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| key.clone()),
+                    key.clone(),
+                ),
+            };
+            let row = adw::ActionRow::builder()
+                .title(&name)
+                .subtitle(&where_)
+                .build();
+            let back = gtk::Button::with_label("Show");
+            back.set_valign(gtk::Align::Center);
+            {
+                let ui = ui.clone();
+                let key = key.clone();
+                let row = row.clone();
+                let removed = removed.clone();
+                back.connect_clicked(move |b| {
+                    {
+                        let mut s = ui.settings.borrow_mut();
+                        s.quick_access_hidden.retain(|k| *k != key);
+                        let _ = s.save();
+                    }
+                    refresh_nearby(&ui);
+                    b.set_sensitive(false);
+                    removed.remove(&row);
+                    let left = ui.settings.borrow().quick_access_hidden.len();
+                    removed.set_subtitle(&match left {
+                        0 => "All of them are offered again".to_string(),
+                        1 => "One place is no longer offered".to_string(),
+                        n => format!("{n} places are no longer offered"),
+                    });
+                });
+            }
+            row.add_suffix(&back);
+            removed.add_row(&row);
         }
-        row.add_suffix(&restore);
-        opening.add_row(&row);
+        opening.add_row(&removed);
     }
 
     let saving = settings_section(
@@ -6610,8 +6695,9 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         let sections = sections.clone();
         find.connect_search_changed(move |e| filter_settings(&sections, &e.text()));
     }
-    // Cleared when the page is left and come back to, so it never opens
-    // already filtered by something typed a week ago.
+    // The search is cleared when the page is come back to, so it never opens
+    // already filtered by something typed a week ago. Clearing it shows every
+    // section again and leaves them however they were left.
     {
         let find = find.clone();
         let sections = sections.clone();
