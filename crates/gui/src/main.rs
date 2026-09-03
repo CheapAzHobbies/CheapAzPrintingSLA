@@ -28,6 +28,9 @@ const EXPANDER_MS: u64 = 220;
 /// the border-radius transition in the stylesheet, because the list waits this
 /// long before dropping so the two read as one thing after another.
 const CORNER_MS: u64 = 120;
+/// The corner's own radius, from the stylesheet. Once the folding list is
+/// shorter than this, rounding the header cannot put a curve through anything.
+const CORNER_RADIUS: f64 = 12.0;
 
 use adw::prelude::*;
 use cheapazsla_core::history::{self, History};
@@ -156,8 +159,6 @@ struct App {
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
-    /// What the field says when it is empty and wide enough to say it.
-    search_hint: Rc<RefCell<String>>,
     /// How far open the field is, where it is heading, and whether a tick
     /// callback is walking it there.
     search_t: Rc<Cell<f64>>,
@@ -180,6 +181,9 @@ struct App {
     nearby_target: Rc<Cell<f64>>,
     nearby_elapsed: Rc<Cell<f64>>,
     nearby_moving: Rc<Cell<bool>>,
+    /// Counts animations, so a safety net can tell whether the one it was
+    /// watching is still the one running.
+    nearby_gen: Rc<Cell<u64>>,
     /// The rows currently inside the expander, so a refresh can take them out
     /// again without rebuilding the row and losing whether it was open.
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
@@ -556,7 +560,6 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_head_list: nearby.head_list,
         nearby_rows_list: nearby.rows_list,
         nearby_search: nearby.search,
-        search_hint: Rc::new(RefCell::new(String::new())),
         search_t: Rc::new(Cell::new(0.0)),
         search_open: Rc::new(Cell::new(false)),
         search_moving: Rc::new(Cell::new(false)),
@@ -568,6 +571,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_target: Rc::new(Cell::new(0.0)),
         nearby_elapsed: Rc::new(Cell::new(0.0)),
         nearby_moving: Rc::new(Cell::new(false)),
+        nearby_gen: Rc::new(Cell::new(0)),
         nearby_sources: nearby.sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
         nearby_keys: RefCell::new(Vec::new()),
@@ -1843,26 +1847,22 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     {
         let ui2 = ui.clone();
         ui.nearby_expander.connect_expanded_notify(move |e| {
-            // Shut, the header is a card in its own right and keeps its
-            // corners. Open, it is the top of one and gives up the bottom two
-            // so the seam with the file list underneath does not show. The
-            // radius is transitioned in CSS rather than switched, so the
-            // corners square off as the list opens instead of snapping.
-            //
-            // Squaring happens at once; rounding waits for the list to finish
-            // shutting, which `animate_nearby_height` does at the end of its
-            // last frame. Rounding them while rows were still on screen put a
-            // curve through the middle of the list.
             // Glass while shut, box while open.
             show_nearby_search(&ui2, ui2.nearby_search_shown.get());
 
+            // Shut, the header is a card in its own right and keeps its
+            // corners. Open, it is the top of one and gives up the bottom two,
+            // so the seam with the file list underneath does not show.
+            //
             // One thing after another, in both directions. Opening: the
             // corners square off, and only then does the list drop out from
             // under them. Shutting is the same sequence backwards - the list
             // folds away first and the corners round afterwards, which
             // `animate_nearby_height` does at the end of its last frame.
             // Done together, the header appears to change shape while the
-            // thing it is changing shape for is still arriving.
+            // thing it is changing shape for is still arriving; and rounding
+            // them while rows were still on screen put a curve through the
+            // middle of the list.
             if !e.is_expanded() {
                 animate_nearby_height(&ui2, ui2.nearby_clip.height());
                 return;
@@ -2545,9 +2545,7 @@ fn refresh_nearby(ui: &Rc<App>) {
     // question a search box in a list of found files raises is which folders
     // it is looking through, and it may as well answer it.
     show_nearby_search(ui, true);
-    let hint = format!("Search {}", places.join(", "));
-    ui.nearby_search.set_placeholder_text(Some(&hint));
-    *ui.search_hint.borrow_mut() = hint;
+    ui.nearby_search.set_placeholder_text(Some(SEARCH_HINT));
 
     // One size group per column, so the four facts about a file start in the
     // same place down the list instead of each row setting its own margins.
@@ -2747,6 +2745,10 @@ const SEARCH_FADE: f64 = 0.34;
 /// recognisable, without stopping on its way out to show the first letter of
 /// a word nobody is reading.
 const SEARCH_SEED: i32 = 38;
+/// What the field says when it is empty. One word: the row above it already
+/// names the folders being looked through, and repeating them inside the box
+/// made a long line that had to be ellipsized to fit anyway.
+const SEARCH_HINT: &str = "Search";
 /// Below this width the placeholder is taken away rather than left to
 /// ellipsize. Font metrics decide how much of a word fits in a given number of
 /// pixels, and the answer is not the same on every machine; taking the text
@@ -2794,7 +2796,6 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
     let t = ui.search_t.clone();
     let want = ui.search_open.clone();
     let moving = ui.search_moving.clone();
-    let hint = ui.search_hint.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
@@ -2821,16 +2822,19 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
         };
         let wide = SEARCH_SEED + ((SEARCH_WIDTH - SEARCH_SEED) as f64 * eased).round() as i32;
         entry.set_size_request(wide, -1);
-        // On the way out the words go before the box does, so what is left to
-        // fade is the glass alone rather than the first letter of a word.
-        if wide < SEARCH_HINT_MIN {
+        // On the way out the word goes first and stays gone, so the whole
+        // shrink is the glass travelling rather than a letter being squeezed
+        // out of a shortening box. On the way in it comes back as soon as
+        // there is room for it, so the box fills as it grows.
+        if !opening || wide < SEARCH_HINT_MIN {
             entry.set_placeholder_text(None);
         } else {
-            entry.set_placeholder_text(Some(hint.borrow().as_str()));
+            entry.set_placeholder_text(Some(SEARCH_HINT));
         }
 
         if (opening && at >= 1.0) || (!opening && at <= 0.0) {
             if opening {
+                entry.set_placeholder_text(Some(SEARCH_HINT));
                 entry.set_opacity(1.0);
             } else {
                 entry.set_visible(false);
@@ -2940,12 +2944,42 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         return;
     };
 
+    let generation = ui.nearby_gen.get().wrapping_add(1);
+    ui.nearby_gen.set(generation);
     ui.nearby_from.set(from as f64);
     ui.nearby_h.set(from as f64);
     ui.nearby_target.set(to as f64);
     ui.nearby_elapsed.set(0.0);
     hold_nearby(&clip, from);
     ui.nearby_moving.set(true);
+
+    // A tick callback only runs while the frame clock does, and a clock that
+    // is throttled - an occluded window, a session that has stopped drawing -
+    // takes the animation with it and leaves `moving` set for good. Every
+    // later change then does nothing but move a target nothing is chasing,
+    // and the list sits at whatever height it had reached: shut, refusing to
+    // open, with the refresh button apparently doing nothing. This is the
+    // floor under that. It only acts on its own animation, and only if that
+    // one is somehow still running long after it should have finished.
+    {
+        let ui = ui.clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis((NEARBY_SECONDS * 4000.0) as u64),
+            move || {
+                if !ui.nearby_moving.get() || ui.nearby_gen.get() != generation {
+                    return;
+                }
+                ui.nearby_moving.set(false);
+                let width = ui.nearby_clip.width();
+                let (to, cap) = nearby_rest(&ui, if width > 0 { width } else { -1 });
+                settle_nearby(&ui.nearby_clip, cap);
+                if to == 0 {
+                    ui.nearby_head_list.remove_css_class("cz-qa-open");
+                    ui.nearby_rows_list.set_visible(false);
+                }
+            },
+        );
+    }
 
     let root: gtk::Widget = root.upcast();
     let start = ui.nearby_from.clone();
@@ -2986,6 +3020,14 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
             }
             moving.set(false);
             return glib::ControlFlow::Break;
+        }
+        // Once what is left of the list is shorter than the corner itself,
+        // there is nothing left for a curve to cut through - so the rounding
+        // starts here rather than after the fold has finished. Waiting until
+        // the end left a gap between the list going and the corners moving,
+        // which read as a hesitation.
+        if target.get() <= 0.0 && at < CORNER_RADIUS {
+            head.remove_css_class("cz-qa-open");
         }
         hold_nearby(&clip, at.round() as i32);
         glib::ControlFlow::Continue
