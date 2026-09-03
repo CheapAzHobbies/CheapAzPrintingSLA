@@ -142,7 +142,10 @@ fn sheet(p: &Palette) -> String {
    seam invisible: the header loses its bottom corners while the list is open,
    and the list loses its top corners and its top border, so the two read as
    one card with a single line across it. */
-.cz-qa-open {{
+.cz-qa-head {{
+  transition: border-radius 200ms ease;
+}}
+.cz-qa-head.cz-qa-open {{
   border-bottom-left-radius: 0;
   border-bottom-right-radius: 0;
 }}

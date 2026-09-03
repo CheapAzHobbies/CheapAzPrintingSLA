@@ -152,9 +152,13 @@ struct App {
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
-    /// The magnifying glass shown in place of the box while the list is shut.
+    /// The magnifying glass. Always there once searching is on offer.
     nearby_search_btn: gtk::Button,
-    nearby_search_reveal: gtk::Revealer,
+    /// How far open the field is, where it is heading, and whether a tick
+    /// callback is walking it there.
+    search_t: Rc<Cell<f64>>,
+    search_open: Rc<Cell<bool>>,
+    search_moving: Rc<Cell<bool>>,
     /// Whether searching is being offered at all, which it is not when there
     /// are no files to search.
     nearby_search_shown: Cell<bool>,
@@ -543,7 +547,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_rows_list: nearby.rows_list,
         nearby_search: nearby.search,
         nearby_search_btn: nearby.search_btn,
-        nearby_search_reveal: nearby.search_reveal,
+        search_t: Rc::new(Cell::new(0.0)),
+        search_open: Rc::new(Cell::new(false)),
+        search_moving: Rc::new(Cell::new(false)),
         nearby_search_shown: Cell::new(false),
         nearby_subtitle: RefCell::new(String::new()),
         nearby_cap: Rc::new(Cell::new(-1)),
@@ -1112,6 +1118,7 @@ fn build_nearby_panel() -> NearbyPanel {
     // five files scrolled the search box and the buttons off the top as well.
     let head_list = gtk::ListBox::new();
     head_list.add_css_class("boxed-list");
+    head_list.add_css_class("cz-qa-head");
     head_list.set_selection_mode(gtk::SelectionMode::None);
 
     let list = gtk::ListBox::new();
@@ -1161,21 +1168,20 @@ fn build_nearby_panel() -> NearbyPanel {
     // also why this is a plain entry rather than a search entry: a search
     // entry brings its own glass, and two of them was the whole problem.
     let search = gtk::Entry::new();
-    search.set_width_chars(16);
-    search.set_max_width_chars(22);
+    // No character width. It looks like the natural way to size a field, but
+    // width-chars is a minimum, and a size request can only ever raise a
+    // minimum - so with it set the field could not be animated narrower than
+    // sixteen characters and the growth did nothing at all. The width is
+    // driven entirely by the request instead.
+    search.set_width_chars(0);
+    search.set_max_width_chars(0);
     search.set_valign(gtk::Align::Center);
-    let search_reveal = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideLeft)
-        .transition_duration(EXPANDER_MS as u32)
-        .reveal_child(false)
-        .child(&search)
-        .build();
-    search_reveal.set_valign(gtk::Align::Center);
+    search.set_visible(false);
 
     let search_btn = shell::icon_button("system-search-symbolic", "Search the files listed here");
     search_btn.set_valign(gtk::Align::Center);
 
-    expander.add_suffix(&search_reveal);
+    expander.add_suffix(&search);
     expander.add_suffix(&search_btn);
 
     head_list.append(&expander);
@@ -1192,7 +1198,6 @@ fn build_nearby_panel() -> NearbyPanel {
         rows_list: list,
         search,
         search_btn,
-        search_reveal,
     }
 }
 
@@ -1207,7 +1212,6 @@ struct NearbyPanel {
     search: gtk::Entry,
     /// The glass. Sits beside the field once it is open, as its icon.
     search_btn: gtk::Button,
-    search_reveal: gtk::Revealer,
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -1817,11 +1821,16 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         ui.nearby_expander.connect_expanded_notify(move |e| {
             // Shut, the header is a card in its own right and keeps its
             // corners. Open, it is the top of one and gives up the bottom two
-            // so the seam with the file list underneath does not show.
+            // so the seam with the file list underneath does not show. The
+            // radius is transitioned in CSS rather than switched, so the
+            // corners square off as the list opens instead of snapping.
+            //
+            // Squaring happens at once; rounding waits for the list to finish
+            // shutting, which `animate_nearby_height` does at the end of its
+            // last frame. Rounding them while rows were still on screen put a
+            // curve through the middle of the list.
             if e.is_expanded() {
                 ui2.nearby_head_list.add_css_class("cz-qa-open");
-            } else {
-                ui2.nearby_head_list.remove_css_class("cz-qa-open");
             }
             // Glass while shut, box while open.
             show_nearby_search(&ui2, ui2.nearby_search_shown.get());
@@ -2577,15 +2586,36 @@ const NEARBY_SECONDS: f64 = EXPANDER_MS as f64 / 1000.0;
 /// scrolled window at all - it is the list, growing and shrinking with its own
 /// contents.
 fn settle_nearby(clip: &gtk::ScrolledWindow, cap: i32) {
-    if cap > 0 {
-        clip.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-        clip.set_min_content_height(cap);
-        clip.set_max_content_height(cap);
-    } else {
+    // A negative cap means release: the list is free to be as tall as it
+    // wants. Zero is not release, it is a cap of nothing - the shut state -
+    // and confusing the two is what made shutting the list animate down to
+    // nothing and then spring straight back to full height.
+    if cap < 0 {
         clip.set_vscrollbar_policy(gtk::PolicyType::Never);
         clip.set_min_content_height(-1);
         clip.set_max_content_height(-1);
+        return;
     }
+    clip.set_vscrollbar_policy(if cap == 0 {
+        gtk::PolicyType::External
+    } else {
+        gtk::PolicyType::Automatic
+    });
+    pin_nearby(clip, cap);
+}
+
+/// Pin the scroller to exactly one height.
+///
+/// Cleared first, and the maximum set before the minimum. GTK quietly lowers a
+/// minimum that is asked to exceed the current maximum, so raising the pin -
+/// from nothing, which is every time the list opens - set the minimum back to
+/// what it already was and left the list allocated at the height it had. The
+/// symptom was a list that opened one row tall.
+fn pin_nearby(clip: &gtk::ScrolledWindow, height: i32) {
+    clip.set_min_content_height(-1);
+    clip.set_max_content_height(-1);
+    clip.set_max_content_height(height);
+    clip.set_min_content_height(height);
 }
 
 /// Where the file list should come to rest: its height, and the cap if any.
@@ -2626,11 +2656,92 @@ fn show_nearby_search(ui: &Rc<App>, offer: bool) {
     if !offer {
         ui.nearby_search.set_text("");
     }
-    let open = offer && ui.nearby_expander.is_expanded();
-    ui.nearby_search_reveal.set_reveal_child(open);
     // Visible in both states. Shut it is the button; open it is the field's
     // icon, in the same place, doing the same job.
     ui.nearby_search_btn.set_visible(offer);
+    open_nearby_search(ui, offer && ui.nearby_expander.is_expanded());
+}
+
+/// How long the field takes to open or shut, in seconds, and the share of that
+/// spent fading the box in before it starts to widen.
+const SEARCH_SECONDS: f64 = 0.28;
+const SEARCH_FADE: f64 = 0.34;
+/// The width the box fades in at, before it grows: a small rounded box beside
+/// the glass rather than a sliver.
+const SEARCH_SEED: i32 = 34;
+/// And what it grows to. A number rather than the field's own natural width,
+/// which is nothing now that it has no character width to claim one from.
+const SEARCH_WIDTH: i32 = 190;
+
+/// Open or shut the search field.
+///
+/// The box fades in first, at a width of almost nothing, and then widens.
+/// Deliberately a real width rather than a revealer sliding it into view: a
+/// revealer clips its child, so the rounded corner on the leading edge would
+/// be sheared off for the whole of the animation. Growing the widget itself
+/// means the corners are drawn, correctly, in every frame.
+fn open_nearby_search(ui: &Rc<App>, open: bool) {
+    let entry = ui.nearby_search.clone();
+    ui.search_open.set(open);
+
+    // Mapping is deliberately not the test. The field is hidden while shut,
+    // so it is never mapped at the moment it is asked to open, and checking
+    // for it meant every opening snapped instead of animating. Being in a
+    // window at all is the real question.
+    let snap = !ui.settings.borrow().animations || entry.root().is_none();
+    if snap {
+        ui.search_t.set(if open { 1.0 } else { 0.0 });
+        entry.set_size_request(if open { SEARCH_WIDTH } else { SEARCH_SEED }, -1);
+        entry.set_opacity(1.0);
+        entry.set_visible(open);
+        return;
+    }
+    if open {
+        entry.set_visible(true);
+    }
+    if ui.search_moving.replace(true) {
+        return;
+    }
+    let Some(root) = entry.root() else {
+        ui.search_moving.set(false);
+        return;
+    };
+    let root: gtk::Widget = root.upcast();
+    let t = ui.search_t.clone();
+    let want = ui.search_open.clone();
+    let moving = ui.search_moving.clone();
+    let last = Cell::new(None::<i64>);
+    root.add_tick_callback(move |_, clock| {
+        let now = clock.frame_time();
+        let dt = match last.replace(Some(now)) {
+            Some(previous) => ((now - previous) as f64 / 1e6).clamp(0.0, 0.1),
+            None => 0.0,
+        };
+        let opening = want.get();
+        let step = dt / SEARCH_SECONDS;
+        let at = (t.get() + if opening { step } else { -step }).clamp(0.0, 1.0);
+        t.set(at);
+
+        // The box arrives before it grows, and leaves after it has shrunk.
+        entry.set_opacity((at / SEARCH_FADE).clamp(0.0, 1.0));
+        let grown = ((at - SEARCH_FADE) / (1.0 - SEARCH_FADE)).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - grown).powi(3);
+        entry.set_size_request(
+            SEARCH_SEED + ((SEARCH_WIDTH - SEARCH_SEED) as f64 * eased).round() as i32,
+            -1,
+        );
+
+        if (opening && at >= 1.0) || (!opening && at <= 0.0) {
+            if opening {
+                entry.set_opacity(1.0);
+            } else {
+                entry.set_visible(false);
+            }
+            moving.set(false);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Show only the rows matching what has been typed, and say so.
@@ -2674,8 +2785,7 @@ fn apply_nearby_filter(ui: &Rc<App>) {
 /// Hold the list at one height, whatever its contents now measure.
 fn hold_nearby(clip: &gtk::ScrolledWindow, height: i32) {
     clip.set_vscrollbar_policy(gtk::PolicyType::External);
-    clip.set_min_content_height(height);
-    clip.set_max_content_height(height);
+    pin_nearby(clip, height);
 }
 
 /// Walk the Quick Access list from the height it had to the height it wants.
@@ -2708,10 +2818,16 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     }
     if from <= 0 || from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
         settle_nearby(&clip, cap);
+        if to == 0 {
+            ui.nearby_head_list.remove_css_class("cz-qa-open");
+        }
         return;
     }
     let Some(root) = clip.root() else {
         settle_nearby(&clip, cap);
+        if to == 0 {
+            ui.nearby_head_list.remove_css_class("cz-qa-open");
+        }
         return;
     };
 
@@ -2729,6 +2845,7 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let elapsed = ui.nearby_elapsed.clone();
     let moving = ui.nearby_moving.clone();
     let rest = ui.nearby_cap.clone();
+    let head = ui.nearby_head_list.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
@@ -2749,6 +2866,10 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
 
         if t >= 1.0 {
             settle_nearby(&clip, rest.get());
+            if target.get() <= 0.0 {
+                // Fully shut at last: the header may have its corners back.
+                head.remove_css_class("cz-qa-open");
+            }
             moving.set(false);
             return glib::ControlFlow::Break;
         }
