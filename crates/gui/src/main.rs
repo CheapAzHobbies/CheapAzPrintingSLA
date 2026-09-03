@@ -147,6 +147,14 @@ struct App {
     nearby_clip: gtk::ScrolledWindow,
     /// Where that height is now, where it is heading, and whether a tick
     /// callback is already walking it there.
+    /// Height of the expander's own row, remembered while the list is shut so
+    /// the open height can be worked out from parts rather than measured
+    /// mid-animation.
+    nearby_head: Cell<i32>,
+    /// The height to come to rest at, and whether that height is a cap that
+    /// should scroll. Held in a cell because the tick callback settles the
+    /// list and deliberately holds no handle back to `App`.
+    nearby_cap: Rc<Cell<i32>>,
     nearby_h: Rc<Cell<f64>>,
     nearby_from: Rc<Cell<f64>>,
     nearby_target: Rc<Cell<f64>>,
@@ -515,6 +523,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_panel: nearby_panel.clone(),
         nearby_expander,
         nearby_clip,
+        nearby_head: Cell::new(0),
+        nearby_cap: Rc::new(Cell::new(-1)),
         nearby_h: Rc::new(Cell::new(0.0)),
         nearby_from: Rc::new(Cell::new(0.0)),
         nearby_target: Rc::new(Cell::new(0.0)),
@@ -1678,6 +1688,23 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     // rather than buried in Settings.
     build_sources_menu(ui, &ui.nearby_sources.clone());
 
+    // Opening the list has to be caught as well as refreshing it. The expander
+    // animates itself open, and with nothing to stop it a folder holding forty
+    // files would push the rest of the page down by the length of all forty.
+    // Only when there is a cap to impose: a list that fits is left entirely to
+    // the expander's own animation, which is smoother than anything imposed
+    // over the top of it.
+    {
+        let ui2 = ui.clone();
+        ui.nearby_expander.connect_expanded_notify(move |_| {
+            let capped = ui2.nearby_rows.borrow().len()
+                > ui2.settings.borrow().quick_access_visible as usize;
+            if capped || ui2.nearby_cap.get() > 0 {
+                animate_nearby_height(&ui2, ui2.nearby_clip.height());
+            }
+        });
+    }
+
     refresh_nearby(ui);
 
     // Output format.
@@ -2001,16 +2028,17 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
         heading.set_margin_bottom(theme::SPACE_2);
         content.append(&heading);
 
-        let (open_dir, extra, off, hidden) = {
+        let (open_dir, extra, off, hidden, drives_on) = {
             let s = ui.settings.borrow();
             (
                 s.open_start_dir(),
                 s.quick_access_folders.clone(),
                 s.quick_access_off.clone(),
                 s.quick_access_hidden.clone(),
+                s.quick_access_drives_on.clone(),
             )
         };
-        let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden);
+        let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden, &drives_on);
 
         if sources.is_empty() {
             let none = gtk::Label::new(Some("Nowhere to look yet"));
@@ -2031,15 +2059,33 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
                 .subtitle(source.path.display().to_string())
                 .active(source.enabled)
                 .build();
+            if !source.enabled && source.opt_in {
+                row.set_subtitle(&format!(
+                    "{} - not read until switched on",
+                    source.path.display()
+                ));
+            }
             {
                 let ui = ui.clone();
                 let key = source.key.clone();
+                let opt_in = source.opt_in;
                 row.connect_active_notify(move |r| {
                     {
                         let mut s = ui.settings.borrow_mut();
-                        s.quick_access_off.retain(|k| *k != key);
-                        if !r.is_active() {
-                            s.quick_access_off.push(key.clone());
+                        if opt_in {
+                            // A drive is remembered when it is wanted. Nothing
+                            // is recorded about the ones that are not, so a
+                            // machine that sees a lot of drives does not
+                            // accumulate a list of every stick ever attached.
+                            s.quick_access_drives_on.retain(|k| *k != key);
+                            if r.is_active() {
+                                s.quick_access_drives_on.push(key.clone());
+                            }
+                        } else {
+                            s.quick_access_off.retain(|k| *k != key);
+                            if !r.is_active() {
+                                s.quick_access_off.push(key.clone());
+                            }
                         }
                         let _ = s.save();
                     }
@@ -2185,6 +2231,21 @@ fn refresh_nearby(ui: &Rc<App>) {
     // where the panel actually is instead of snapping back.
     let was = ui.nearby_clip.height();
 
+    // The header's height, taken while the list is shut and settled, which is
+    // the only moment it can be measured on its own. Everything the cap needs
+    // is worked out from it plus the rows.
+    if !ui.nearby_expander.is_expanded() && !ui.nearby_moving.get() {
+        if let Some(child) = ui.nearby_clip.child() {
+            let w = ui.nearby_clip.width();
+            let h = child
+                .measure(gtk::Orientation::Vertical, if w > 0 { w } else { -1 })
+                .1;
+            if h > 0 {
+                ui.nearby_head.set(h);
+            }
+        }
+    }
+
     for row in ui.nearby_rows.borrow_mut().drain(..) {
         ui.nearby_expander.remove(&row);
     }
@@ -2194,16 +2255,17 @@ fn refresh_nearby(ui: &Rc<App>) {
         return;
     }
 
-    let (open_dir, extra, off, hidden) = {
+    let (open_dir, extra, off, hidden, drives_on) = {
         let s = ui.settings.borrow();
         (
             s.open_start_dir(),
             s.quick_access_folders.clone(),
             s.quick_access_off.clone(),
             s.quick_access_hidden.clone(),
+            s.quick_access_drives_on.clone(),
         )
     };
-    let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden);
+    let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden, &drives_on);
     let queued: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
     let found = nearby::scan(&sources, &queued);
 
@@ -2337,18 +2399,73 @@ fn refresh_nearby(ui: &Rc<App>) {
 /// the list and emptying it now move at the same pace.
 const NEARBY_SECONDS: f64 = EXPANDER_MS as f64 / 1000.0;
 
-/// Hand the list's height back to the list.
+/// Hand the list's height back to the list, or hold it at a cap and let it
+/// scroll inside itself.
 ///
 /// A scrolled window that may scroll can be any height it likes, which is what
-/// makes the clipping possible and is also the whole problem when it is not
-/// animating: it will happily take zero, or stay at the height it had while
-/// the expander opens underneath it. `Never` makes it measure exactly as the
-/// list inside it does, so at rest it is not really a scrolled window at all -
-/// it is the list, and it grows and shrinks with its own contents.
-fn settle_nearby(clip: &gtk::ScrolledWindow) {
-    clip.set_vscrollbar_policy(gtk::PolicyType::Never);
-    clip.set_min_content_height(-1);
-    clip.set_max_content_height(-1);
+/// makes both the clipping and the cap possible, and is also the whole problem
+/// when it is doing neither: it will happily take zero, or stay at the height
+/// it had while the expander opens underneath it. `Never` makes it measure
+/// exactly as the list inside it does, so an uncapped list is not really in a
+/// scrolled window at all - it is the list, growing and shrinking with its own
+/// contents.
+fn settle_nearby(clip: &gtk::ScrolledWindow, cap: i32) {
+    if cap > 0 {
+        clip.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+        clip.set_min_content_height(cap);
+        clip.set_max_content_height(cap);
+    } else {
+        clip.set_vscrollbar_policy(gtk::PolicyType::Never);
+        clip.set_min_content_height(-1);
+        clip.set_max_content_height(-1);
+    }
+}
+
+/// Where the list should come to rest: its height, and the cap if it has one.
+///
+/// Worked out from the header plus as many rows as are allowed to show, never
+/// from the child's own natural height. That measurement is only truthful when
+/// nothing is moving, and the two moments this is wanted - a source being
+/// switched, and the expander opening - are both moments when something is.
+fn nearby_rest(ui: &Rc<App>, for_width: i32) -> (i32, i32) {
+    let rows = ui.nearby_rows.borrow();
+    let child = ui.nearby_clip.child();
+    let natural = child
+        .as_ref()
+        .map(|c| c.measure(gtk::Orientation::Vertical, for_width).1)
+        .unwrap_or(0);
+
+    if !ui.nearby_expander.is_expanded() {
+        // The remembered header rather than what is measured now: this is also
+        // reached the instant the list is shut, when the rows are still on
+        // their way out and the measurement is of the open list.
+        return (
+            if ui.nearby_head.get() > 0 {
+                ui.nearby_head.get()
+            } else {
+                natural
+            },
+            -1,
+        );
+    }
+
+    let head = if ui.nearby_head.get() > 0 {
+        ui.nearby_head.get()
+    } else {
+        return (natural, -1);
+    };
+    let limit = ui.settings.borrow().quick_access_visible as usize;
+    let shown: i32 = rows
+        .iter()
+        .take(limit)
+        .map(|r| r.measure(gtk::Orientation::Vertical, for_width).1)
+        .sum();
+    let height = head + shown;
+    if rows.len() > limit {
+        (height, height)
+    } else {
+        (height, -1)
+    }
 }
 
 /// Hold the list at one height, whatever its contents now measure.
@@ -2367,13 +2484,14 @@ fn hold_nearby(clip: &gtk::ScrolledWindow, height: i32) {
 /// from the old value to the new one and then released.
 fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let clip = ui.nearby_clip.clone();
-    let Some(child) = clip.child() else {
+    if clip.child().is_none() {
         return;
-    };
+    }
 
     let width = clip.width();
     let for_width = if width > 0 { width } else { -1 };
-    let (_, to, _, _) = child.measure(gtk::Orientation::Vertical, for_width);
+    let (to, cap) = nearby_rest(ui, for_width);
+    ui.nearby_cap.set(cap);
 
     if ui.nearby_moving.get() {
         // Already walking. Aim it somewhere else from wherever it has got to,
@@ -2386,11 +2504,11 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         return;
     }
     if from <= 0 || from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
-        settle_nearby(&clip);
+        settle_nearby(&clip, cap);
         return;
     }
     let Some(root) = clip.root() else {
-        settle_nearby(&clip);
+        settle_nearby(&clip, cap);
         return;
     };
 
@@ -2407,6 +2525,7 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let height = ui.nearby_h.clone();
     let elapsed = ui.nearby_elapsed.clone();
     let moving = ui.nearby_moving.clone();
+    let rest = ui.nearby_cap.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
@@ -2426,7 +2545,7 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         height.set(at);
 
         if t >= 1.0 {
-            settle_nearby(&clip);
+            settle_nearby(&clip, rest.get());
             moving.set(false);
             return glib::ControlFlow::Break;
         }
@@ -4547,7 +4666,10 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
 
     let nearby_row = adw::SwitchRow::builder()
         .title("Quick Access list")
-        .subtitle("Offer convertible files from your chosen folder and mounted drives, on the Convert page")
+        .subtitle(
+            "Offer convertible files from your chosen folders on the Convert page. \
+             Drives are listed there but only read once you switch them on.",
+        )
         .active(current.show_nearby_files)
         .build();
     {
@@ -4562,6 +4684,31 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     opening.add(&nearby_row);
+
+    let visible_row = adw::SpinRow::builder()
+        .title("Files shown at once")
+        .subtitle("Longer lists scroll inside the panel instead of stretching the page")
+        .adjustment(&gtk::Adjustment::new(
+            current.quick_access_visible as f64,
+            1.0,
+            40.0,
+            1.0,
+            5.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        visible_row.connect_value_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.quick_access_visible = r.value() as u32;
+                let _ = s.save();
+            }
+            refresh_nearby(&ui);
+        });
+    }
+    opening.add(&visible_row);
     page.add(&opening);
 
     let drives_group = adw::PreferencesGroup::builder()

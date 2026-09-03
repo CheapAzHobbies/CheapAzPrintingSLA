@@ -43,6 +43,10 @@ pub struct Source {
     /// how it leaves; a folder is listed because of something the user did,
     /// so it is theirs to undo.
     pub removable_entry: bool,
+    /// Whether being listed means being read. A folder is scanned unless it is
+    /// switched off; a drive is left alone until it is switched on, because
+    /// there may be any number of them attached and none of them were chosen.
+    pub opt_in: bool,
 }
 
 /// Directories are scanned one level deep only.
@@ -55,12 +59,14 @@ const MAX_TOTAL: usize = 40;
 /// The folder the file chooser starts from comes first, then folders the user
 /// added, then every mounted drive. Anything named in `off` is listed but not
 /// scanned, so turning a source back on does not mean finding it again.
-/// Anything named in `hidden` is not listed at all.
+/// Anything named in `hidden` is not listed at all. Drives are the other way
+/// round: listed, but read only if named in `drives_on`.
 pub fn sources(
     open_dir: Option<&Path>,
     extra: &[PathBuf],
     off: &[String],
     hidden: &[String],
+    drives_on: &[String],
 ) -> Vec<Source> {
     let name_of = |p: &Path| {
         p.file_name()
@@ -70,31 +76,37 @@ pub fn sources(
     let mut out: Vec<Source> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
 
-    let mut push = |path: PathBuf, label: String, key: String, removable_entry: bool| {
-        // The same folder can arrive twice: the open folder may itself sit on
-        // a mounted drive, or be listed again as an added folder. The first
-        // entry keeps its place, but a later one that may be removed hands
-        // that over - otherwise adding the folder you last opened from would
-        // quietly produce an entry with no way to take it off again.
-        if let Some(seat) = seen.iter().position(|p| *p == path) {
-            if removable_entry {
-                out[seat].removable_entry = true;
+    let mut push =
+        |path: PathBuf, label: String, key: String, removable_entry: bool, opt_in: bool| {
+            // The same folder can arrive twice: the open folder may itself sit on
+            // a mounted drive, or be listed again as an added folder. The first
+            // entry keeps its place, but a later one that may be removed hands
+            // that over - otherwise adding the folder you last opened from would
+            // quietly produce an entry with no way to take it off again.
+            if let Some(seat) = seen.iter().position(|p| *p == path) {
+                if removable_entry {
+                    out[seat].removable_entry = true;
+                }
+                return;
             }
-            return;
-        }
-        if hidden.contains(&key) {
-            return;
-        }
-        seen.push(path.clone());
-        let enabled = !off.contains(&key);
-        out.push(Source {
-            path,
-            label,
-            key,
-            enabled,
-            removable_entry,
-        });
-    };
+            if hidden.contains(&key) {
+                return;
+            }
+            seen.push(path.clone());
+            let enabled = if opt_in {
+                drives_on.contains(&key)
+            } else {
+                !off.contains(&key)
+            };
+            out.push(Source {
+                path,
+                label,
+                key,
+                enabled,
+                removable_entry,
+                opt_in,
+            });
+        };
 
     if let Some(d) = open_dir {
         push(
@@ -102,6 +114,7 @@ pub fn sources(
             name_of(d),
             d.to_string_lossy().into_owned(),
             true,
+            false,
         );
     }
     for d in extra {
@@ -110,11 +123,12 @@ pub fn sources(
             name_of(d),
             d.to_string_lossy().into_owned(),
             true,
+            false,
         );
     }
     for drive in crate::drives::mounted() {
         let key = format!("drive:{}", drive.name);
-        push(drive.path, drive.name, key, false);
+        push(drive.path, drive.name, key, false, true);
     }
     out
 }
@@ -204,6 +218,7 @@ mod tests {
                 key: self.0.to_string_lossy().into_owned(),
                 enabled,
                 removable_entry: true,
+                opt_in: false,
             }
         }
     }
@@ -224,9 +239,9 @@ mod tests {
     fn a_source_taken_off_the_list_is_not_offered_again() {
         let d = Dir::new("hidden", &["a.sl1"]);
         let key = d.0.to_string_lossy().into_owned();
-        let listed = sources(None, &[d.0.clone()], &[], &[]);
+        let listed = sources(None, &[d.0.clone()], &[], &[], &[]);
         assert!(listed.iter().any(|s| s.path == d.0));
-        let listed = sources(None, &[d.0.clone()], &[], &[key]);
+        let listed = sources(None, &[d.0.clone()], &[], &[key], &[]);
         assert!(!listed.iter().any(|s| s.path == d.0));
     }
 
@@ -235,7 +250,7 @@ mod tests {
         // It is offered automatically, but it is offered because of a file the
         // user opened, so it is still theirs to be rid of.
         let d = Dir::new("openable", &["a.sl1"]);
-        let listed = sources(Some(&d.0), &[], &[], &[]);
+        let listed = sources(Some(&d.0), &[], &[], &[], &[]);
         let entry = listed.iter().find(|s| s.path == d.0).expect("listed");
         assert!(entry.removable_entry);
     }
@@ -246,7 +261,7 @@ mod tests {
         // were the version that cannot be removed, adding a folder by hand
         // could produce an entry with no way to take it off again.
         let d = Dir::new("both", &["a.sl1"]);
-        let listed = sources(Some(&d.0), &[d.0.clone()], &[], &[]);
+        let listed = sources(Some(&d.0), &[d.0.clone()], &[], &[], &[]);
         let mine: Vec<_> = listed.iter().filter(|s| s.path == d.0).collect();
         assert_eq!(mine.len(), 1, "listed once, not twice");
         assert!(mine[0].removable_entry);
@@ -285,6 +300,7 @@ mod tests {
             key: "gone".into(),
             enabled: true,
             removable_entry: false,
+            opt_in: false,
         };
         let d = Dir::new("missing", &["a.sl1"]);
         assert_eq!(names(&scan(&[missing, d.source(true)], &[])), vec!["a.sl1"]);

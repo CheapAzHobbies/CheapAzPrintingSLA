@@ -62,6 +62,17 @@ pub struct Settings {
     /// the first time is scanned without being enabled by hand, which is the
     /// behaviour that makes the feature worth having.
     pub quick_access_off: Vec<String>,
+    /// Drives Quick Access has been told it may look in, by `drive:LABEL`.
+    ///
+    /// An on-list, unlike `quick_access_off`, and deliberately so: a drive
+    /// that has just been plugged in is listed but not read until it is
+    /// switched on by hand. Folders are few and chosen; drives are however
+    /// many happen to be attached, and reading all of them by default fills
+    /// the list with things nobody asked to see.
+    pub quick_access_drives_on: Vec<String>,
+    /// How many files the Quick Access list shows before it starts scrolling
+    /// inside itself, rather than growing the page.
+    pub quick_access_visible: u32,
     /// Sources taken off the "Look in" list altogether, by the same key.
     ///
     /// Distinct from `quick_access_off`, which is a source the user still
@@ -98,6 +109,8 @@ impl Default for Settings {
             quick_access_folders: Vec::new(),
             quick_access_off: Vec::new(),
             quick_access_hidden: Vec::new(),
+            quick_access_drives_on: Vec::new(),
+            quick_access_visible: 5,
             never_eject: Vec::new(),
         }
     }
@@ -175,6 +188,20 @@ impl Settings {
                 .map(String::from)
                 .collect();
         }
+        if let Some(v) = map.get("quick_access_drives_on") {
+            s.quick_access_drives_on = v
+                .split('\x1f')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+        }
+        if let Some(v) = map.get("quick_access_visible") {
+            // Clamped rather than trusted: a hand-edited zero would make the
+            // list a scrollbar with nothing beside it.
+            if let Ok(n) = v.parse::<u32>() {
+                s.quick_access_visible = n.clamp(1, 40);
+            }
+        }
         if let Some(v) = map.get("quick_access_hidden") {
             s.quick_access_hidden = v
                 .split('\x1f')
@@ -239,7 +266,9 @@ impl Settings {
              never_eject = {}\n\
              quick_access_folders = {}\n\
              quick_access_off = {}\n\
-             quick_access_hidden = {}\n",
+             quick_access_hidden = {}\n\
+             quick_access_drives_on = {}\n\
+             quick_access_visible = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -269,6 +298,8 @@ impl Settings {
                 .join("\x1f"),
             self.quick_access_off.join("\x1f"),
             self.quick_access_hidden.join("\x1f"),
+            self.quick_access_drives_on.join("\x1f"),
+            self.quick_access_visible,
         );
         std::fs::write(path, body)
     }
