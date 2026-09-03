@@ -142,13 +142,17 @@ fn sheet(p: &Palette) -> String {
    seam invisible: the header loses its bottom corners while the list is open,
    and the list loses its top corners and its top border, so the two read as
    one card with a single line across it. */
-/* Linear, not eased. Eased, the radius holds square for most of the two
-   hundred milliseconds and then swings round at the end, which does not read
-   as a corner rounding - it reads as the corner changing colour and then
-   moving. Acceleration belongs to the search box, which travels far enough
-   for it to mean something. */
+/* Linear, not eased. Eased, the radius held square for most of its time and
+   then swung round at the end, which does not read as a corner rounding - it
+   reads as the corner changing colour and then moving. Acceleration belongs
+   to the search box, which travels far enough for it to mean something.
+
+   Short, because it is a step in a sequence rather than the movement itself:
+   the corners square off, then the list drops; the list folds, then they
+   round. Anything longer and the second half is left waiting on the first.
+   CORNER_MS in main.rs is this number and has to stay this number. */
 .cz-qa-head, .cz-qa-head > row {{
-  transition: border-radius 200ms linear;
+  transition: border-radius 120ms linear;
 }}
 /* The header was exactly the shade of the files under it, so open, the two
    read as one undifferentiated slab and the seam between them was doing all

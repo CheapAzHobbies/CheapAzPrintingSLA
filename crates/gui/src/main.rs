@@ -24,6 +24,10 @@ const CONTROLS_MS: u32 = 200;
 /// rather than chained to it: being slightly late looks fine, being early is
 /// the clunk.
 const EXPANDER_MS: u64 = 220;
+/// How long the header's corners take to square off or round again. Must match
+/// the border-radius transition in the stylesheet, because the list waits this
+/// long before dropping so the two read as one thing after another.
+const CORNER_MS: u64 = 120;
 
 use adw::prelude::*;
 use cheapazsla_core::history::{self, History};
@@ -152,6 +156,8 @@ struct App {
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
+    /// What the field says when it is empty and wide enough to say it.
+    search_hint: Rc<RefCell<String>>,
     /// How far open the field is, where it is heading, and whether a tick
     /// callback is walking it there.
     search_t: Rc<Cell<f64>>,
@@ -550,6 +556,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_head_list: nearby.head_list,
         nearby_rows_list: nearby.rows_list,
         nearby_search: nearby.search,
+        search_hint: Rc::new(RefCell::new(String::new())),
         search_t: Rc::new(Cell::new(0.0)),
         search_open: Rc::new(Cell::new(false)),
         search_moving: Rc::new(Cell::new(false)),
@@ -1846,14 +1853,29 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             // shutting, which `animate_nearby_height` does at the end of its
             // last frame. Rounding them while rows were still on screen put a
             // curve through the middle of the list.
-            if e.is_expanded() {
-                ui2.nearby_head_list.add_css_class("cz-qa-open");
-            }
             // Glass while shut, box while open.
             show_nearby_search(&ui2, ui2.nearby_search_shown.get());
-            // The expander holds no rows any more, so its own reveal animates
-            // nothing. Opening and shutting the list is this, entirely.
-            animate_nearby_height(&ui2, ui2.nearby_clip.height());
+
+            // One thing after another, in both directions. Opening: the
+            // corners square off, and only then does the list drop out from
+            // under them. Shutting is the same sequence backwards - the list
+            // folds away first and the corners round afterwards, which
+            // `animate_nearby_height` does at the end of its last frame.
+            // Done together, the header appears to change shape while the
+            // thing it is changing shape for is still arriving.
+            if !e.is_expanded() {
+                animate_nearby_height(&ui2, ui2.nearby_clip.height());
+                return;
+            }
+            ui2.nearby_head_list.add_css_class("cz-qa-open");
+            if !ui2.settings.borrow().animations {
+                animate_nearby_height(&ui2, ui2.nearby_clip.height());
+                return;
+            }
+            let ui3 = ui2.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(CORNER_MS), move || {
+                animate_nearby_height(&ui3, ui3.nearby_clip.height());
+            });
         });
     }
 
@@ -2523,8 +2545,9 @@ fn refresh_nearby(ui: &Rc<App>) {
     // question a search box in a list of found files raises is which folders
     // it is looking through, and it may as well answer it.
     show_nearby_search(ui, true);
-    ui.nearby_search
-        .set_placeholder_text(Some(&format!("Search {}", places.join(", "))));
+    let hint = format!("Search {}", places.join(", "));
+    ui.nearby_search.set_placeholder_text(Some(&hint));
+    *ui.search_hint.borrow_mut() = hint;
 
     // One size group per column, so the four facts about a file start in the
     // same place down the list instead of each row setting its own margins.
@@ -2719,10 +2742,17 @@ fn show_nearby_search(ui: &Rc<App>, offer: bool) {
 /// spent fading the box in before it starts to widen.
 const SEARCH_SECONDS: f64 = 0.28;
 const SEARCH_FADE: f64 = 0.34;
-/// The width the box shrinks to before it fades, and grows from. Enough to
-/// hold the glass and an ellipsis - the field arrives and leaves as something
-/// recognisable rather than as a sliver of nothing.
-const SEARCH_SEED: i32 = 62;
+/// The width the box shrinks to before it fades, and grows from. Enough for
+/// the glass and an ellipsis and no more: the field leaves as something
+/// recognisable, without stopping on its way out to show the first letter of
+/// a word nobody is reading.
+const SEARCH_SEED: i32 = 38;
+/// Below this width the placeholder is taken away rather than left to
+/// ellipsize. Font metrics decide how much of a word fits in a given number of
+/// pixels, and the answer is not the same on every machine; taking the text
+/// out is the only way to be sure the field goes out as the glass and nothing
+/// else, wherever it is running.
+const SEARCH_HINT_MIN: i32 = 96;
 /// And what it grows to. A number rather than the field's own natural width,
 /// which is nothing now that it has no character width to claim one from.
 const SEARCH_WIDTH: i32 = 190;
@@ -2764,6 +2794,7 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
     let t = ui.search_t.clone();
     let want = ui.search_open.clone();
     let moving = ui.search_moving.clone();
+    let hint = ui.search_hint.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
@@ -2788,10 +2819,15 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
         } else {
             grown.powi(3)
         };
-        entry.set_size_request(
-            SEARCH_SEED + ((SEARCH_WIDTH - SEARCH_SEED) as f64 * eased).round() as i32,
-            -1,
-        );
+        let wide = SEARCH_SEED + ((SEARCH_WIDTH - SEARCH_SEED) as f64 * eased).round() as i32;
+        entry.set_size_request(wide, -1);
+        // On the way out the words go before the box does, so what is left to
+        // fade is the glass alone rather than the first letter of a word.
+        if wide < SEARCH_HINT_MIN {
+            entry.set_placeholder_text(None);
+        } else {
+            entry.set_placeholder_text(Some(hint.borrow().as_str()));
+        }
 
         if (opening && at >= 1.0) || (!opening && at <= 0.0) {
             if opening {
