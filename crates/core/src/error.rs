@@ -32,19 +32,18 @@ pub enum Error {
 }
 
 impl Error {
-    /// One line saying what went wrong, in the words someone would use to
-    /// describe it to a colleague.
+    /// What went wrong, named rather than described.
     ///
     /// `Display` gives the particulars - byte offsets, expected lengths - and
     /// those belong in the panel someone opens on purpose. This is for the
-    /// glance: it says which of the handful of things that can go wrong did,
-    /// and nothing else.
+    /// glance, so it is a label and not a sentence: two words read at a
+    /// glance where a sentence has to be read.
     pub fn headline(&self) -> &'static str {
         match self {
-            Error::Io { .. } => "This file could not be read from disk",
+            Error::Io { .. } => "Unreadable file",
             Error::UnknownFormat => "Unsupported format",
-            Error::UnsupportedConversion { .. } => "This pair of formats cannot be converted",
-            Error::LayerOutOfRange { .. } => "That layer is not in this file",
+            Error::UnsupportedConversion { .. } => "Unsupported conversion",
+            Error::LayerOutOfRange { .. } => "Layer out of range",
             Error::Format(f) => f.headline(),
         }
     }
@@ -97,21 +96,21 @@ pub enum FormatError {
 }
 
 impl FormatError {
-    /// The same glance-level line, for a problem inside the file rather than
+    /// The same glance-level label, for a problem inside the file rather than
     /// with the file. Every one of these means the same thing to the person
-    /// holding it - the file is not going to open - so they say what is wrong
+    /// holding it - the file is not going to open - so they name what is wrong
     /// with it without asking anyone to care about offsets.
     pub fn headline(&self) -> &'static str {
         match self {
-            FormatError::Truncated { .. } => "This file is incomplete",
-            FormatError::BadMagic => "This file is not the format it claims to be",
-            FormatError::UnsupportedVersion { .. } => "This file is a version not yet supported",
+            FormatError::Truncated { .. } => "Incomplete file",
+            FormatError::BadMagic => "Wrong format for this extension",
+            FormatError::UnsupportedVersion { .. } => "Unsupported version",
             FormatError::MissingField(_)
             | FormatError::InvalidValue { .. }
             | FormatError::OffsetOutOfBounds { .. }
             | FormatError::AllocationTooLarge { .. }
             | FormatError::LayerDecode(_)
-            | FormatError::Other(_) => "This file is damaged and cannot be read",
+            | FormatError::Other(_) => "Corrupted file",
         }
     }
 }
