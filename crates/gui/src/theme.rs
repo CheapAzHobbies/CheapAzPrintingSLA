@@ -271,6 +271,16 @@ fn sheet(p: &Palette) -> String {
 }}
 .cz-armed:hover {{ background-color: alpha(@cz_accent, 0.28); }}
 
+/* ---- WatchDog's milestones ---- */
+.cz-steps {{ margin-top: {space_3}px; }}
+.cz-step-link {{ min-height: 4px; }}
+/* Waiting is dim but present: not this step's turn is not the same as
+   something being wrong with it. */
+.cz-step-waiting {{ color: @cz_dim; opacity: 0.55; }}
+.cz-step-working {{ color: @cz_accent; }}
+.cz-step-done {{ color: @cz_text; }}
+.cz-step-missing {{ color: {error}; }}
+
 /* ---- queue ---- */
 .cz-queue > row {{
   border-bottom: 1px solid @cz_border;

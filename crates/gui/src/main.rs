@@ -14,6 +14,7 @@ mod palette;
 mod penguin;
 mod render;
 mod shell;
+mod steps;
 mod theme;
 mod viewer;
 
@@ -167,6 +168,12 @@ struct App {
     /// converts. Separate from the one the manual queue uses, which lives
     /// beside the Convert button and means something else.
     watchdog_penguin: Rc<penguin::Penguin>,
+    /// The milestone chain, and what it is currently saying.
+    watchdog_steps: Rc<steps::Steps>,
+    /// The file being converted right now, for the chain's third stop.
+    watchdog_doing: RefCell<Option<String>>,
+    /// Kept so the pulsing timer can be told to stop.
+    watchdog_pulsing: Rc<Cell<bool>>,
     /// The list of readable formats under the drop zone. First thing out when
     /// the window is squeezed: it is a reference, not an instruction, and the
     /// instruction above it still stands without it.
@@ -535,6 +542,18 @@ fn build(app: &adw::Application) -> Rc<App> {
     let watchdog_penguin = penguin::Penguin::new(56);
     watchdog_penguin.widget.set_margin_top(theme::SPACE_2);
     dropzone.append(&watchdog_penguin.widget);
+
+    // The chain: where a file comes from, what happens to it, and where it
+    // ends up. Shown in the drop zone because that is the empty middle of the
+    // page and the place someone looks to find out what is going on.
+    let watchdog_steps = steps::Steps::new(&[
+        ("folder-saved-search-symbolic", "Folder"),
+        ("text-x-generic-symbolic", "New file"),
+        ("media-playlist-repeat-symbolic", "Convert"),
+        ("drive-removable-media-symbolic", "Drive"),
+    ]);
+    watchdog_steps.widget.set_visible(false);
+    dropzone.append(&watchdog_steps.widget);
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
@@ -762,6 +781,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone_title,
         dropzone_sub,
         watchdog_penguin,
+        watchdog_steps,
+        watchdog_doing: RefCell::new(None),
+        watchdog_pulsing: Rc::new(Cell::new(false)),
         dropzone_formats,
         nearby_panel: nearby_panel.clone(),
         nearby_expander: nearby.expander,
@@ -2421,13 +2443,13 @@ fn refresh_dropzone_text(ui: &Rc<App>) {
     };
 
     // Moving while it waits. Something frozen reads as something broken, and
-    // the question this answers is whether the thing is alive - so it dances,
-    // slowly, and saves the full pace for when it is actually converting.
+    // the question this answers is whether the thing is alive.
     if armed && !needs_folder {
         ui.watchdog_penguin.idle(moving);
     } else {
         ui.watchdog_penguin.stop();
     }
+    refresh_watchdog_steps(ui);
 
     if needs_folder {
         ui.dropzone_title.set_text("Choose a folder to watch");
@@ -2874,6 +2896,113 @@ fn choose_scan_folder(ui: &Rc<App>) {
             }
         },
     );
+}
+
+/// Put the milestone chain in step with what is actually true.
+///
+/// Four stops, each answering one question a person would ask in order: is it
+/// watching somewhere, has anything turned up, is it converting, and can it
+/// deliver. A stop that cannot be satisfied is crossed out where it stands, so
+/// the answer to "why has nothing happened" is a place on a line rather than a
+/// sentence to be decoded.
+fn refresh_watchdog_steps(ui: &Rc<App>) {
+    use steps::State;
+
+    let (armed, dir, target, label) = {
+        let s = ui.settings.borrow();
+        (
+            s.auto_convert,
+            s.auto_watch_dir.clone(),
+            s.auto_target_uuid.clone(),
+            s.auto_target_label.clone(),
+        )
+    };
+    ui.watchdog_steps.widget.set_visible(armed);
+    if !armed {
+        ui.watchdog_pulsing.set(false);
+        return;
+    }
+    let chain = &ui.watchdog_steps;
+
+    // 1: the folder. Set but gone is a different thing from never set, and
+    // the second is the one worth crossing out.
+    let watching = dir.as_deref().filter(|d| d.is_dir());
+    match (&dir, &watching) {
+        (None, _) => {
+            chain.set_state(0, State::Waiting);
+            chain.set_note(0, Some("none chosen"));
+        }
+        (Some(_), None) => {
+            chain.set_state(0, State::Missing);
+            chain.set_note(0, Some("folder is gone"));
+        }
+        (Some(d), Some(_)) => {
+            chain.set_state(0, State::Done);
+            chain.set_note(
+                0,
+                d.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .as_deref(),
+            );
+        }
+    }
+
+    // 2: something to do. Settling counts as arriving; there is no useful
+    // difference to a reader between "seen" and "still being written".
+    let waiting_on = ui.auto_settling.borrow().len() + ui.auto_queue.borrow().len();
+    let doing = ui.watchdog_doing.borrow().clone();
+    if waiting_on > 0 || doing.is_some() {
+        chain.set_state(1, State::Done);
+        chain.set_note(1, doing.as_deref());
+    } else {
+        chain.set_state(1, State::Waiting);
+        chain.set_note(1, Some("waiting"));
+    }
+
+    // 3: the conversion.
+    match &doing {
+        Some(_) => {
+            chain.set_state(2, State::Working);
+            chain.set_note(2, None);
+        }
+        None => {
+            chain.set_state(2, State::Waiting);
+            chain.set_note(2, None);
+            chain.set_link(2, Some(0.0));
+        }
+    }
+
+    // 4: somewhere to put it. A drive that is chosen and absent is the
+    // commonest reason nothing arrives, and the one worth a cross.
+    let here = target.as_deref().and_then(drives::by_uuid);
+    match (&target, &here) {
+        (None, _) => {
+            chain.set_state(3, State::Waiting);
+            chain.set_note(3, Some("none chosen"));
+        }
+        (Some(_), None) => {
+            chain.set_state(3, State::Missing);
+            chain.set_note(3, label.as_deref().or(Some("not plugged in")));
+        }
+        (Some(_), Some(d)) => {
+            chain.set_state(3, State::Done);
+            chain.set_note(3, Some(&d.name));
+        }
+    }
+
+    // Full where the path is complete, empty where it is not - so the line
+    // itself reads as a route rather than as decoration.
+    chain.set_link(1, Some(if watching.is_some() { 1.0 } else { 0.0 }));
+    chain.set_link(3, Some(if here.is_some() { 1.0 } else { 0.0 }));
+
+    // Pulse only the link that something is actually crossing.
+    let flowing = doing.is_some();
+    if flowing && !ui.watchdog_pulsing.replace(true) {
+        steps::pulse_while(chain, vec![2], ui.watchdog_pulsing.clone());
+    }
+    if !flowing {
+        ui.watchdog_pulsing.set(false);
+    }
 }
 
 /// A name short enough to sit on a button without pushing the row apart.
@@ -3401,17 +3530,38 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Layer counts as they happen, so the chain can show how far in it is
+    // rather than only that something is going on.
+    let (ptx, prx) = async_channel::unbounded::<(u32, u32)>();
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(convert::run(&plan).map_err(|e| e.to_string()));
+        let result = convert::run_with_progress(&plan, move |done, total| {
+            let _ = ptx.send_blocking((done, total));
+        })
+        .map_err(|e| e.to_string());
+        let _ = tx.send_blocking(result);
     });
+    *ui.watchdog_doing.borrow_mut() = Some(name.clone());
+    refresh_watchdog_steps(ui);
     ui.watchdog_penguin.stop();
     ui.watchdog_penguin.start();
+    {
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            while let Ok((done, total)) = prx.recv().await {
+                if total > 0 {
+                    ui.watchdog_steps
+                        .set_link(2, Some(done as f64 / total as f64));
+                }
+            }
+        });
+    }
     let ui = ui.clone();
     let landed = drive.is_some();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.auto_busy.set(false);
+        *ui.watchdog_doing.borrow_mut() = None;
         refresh_dropzone_text(&ui);
         let ui2 = ui.clone();
         glib::idle_add_local_once(move || auto_pump(&ui2));
