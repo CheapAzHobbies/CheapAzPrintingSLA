@@ -1,10 +1,15 @@
-//! Searchable format selector (§8, §9, §11).
+//! Format selector (§8, §9, §11).
 //!
-//! A popover attached to its button, carrying a search field, a recently used
-//! section and the full list. Recents come first because in practice a user
-//! converts to the same one or two formats for months at a time, and making
-//! them scroll past twenty they will never touch is the kind of small friction
-//! that adds up.
+//! A popover attached to its button, listing every format that can be written,
+//! in alphabetical order.
+//!
+//! It had a search field and a recently-used section, both of which are
+//! machinery for a list too long to read. This one is not: there are a handful
+//! of printer formats and there will not be twenty, so the whole list fits on
+//! screen at once. A search box over five rows is a control that costs more
+//! attention than it saves, and a recents section on top of five rows shows
+//! some of them twice. Someone who wants a shorter list still can have one -
+//! Settings turns off the formats they never write.
 //!
 //! Formats come from the registry, never a list kept here (§10), so a new
 //! handler appears with no change to this file.
@@ -33,14 +38,14 @@ type ChangeHandler = Box<dyn Fn(&'static str)>;
 pub struct FormatPicker {
     pub button: gtk::MenuButton,
     popover: gtk::Popover,
-    search: gtk::SearchEntry,
     list: gtk::ListBox,
     label: gtk::Label,
     direction: Direction,
     /// Format ids in the order they are shown, parallel to the list rows.
     shown: RefCell<Vec<&'static str>>,
     selected: RefCell<Option<&'static str>>,
-    recents: RefCell<Vec<String>>,
+    /// Format ids the user has turned off, which are not offered at all.
+    hidden: RefCell<Vec<String>>,
     on_change: RefCell<Option<ChangeHandler>>,
 }
 
@@ -64,14 +69,6 @@ impl FormatPicker {
             Direction::Write => "Output format",
         }));
 
-        let search = gtk::SearchEntry::builder()
-            .placeholder_text("Search formats…")
-            .build();
-        search.set_margin_top(theme::SPACE_2);
-        search.set_margin_bottom(theme::SPACE_2);
-        search.set_margin_start(theme::SPACE_2);
-        search.set_margin_end(theme::SPACE_2);
-
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::None);
         list.add_css_class("navigation-sidebar");
@@ -84,8 +81,6 @@ impl FormatPicker {
             .build();
 
         let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        inner.append(&search);
-        inner.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         inner.append(&scroller);
 
         let popover = gtk::Popover::builder()
@@ -98,28 +93,18 @@ impl FormatPicker {
         let me = Rc::new(Self {
             button,
             popover: popover.clone(),
-            search: search.clone(),
             list: list.clone(),
             label,
             direction,
             shown: RefCell::new(Vec::new()),
             selected: RefCell::new(None),
-            recents: RefCell::new(Vec::new()),
+            hidden: RefCell::new(Vec::new()),
             on_change: RefCell::new(None),
         });
 
         {
             let me2 = me.clone();
-            search.connect_search_changed(move |e| me2.rebuild(&e.text()));
-        }
-        {
-            // Opening focuses the search field, so typing filters immediately.
-            let me2 = me.clone();
-            popover.connect_show(move |_| {
-                me2.search.set_text("");
-                me2.rebuild("");
-                me2.search.grab_focus();
-            });
+            popover.connect_show(move |_| me2.rebuild());
         }
         {
             // Escape closes, as §8 asks. The popover already closes on an
@@ -138,8 +123,9 @@ impl FormatPicker {
         me
     }
 
-    pub fn set_recents(self: &Rc<Self>, recents: Vec<String>) {
-        *self.recents.borrow_mut() = recents;
+    /// Formats to leave out entirely, by id.
+    pub fn set_hidden(self: &Rc<Self>, hidden: Vec<String>) {
+        *self.hidden.borrow_mut() = hidden;
     }
 
     pub fn selected(&self) -> Option<&'static str> {
@@ -161,89 +147,54 @@ impl FormatPicker {
         *self.on_change.borrow_mut() = Some(Box::new(f));
     }
 
+    /// Every format this picker could offer, in the order it will offer them.
+    ///
+    /// Alphabetical, because registry order is a fact about which handler was
+    /// written first and nothing the reader can predict.
     fn candidates(&self) -> Vec<&'static FormatInfo> {
-        match self.direction {
+        let hidden = self.hidden.borrow();
+        let mut all: Vec<&'static FormatInfo> = match self.direction {
             Direction::Write => registry::writable(),
         }
+        .into_iter()
+        .filter(|i| !hidden.iter().any(|h| h == i.id))
+        .collect();
+        all.sort_by_key(|i| i.name.to_lowercase());
+        all
     }
 
-    /// Rebuild the list for the current filter.
-    fn rebuild(self: &Rc<Self>, filter: &str) {
+    /// Rebuild the list.
+    fn rebuild(self: &Rc<Self>) {
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
         self.shown.borrow_mut().clear();
 
-        let needle = filter.trim().to_lowercase();
-        let matches = |i: &FormatInfo| {
-            needle.is_empty()
-                || i.name.to_lowercase().contains(&needle)
-                || i.extension.contains(&needle)
-                || i.id.contains(&needle)
-        };
-
-        let all: Vec<&'static FormatInfo> = self
-            .candidates()
-            .into_iter()
-            .filter(|i| matches(i))
-            .collect();
-
-        // Recently used first, but only when not searching: while typing the
-        // user is looking for a specific thing and grouping just gets in the way.
-        if needle.is_empty() {
-            let recents = self.recents.borrow().clone();
-            let recent: Vec<&'static FormatInfo> = recents
-                .iter()
-                .filter_map(|id| registry::by_id(id).map(|h| h.info()))
-                .filter(|i| all.iter().any(|a| a.id == i.id))
-                .collect();
-            if !recent.is_empty() {
-                self.add_heading("Recently used");
-                for info in &recent {
-                    self.add_row(info);
-                }
-                if recent.len() < all.len() {
-                    self.add_heading("All formats");
-                }
-            }
-            for info in &all {
-                if recent.iter().any(|r| r.id == info.id) {
-                    continue;
-                }
-                self.add_row(info);
-            }
-        } else {
-            for info in &all {
-                self.add_row(info);
-            }
-            if all.is_empty() {
-                let empty = gtk::Label::builder()
-                    .label("No formats match")
-                    .margin_top(theme::SPACE_4)
-                    .margin_bottom(theme::SPACE_4)
-                    .build();
-                empty.add_css_class("cz-dim");
-                let row = gtk::ListBoxRow::builder()
-                    .child(&empty)
-                    .selectable(false)
-                    .activatable(false)
-                    .build();
-                self.list.append(&row);
-            }
+        let all = self.candidates();
+        if all.is_empty() {
+            // Only reachable by turning every one of them off in Settings,
+            // which is a thing someone can do and then wonder about.
+            let empty = gtk::Label::builder()
+                .label("Every output format is switched off in Settings")
+                .wrap(true)
+                .max_width_chars(28)
+                .margin_top(theme::SPACE_4)
+                .margin_bottom(theme::SPACE_4)
+                .margin_start(theme::SPACE_3)
+                .margin_end(theme::SPACE_3)
+                .build();
+            empty.add_css_class("cz-dim");
+            let row = gtk::ListBoxRow::builder()
+                .child(&empty)
+                .selectable(false)
+                .activatable(false)
+                .build();
+            self.list.append(&row);
+            return;
         }
-    }
-
-    fn add_heading(&self, text: &str) {
-        let l = crate::shell::section_label(text);
-        l.set_margin_top(theme::SPACE_2);
-        l.set_margin_bottom(theme::SPACE_1);
-        l.set_margin_start(theme::SPACE_3);
-        let row = gtk::ListBoxRow::builder()
-            .child(&l)
-            .selectable(false)
-            .activatable(false)
-            .build();
-        self.list.append(&row);
+        for info in &all {
+            self.add_row(info);
+        }
     }
 
     fn add_row(self: &Rc<Self>, info: &'static FormatInfo) {

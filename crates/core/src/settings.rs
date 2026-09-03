@@ -52,6 +52,17 @@ pub struct Settings {
     /// Offer readable files found in the open folder and on mounted drives,
     /// so a file can be picked without opening a file dialog for it.
     pub show_nearby_files: bool,
+    /// How many recently used folders the Save to menu offers.
+    ///
+    /// One by default. The menu's job is the handful of places output goes,
+    /// and a list of five recents pushes the two standing choices - a drive,
+    /// or beside the original - down past them.
+    pub recent_output_shown: u32,
+    /// Formats never offered when reading, by id. For someone who owns one
+    /// printer and does not want a list of five.
+    pub hidden_input_formats: Vec<String>,
+    /// And the same when writing.
+    pub hidden_output_formats: Vec<String>,
     /// Save to whichever removable drive is attached, rather than to a fixed
     /// folder. Remembered, because it is a standing instruction rather than a
     /// place: choosing it once and finding it forgotten next launch makes it
@@ -120,6 +131,9 @@ impl Default for Settings {
             auto_lock_new_drives: false,
             show_nearby_files: true,
             follow_drive: false,
+            recent_output_shown: 1,
+            hidden_input_formats: Vec::new(),
+            hidden_output_formats: Vec::new(),
             quick_access_folders: Vec::new(),
             quick_access_off: Vec::new(),
             quick_access_hidden: Vec::new(),
@@ -188,6 +202,25 @@ impl Settings {
         }
         if let Some(v) = map.get("show_nearby_files") {
             s.show_nearby_files = v == "true";
+        }
+        if let Some(v) = map.get("recent_output_shown") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.recent_output_shown = n.min(MAX_RECENT as u32);
+            }
+        }
+        for (key, into) in [("hidden_input_formats", 0), ("hidden_output_formats", 1)] {
+            if let Some(v) = map.get(key) {
+                let list: Vec<String> = v
+                    .split('\x1f')
+                    .filter(|p| !p.is_empty())
+                    .map(String::from)
+                    .collect();
+                if into == 0 {
+                    s.hidden_input_formats = list;
+                } else {
+                    s.hidden_output_formats = list;
+                }
+            }
         }
         if let Some(v) = map.get("follow_drive") {
             s.follow_drive = v == "true";
@@ -291,7 +324,10 @@ impl Settings {
              quick_access_drives_on = {}\n\
              quick_access_visible = {}\n\
              quick_access_columns = {}\n\
-             follow_drive = {}\n",
+             follow_drive = {}\n\
+             recent_output_shown = {}\n\
+             hidden_input_formats = {}\n\
+             hidden_output_formats = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -325,6 +361,9 @@ impl Settings {
             self.quick_access_visible,
             self.quick_access_columns,
             self.follow_drive,
+            self.recent_output_shown,
+            self.hidden_input_formats.join("\x1f"),
+            self.hidden_output_formats.join("\x1f"),
         );
         std::fs::write(path, body)
     }
@@ -370,6 +409,7 @@ impl Settings {
         self.recent_output_dirs
             .iter()
             .filter(|p| p.is_dir())
+            .take(self.recent_output_shown as usize)
             .cloned()
             .collect()
     }

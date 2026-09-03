@@ -42,7 +42,7 @@ impl Error {
     pub fn headline(&self) -> &'static str {
         match self {
             Error::Io { .. } => "This file could not be read from disk",
-            Error::UnknownFormat => "This is not a print file CheapAzSLA knows",
+            Error::UnknownFormat => "Unsupported format",
             Error::UnsupportedConversion { .. } => "This pair of formats cannot be converted",
             Error::LayerOutOfRange { .. } => "That layer is not in this file",
             Error::Format(f) => f.headline(),

@@ -393,8 +393,27 @@ fn build(app: &adw::Application) -> Rc<App> {
     add_label.set_margin_top(theme::SPACE_3);
     add_label.set_margin_bottom(theme::SPACE_3);
     add_more.set_child(Some(&add_label));
+
+    // Emptying the queue, at the other end of the same strip. Taking files out
+    // one X at a time is fine for the three you meant to add and unusable for
+    // the hundred you did not, and the row under the queue is where anyone
+    // looking to change what is in it will already be looking.
+    let clear_all = gtk::Button::builder().build();
+    clear_all.add_css_class("flat");
+    clear_all.set_widget_name("queue-clear");
+    let clear_label = labelled_icon("user-trash-symbolic", "Clear Files");
+    clear_label.set_halign(gtk::Align::End);
+    clear_label.set_margin_top(theme::SPACE_3);
+    clear_label.set_margin_bottom(theme::SPACE_3);
+    clear_all.set_child(Some(&clear_label));
+    clear_all.set_tooltip_text(Some("Take every file out of the list"));
+
+    let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    add_row.append(&add_more);
+    add_row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    add_row.append(&clear_all);
     queue_panel.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    queue_panel.append(&add_more);
+    queue_panel.append(&add_row);
 
     // Detected, but overridable (§21). Detection reads the contents rather
     // than the name, which is right almost always and wrong occasionally: a
@@ -1783,6 +1802,10 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         let ui = ui.clone();
         add_more.connect_clicked(move |_| choose_files(&ui));
     }
+    if let Some(clear) = find_named(&ui.page_faces, "queue-clear") {
+        let ui = ui.clone();
+        clear.connect_clicked(move |_| clear_files(&ui));
+    }
 
     // Drag and drop, with the accent feedback §13 asks for.
     let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
@@ -2425,35 +2448,6 @@ fn fill_sources_menu(ui: &Rc<App>, content: &gtk::Box) {
             });
         }
         content.append(&add);
-
-        // The way back. A folder can be added again through the picker, but a
-        // drive cannot - it is only ever offered because it is attached - so
-        // without this, removing one would be permanent and silent.
-        let removed = hidden.len();
-        if removed > 0 {
-            let back = gtk::Button::builder().build();
-            back.set_child(Some(&labelled_icon(
-                "edit-undo-symbolic",
-                &if removed == 1 {
-                    "Show 1 removed place".to_string()
-                } else {
-                    format!("Show {removed} removed places")
-                },
-            )));
-            back.add_css_class("flat");
-            let ui = ui.clone();
-            let body = content.clone();
-            back.connect_clicked(move |_| {
-                {
-                    let mut s = ui.settings.borrow_mut();
-                    s.quick_access_hidden.clear();
-                    let _ = s.save();
-                }
-                refresh_nearby(&ui);
-                fill_sources_menu(&ui, &body);
-            });
-            content.append(&back);
-        }
     }
 }
 
@@ -3306,8 +3300,9 @@ type ReadFailure = (String, Vec<Suggestion>);
 ///
 /// "GOO (Detect Automatically)" answers both questions at once, where a bare
 /// "GOO" left the menu's tick on "Detect Automatically" looking like it
-/// disagreed with the field. Narrow, the suffix goes rather than being cut
-/// off in the middle of itself.
+/// disagreed with the field. It stays at every width: the label is ellipsized
+/// and asks for three characters, so the suffix costs nothing it can be
+/// squeezed out of, and there is room for it even at the narrowest.
 ///
 /// The same words as the destination's, deliberately. Two names for one idea
 /// reads as two ideas.
@@ -3316,7 +3311,7 @@ fn refresh_input_label(ui: &Rc<App>) {
     let text = match files.get(*ui.selected.borrow()) {
         Some(f) if !f.format.is_empty() => {
             let name = f.format.to_uppercase();
-            if f.forced_format.is_some() || ui.compact.get() {
+            if f.forced_format.is_some() {
                 name
             } else {
                 format!("{name} (Detect Automatically)")
@@ -3326,9 +3321,7 @@ fn refresh_input_label(ui: &Rc<App>) {
         // setting, and "—" alone said nothing about what that setting was -
         // the row looked the same whether the format was being worked out or
         // had been chosen by hand.
-        Some(f) if f.forced_format.is_none() && !ui.compact.get() => {
-            "Detect Automatically".to_string()
-        }
+        Some(f) if f.forced_format.is_none() => "Detect Automatically".to_string(),
         _ => "—".to_string(),
     };
     ui.input_label.set_text(&text);
@@ -3370,40 +3363,71 @@ fn marquee(text: &str) -> gtk::ScrolledWindow {
         .child(&train)
         .build();
     view.set_overflow(gtk::Overflow::Hidden);
+    view
+}
+
+/// Slide the name in `view` while the pointer is anywhere in `over`, except
+/// while it is on `unless`.
+///
+/// The trigger is the whole row rather than the name itself, because the name
+/// is the part of the row that is too small to aim at - which is the same
+/// reason it needed sliding. The exception is the status: hovering there is
+/// for reading why a file failed, and its tooltip should not have to compete
+/// with something moving underneath it.
+fn marquee_hover(
+    view: &gtk::ScrolledWindow,
+    over: &impl IsA<gtk::Widget>,
+    unless: Option<gtk::Widget>,
+) {
+    let Some(train) = view.child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    let Some(first) = train.first_child().and_downcast::<gtk::Label>() else {
+        return;
+    };
+    let Some(second) = train.last_child().and_downcast::<gtk::Label>() else {
+        return;
+    };
 
     let running = Rc::new(Cell::new(false));
-    let hover = gtk::EventControllerMotion::new();
-    {
-        let view2 = view.clone();
+    let stop = {
+        let view = view.clone();
         let first = first.clone();
         let second = second.clone();
         let running = running.clone();
-        hover.connect_enter(move |_, _, _| {
+        move || {
+            running.set(false);
+            first.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            second.set_visible(false);
+            view.hadjustment().set_value(0.0);
+        }
+    };
+    let start = {
+        let view = view.clone();
+        let first = first.clone();
+        let second = second.clone();
+        let running = running.clone();
+        move || {
             // Nothing to slide if the whole name is already on screen.
             let wanted = first.measure(gtk::Orientation::Horizontal, -1).1;
-            if wanted <= view2.width() || running.replace(true) {
+            if wanted <= view.width() || running.replace(true) {
                 return;
             }
             first.set_ellipsize(gtk::pango::EllipsizeMode::None);
             second.set_visible(true);
 
-            let adj = view2.hadjustment();
+            let adj = view.hadjustment();
             let lead = first.clone();
             let running = running.clone();
-            let stop = {
-                let view3 = view2.clone();
-                let first = first.clone();
-                let second = second.clone();
-                move || {
+            let first = first.clone();
+            let second = second.clone();
+            let view2 = view.clone();
+            let last = Cell::new(None::<i64>);
+            view.add_tick_callback(move |w, clock| {
+                if !running.get() {
                     first.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
                     second.set_visible(false);
-                    view3.hadjustment().set_value(0.0);
-                }
-            };
-            let last = Cell::new(None::<i64>);
-            view2.add_tick_callback(move |w, clock| {
-                if !running.get() {
-                    stop();
+                    view2.hadjustment().set_value(0.0);
                     return glib::ControlFlow::Break;
                 }
                 let now = clock.frame_time();
@@ -3421,14 +3445,29 @@ fn marquee(text: &str) -> gtk::ScrolledWindow {
                 adj.set_value(if next >= lap { next - lap } else { next });
                 glib::ControlFlow::Continue
             });
+        }
+    };
+
+    let hover = gtk::EventControllerMotion::new();
+    {
+        let over = over.as_ref().clone();
+        let start = start.clone();
+        let stop = stop.clone();
+        hover.connect_motion(move |_, x, y| {
+            let blocked = unless.as_ref().is_some_and(|w| {
+                w.compute_bounds(&over).is_some_and(|b| {
+                    b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32))
+                })
+            });
+            if blocked {
+                stop();
+            } else {
+                start();
+            }
         });
     }
-    {
-        let running = running.clone();
-        hover.connect_leave(move |_| running.set(false));
-    }
-    view.add_controller(hover);
-    view
+    hover.connect_leave(move |_| stop());
+    over.as_ref().add_controller(hover);
 }
 
 /// The list of formats the selected file can be read as (§21).
@@ -3466,7 +3505,17 @@ fn build_input_menu(ui: &Rc<App>) {
             None => "Read the contents and work it out".into(),
         },
     )];
-    for info in registry::readable() {
+    // Alphabetical. Registry order is whatever order the handlers happen to be
+    // declared in, which is a fact about the source and not about the list -
+    // and a list nobody can predict the order of has to be read end to end
+    // every time.
+    let hidden = ui.settings.borrow().hidden_input_formats.clone();
+    let mut readable: Vec<_> = registry::readable()
+        .into_iter()
+        .filter(|i| !hidden.iter().any(|h| h == i.id))
+        .collect();
+    readable.sort_by_key(|i| i.name.to_lowercase());
+    for info in readable {
         entries.push((
             Some(info.id.to_string()),
             info.name.to_string(),
@@ -3593,7 +3642,8 @@ fn refresh_queue(ui: &Rc<App>) {
 
         row.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
 
-        row.append(&marquee(&f.name()));
+        let name = marquee(&f.name());
+        row.append(&name);
 
         // Source and target on every row. The output format applies to the
         // whole queue, so without this a file's fate is only visible while it
@@ -3651,7 +3701,9 @@ fn refresh_queue(ui: &Rc<App>) {
             _ => None,
         };
         let width = if ui.compact.get() { 0 } else { 104 };
-        match detail {
+        // Held so the marquee knows to leave the pointer alone here: hovering
+        // the status is for reading why a file failed.
+        let status_widget: Option<gtk::Widget> = match detail {
             Some(detail) => {
                 let failed = matches!(f.status, Status::Failed(_));
                 let press = gtk::Button::builder().child(&chip).build();
@@ -3683,12 +3735,14 @@ fn refresh_queue(ui: &Rc<App>) {
                     show_details(&win, heading, &name, &detail, &suggestions);
                 });
                 row.append(&press);
+                Some(press.clone().upcast())
             }
             None => {
                 chip.set_width_request(width);
                 row.append(&chip);
+                None
             }
-        }
+        };
 
         let remove = shell::icon_button("window-close-symbolic", "Remove from list");
         let ui2 = ui.clone();
@@ -3696,6 +3750,7 @@ fn refresh_queue(ui: &Rc<App>) {
         remove.connect_clicked(move |_| remove_file(&ui2, &path));
         row.append(&remove);
 
+        marquee_hover(&name, &row, status_widget);
         let list_row = gtk::ListBoxRow::builder().child(&row).build();
         ui.queue_list.append(&list_row);
         if i == selected {
@@ -3786,19 +3841,44 @@ fn show_details(
     d.present();
 }
 
+/// Take every file out of the list.
+///
+/// The files are untouched on disk - this is a list, not a folder - so it asks
+/// nothing before doing it. What it does say is how many went, because a
+/// button that empties a hundred rows without a word is indistinguishable from
+/// one that has gone wrong.
+fn clear_files(ui: &Rc<App>) {
+    let count = ui.files.borrow().len();
+    if count == 0 {
+        return;
+    }
+    ui.files.borrow_mut().clear();
+    queue_emptied(ui);
+    refresh_nearby(ui);
+    ui.toasts.add_toast(adw::Toast::new(&match count {
+        1 => "1 file taken off the list".to_string(),
+        n => format!("{n} files taken off the list"),
+    }));
+}
+
+/// Put the page back to its empty state.
+fn queue_emptied(ui: &Rc<App>) {
+    stop_play(ui);
+    *ui.selected.borrow_mut() = 0;
+    swap_page(ui, false);
+    ui.preview_stack.set_visible_child_name("empty");
+    // Drop the texture as well, so the last layer of a removed file is not
+    // still sitting in memory waiting to reappear.
+    ui.viewer.clear();
+    ui.viewer.fit();
+    refresh_queue(ui);
+}
+
 fn remove_file(ui: &Rc<App>, path: &Path) {
     ui.files.borrow_mut().retain(|f| f.path != path);
     let len = ui.files.borrow().len();
     if len == 0 {
-        stop_play(ui);
-        *ui.selected.borrow_mut() = 0;
-        swap_page(ui, false);
-        ui.preview_stack.set_visible_child_name("empty");
-        // Drop the texture as well, so the last layer of a removed file is
-        // not still sitting in memory waiting to reappear.
-        ui.viewer.clear();
-        ui.viewer.fit();
-        refresh_queue(ui);
+        queue_emptied(ui);
         return;
     }
     let sel = (*ui.selected.borrow()).min(len - 1);
@@ -4487,24 +4567,13 @@ fn build_destination_menu(ui: &Rc<App>) {
                 actions.borrow_mut().push(what);
             };
 
-            add(
-                "folder-symbolic",
-                "Beside the original".into(),
-                Some("Same folder as each source file".into()),
-                Destination::BesideOriginal,
-            );
-
-            for dir in ui2.settings.borrow().available_recent_dirs() {
-                add(
-                    "document-open-recent-symbolic",
-                    dir.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| dir.display().to_string()),
-                    Some(dir.display().to_string()),
-                    Destination::Folder(dir.clone()),
-                );
-            }
-
+            // Ordered by how often each is the answer, not by kind. Following
+            // the drive is the standing instruction someone sets once; beside
+            // the original is the other standing answer; recents are for
+            // coming back to a particular job, and there is normally one worth
+            // coming back to. Everything else is a decision, and decisions go
+            // at the bottom.
+            //
             // Offered whether or not a drive is attached: choosing it is a
             // statement about where output should go from now on, which is
             // useful to make before plugging the drive in.
@@ -4523,6 +4592,24 @@ fn build_destination_menu(ui: &Rc<App>) {
                 }),
                 Destination::AutoDrive,
             );
+
+            add(
+                "folder-symbolic",
+                "Beside the original".into(),
+                Some("Same folder as each source file".into()),
+                Destination::BesideOriginal,
+            );
+
+            for dir in ui2.settings.borrow().available_recent_dirs() {
+                add(
+                    "document-open-recent-symbolic",
+                    dir.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dir.display().to_string()),
+                    Some(dir.display().to_string()),
+                    Destination::Folder(dir.clone()),
+                );
+            }
 
             let sub = ui2.settings.borrow().pinned_subfolder.clone();
             for d in drives::mounted() {
@@ -5568,6 +5655,134 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add(&layout_row);
     page.add(&opening);
 
+    // A removed folder can be added again through the picker; a removed drive
+    // is only ever offered because it is attached, so without this there would
+    // be no way back at all. It lives here rather than in the menu it undoes,
+    // which is a menu for choosing where to look and not for administering it.
+    if !current.quick_access_hidden.is_empty() {
+        let removed = current.quick_access_hidden.len();
+        let row = adw::ActionRow::builder()
+            .title("Removed places")
+            .subtitle(match removed {
+                1 => "One folder or drive is no longer offered".to_string(),
+                n => format!("{n} folders and drives are no longer offered"),
+            })
+            .build();
+        let restore = gtk::Button::with_label("Show Again");
+        restore.set_valign(gtk::Align::Center);
+        {
+            let ui = ui.clone();
+            let row = row.clone();
+            restore.connect_clicked(move |b| {
+                {
+                    let mut s = ui.settings.borrow_mut();
+                    s.quick_access_hidden.clear();
+                    let _ = s.save();
+                }
+                refresh_nearby(&ui);
+                b.set_sensitive(false);
+                row.set_subtitle("All of them are offered again");
+            });
+        }
+        row.add_suffix(&restore);
+        opening.add(&row);
+    }
+
+    let saving = adw::PreferencesGroup::builder()
+        .title("Saving files")
+        .description("What the Save to menu offers, and in what order")
+        .build();
+    let recents_row = adw::SpinRow::builder()
+        .title("Recent folders offered")
+        .subtitle("Beyond the drive and beside the original, which are always there")
+        .adjustment(&gtk::Adjustment::new(
+            current.recent_output_shown as f64,
+            0.0,
+            5.0,
+            1.0,
+            1.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        recents_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.recent_output_shown = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+    saving.add(&recents_row);
+    page.add(&saving);
+
+    // Formats. Two groups rather than one, because a format can be readable
+    // and writable and switching it off in one direction is not a statement
+    // about the other: someone who receives .ctb files but never writes them
+    // wants it in the first list and not the second.
+    let formats_group = adw::PreferencesGroup::builder()
+        .title("Formats")
+        .description(
+            "Turn off the ones you never use and they stop appearing in the menus. \
+             Nothing is lost - a file in a format you have switched off still opens \
+             if you choose it by hand.",
+        )
+        .build();
+
+    for (title, subtitle, listed, hidden_now, writing) in [
+        (
+            "Opens",
+            "Formats offered when reading a file",
+            registry::readable(),
+            current.hidden_input_formats.clone(),
+            false,
+        ),
+        (
+            "Saves as",
+            "Formats offered in the output menu",
+            registry::writable(),
+            current.hidden_output_formats.clone(),
+            true,
+        ),
+    ] {
+        let expander = adw::ExpanderRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .build();
+        let mut sorted = listed;
+        sorted.sort_by_key(|i| i.name.to_lowercase());
+        for info in sorted {
+            let row = adw::SwitchRow::builder()
+                .title(info.name)
+                .subtitle(format!(".{}", info.extension))
+                .active(!hidden_now.iter().any(|h| h == info.id))
+                .build();
+            let ui = ui.clone();
+            let id = info.id.to_string();
+            row.connect_active_notify(move |r| {
+                {
+                    let mut s = ui.settings.borrow_mut();
+                    let list = if writing {
+                        &mut s.hidden_output_formats
+                    } else {
+                        &mut s.hidden_input_formats
+                    };
+                    list.retain(|h| *h != id);
+                    if !r.is_active() {
+                        list.push(id.clone());
+                    }
+                    let _ = s.save();
+                }
+                if writing {
+                    let hidden = ui.settings.borrow().hidden_output_formats.clone();
+                    ui.output_picker.set_hidden(hidden);
+                }
+            });
+            expander.add_row(&row);
+        }
+        formats_group.add(&expander);
+    }
+    page.add(&formats_group);
+
     let drives_group = adw::PreferencesGroup::builder()
         .title("Drives")
         .description(
@@ -5785,21 +6000,24 @@ fn restore_session(ui: &Rc<App>) {
     let saved = ui.settings.borrow().clone();
 
     // Recently used formats feed the picker's own section.
-    let mut recents: Vec<String> = Vec::new();
-    if let Some(f) = saved.last_output_format.clone() {
-        recents.push(f);
-    }
-    for e in ui.history.borrow().entries.iter().take(12) {
-        if !recents.contains(&e.to_format) {
-            recents.push(e.to_format.clone());
-        }
-    }
-    ui.output_picker.set_recents(recents);
+    ui.output_picker
+        .set_hidden(saved.hidden_output_formats.clone());
 
-    let chosen = saved
-        .last_output_format
-        .filter(|id| registry::by_id(id).map(|h| h.info().capabilities.writes) == Some(true))
-        .or_else(|| registry::writable().first().map(|i| i.id.to_string()));
+    // A remembered format that has since been switched off is not a format
+    // the picker can show as chosen, so it falls back like any other.
+    let hidden = saved.hidden_output_formats.clone();
+    let usable = |id: &String| {
+        registry::by_id(id).map(|h| h.info().capabilities.writes) == Some(true)
+            && !hidden.iter().any(|h| h == id)
+    };
+    let chosen = saved.last_output_format.clone().filter(usable).or_else(|| {
+        let mut writable: Vec<_> = registry::writable()
+            .into_iter()
+            .filter(|i| !hidden.iter().any(|h| h == i.id))
+            .collect();
+        writable.sort_by_key(|i| i.name.to_lowercase());
+        writable.first().map(|i| i.id.to_string())
+    });
     if let Some(id) = chosen {
         ui.output_picker.set_selected(&id);
     }
