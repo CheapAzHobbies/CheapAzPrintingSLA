@@ -2202,7 +2202,14 @@ fn layer_count(ui: &Rc<App>) -> u32 {
 
 fn choose_files(ui: &Rc<App>) {
     let filter = gtk::FileFilter::new();
-    filter.set_name(Some("Sliced resin files"));
+    // What the dialog is offering, said from the reader's side: these are the
+    // files this program can open. "Sliced resin files" named the category
+    // instead, which is true of plenty of files it cannot open.
+    //
+    // Every readable format, including any switched off in Settings. That
+    // setting shortens the menus; it does not make a file unopenable, and the
+    // dialog is exactly where someone would go to open one by hand.
+    filter.set_name(Some("Compatible files"));
     for info in registry::readable() {
         filter.add_pattern(&format!("*.{}", info.extension));
         filter.add_pattern(&format!("*.{}", info.extension.to_uppercase()));
