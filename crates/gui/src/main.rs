@@ -263,6 +263,15 @@ struct App {
     /// The output is following whichever removable drive is connected, rather
     /// than a fixed folder. Re-resolved whenever a drive comes or goes.
     out_auto_drive: Cell<bool>,
+    /// The removable drive the destination sits on, if it sits on one. Held by
+    /// name, so the answer survives the drive being unplugged - which is the
+    /// only moment it is wanted.
+    out_drive: RefCell<Option<String>>,
+    /// What the destination row says before anything is added about the drive
+    /// being missing. Kept so the row can be redrawn when a drive comes or
+    /// goes without working out its name and free space again.
+    dest_base: RefCell<String>,
+    dest_base_detail: RefCell<String>,
     /// Label of the removable drive that mounted most recently, so "connected
     /// drive" means the one just plugged in when several are attached.
     last_drive: RefCell<Option<String>>,
@@ -624,6 +633,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         selected: RefCell::new(0),
         out_dir: RefCell::new(None),
         out_auto_drive: Cell::new(false),
+        out_drive: RefCell::new(None),
+        dest_base: RefCell::new(String::new()),
+        dest_base_detail: RefCell::new(String::new()),
         last_drive: RefCell::new(None),
         settings: RefCell::new(Settings::load()),
         history: RefCell::new(History::load()),
@@ -1789,6 +1801,9 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 refresh_nearby(&ui);
                 drive_arrived(&ui, mount);
                 reresolve_auto_drive(&ui);
+                reattach_out_drive(&ui);
+                refresh_dest_label(&ui);
+                update_eject_button(&ui);
             });
         }
         {
@@ -1796,6 +1811,8 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             monitor.connect_mount_removed(move |_, _| {
                 refresh_nearby(&ui);
                 reresolve_auto_drive(&ui);
+                refresh_dest_label(&ui);
+                update_eject_button(&ui);
             });
         }
         // The monitor is a process-wide singleton; holding it for the life of
@@ -4426,19 +4443,71 @@ fn set_out_auto_drive(ui: &Rc<App>) {
     set_out_dir(ui, dir);
     // set_out_dir clears the flag, so it goes back on afterwards.
     ui.out_auto_drive.set(true);
-    match resolved {
-        Some(d) => {
-            ui.dest_label
-                .set_text(&format!("{} (Automatically Detect)", d.name));
-        }
-        None => {
-            ui.dest_label
-                .set_text("Connected drive (Automatically Detect)");
-            ui.dest_detail
-                .set_text("No drive connected. Plug one in and it will be used.");
+    {
+        let mut s = ui.settings.borrow_mut();
+        if !s.follow_drive {
+            s.follow_drive = true;
+            let _ = s.save();
         }
     }
+    match resolved {
+        Some(d) => {
+            *ui.dest_base.borrow_mut() = format!("{} (Automatically Detect)", d.name);
+        }
+        None => {
+            *ui.dest_base.borrow_mut() = "Connected drive (Automatically Detect)".to_string();
+            *ui.dest_base_detail.borrow_mut() =
+                "No drive connected. Plug one in and it will be used.".to_string();
+        }
+    }
+    refresh_dest_label(ui);
     revalidate(ui);
+}
+
+/// Put the destination back on screen, saying so if its drive has gone.
+///
+/// Unplugging a drive deliberately leaves the destination pointing at it: it
+/// is usually about to be plugged back in, and losing the choice every time
+/// would be worse than keeping it. But saying nothing is worse again - the row
+/// reads exactly as it did when the drive was there, and the first sign
+/// anything is wrong is a conversion that cannot write.
+fn refresh_dest_label(ui: &Rc<App>) {
+    let gone = !ui.out_auto_drive.get()
+        && ui
+            .out_drive
+            .borrow()
+            .as_deref()
+            .is_some_and(|name| drives::by_name(name).is_none());
+    if gone {
+        ui.dest_label
+            .set_text(&format!("{} (Disconnected)", ui.dest_base.borrow()));
+        ui.dest_detail
+            .set_text("Plug this drive back in, or choose somewhere else");
+    } else {
+        ui.dest_label.set_text(&ui.dest_base.borrow());
+        ui.dest_detail.set_text(&ui.dest_base_detail.borrow());
+    }
+}
+
+/// A drive that comes back need not come back in the same place.
+fn reattach_out_drive(ui: &Rc<App>) {
+    if ui.out_auto_drive.get() {
+        return;
+    }
+    let Some(name) = ui.out_drive.borrow().clone() else {
+        return;
+    };
+    if drives::by_name(&name).is_none() {
+        return;
+    }
+    let stale = ui.out_dir.borrow().as_deref().is_some_and(|p| !p.is_dir());
+    if !stale {
+        return;
+    }
+    let sub = ui.settings.borrow().pinned_subfolder.clone();
+    if let Some(dir) = drives::target_dir(&name, &sub) {
+        set_out_dir(ui, Some(dir));
+    }
 }
 
 /// Re-point the output after a drive came or went, when following one.
@@ -4449,13 +4518,12 @@ fn reresolve_auto_drive(ui: &Rc<App>) {
 }
 
 fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
-    match &dir {
+    let (base, detail) = match &dir {
         Some(d) => {
-            ui.dest_label.set_text(
-                &d.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| d.display().to_string()),
-            );
+            let name = d
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| d.display().to_string());
             let detail = drives::space(d)
                 .map(|(free, _)| {
                     format!(
@@ -4465,15 +4533,32 @@ fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
                     )
                 })
                 .unwrap_or_else(|| d.display().to_string());
-            ui.dest_detail.set_text(&detail);
+            (name, detail)
         }
-        None => {
-            ui.dest_label.set_text("Beside the original");
-            ui.dest_detail.set_text("Same folder as each source file");
-        }
-    }
+        None => (
+            "Beside the original".to_string(),
+            "Same folder as each source file".to_string(),
+        ),
+    };
+    // Noted while the drive is still here, because once it is gone there is
+    // nothing left to ask which drive the folder was on.
+    *ui.out_drive.borrow_mut() = dir
+        .as_deref()
+        .and_then(drives::containing)
+        .filter(|d| d.removable)
+        .map(|d| d.name);
+    *ui.dest_base.borrow_mut() = base;
+    *ui.dest_base_detail.borrow_mut() = detail;
     *ui.out_dir.borrow_mut() = dir;
     ui.out_auto_drive.set(false);
+    {
+        let mut s = ui.settings.borrow_mut();
+        if s.follow_drive {
+            s.follow_drive = false;
+            let _ = s.save();
+        }
+    }
+    refresh_dest_label(ui);
     update_eject_button(ui);
     suggest_name(ui);
     revalidate(ui);
@@ -5530,8 +5615,13 @@ fn restore_session(ui: &Rc<App>) {
         ui.output_picker.set_selected(&id);
     }
 
-    // A remembered folder is only restored if it is still there.
-    if let Some(dir) = saved.last_output_dir.filter(|d| d.is_dir()) {
+    // Following a drive is a standing instruction, so it is restored ahead of
+    // any remembered folder - the folder is only where following happened to
+    // land last time. A remembered folder is restored only if it is still
+    // there.
+    if saved.follow_drive {
+        set_out_auto_drive(ui);
+    } else if let Some(dir) = saved.last_output_dir.filter(|d| d.is_dir()) {
         set_out_dir(ui, Some(dir));
     } else {
         set_out_dir(ui, None);

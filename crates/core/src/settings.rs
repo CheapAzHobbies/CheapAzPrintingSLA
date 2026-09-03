@@ -52,6 +52,11 @@ pub struct Settings {
     /// Offer readable files found in the open folder and on mounted drives,
     /// so a file can be picked without opening a file dialog for it.
     pub show_nearby_files: bool,
+    /// Save to whichever removable drive is attached, rather than to a fixed
+    /// folder. Remembered, because it is a standing instruction rather than a
+    /// place: choosing it once and finding it forgotten next launch makes it
+    /// look like it did not take.
+    pub follow_drive: bool,
     /// Extra folders Quick Access looks in, beyond the one the file chooser
     /// starts from.
     pub quick_access_folders: Vec<PathBuf>,
@@ -114,6 +119,7 @@ impl Default for Settings {
             pinned_subfolder: String::new(),
             auto_lock_new_drives: false,
             show_nearby_files: true,
+            follow_drive: false,
             quick_access_folders: Vec::new(),
             quick_access_off: Vec::new(),
             quick_access_hidden: Vec::new(),
@@ -182,6 +188,9 @@ impl Settings {
         }
         if let Some(v) = map.get("show_nearby_files") {
             s.show_nearby_files = v == "true";
+        }
+        if let Some(v) = map.get("follow_drive") {
+            s.follow_drive = v == "true";
         }
         if let Some(v) = map.get("quick_access_folders") {
             s.quick_access_folders = v
@@ -281,7 +290,8 @@ impl Settings {
              quick_access_hidden = {}\n\
              quick_access_drives_on = {}\n\
              quick_access_visible = {}\n\
-             quick_access_columns = {}\n",
+             quick_access_columns = {}\n\
+             follow_drive = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -314,6 +324,7 @@ impl Settings {
             self.quick_access_drives_on.join("\x1f"),
             self.quick_access_visible,
             self.quick_access_columns,
+            self.follow_drive,
         );
         std::fs::write(path, body)
     }
