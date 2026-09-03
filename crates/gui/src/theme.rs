@@ -174,9 +174,15 @@ fn sheet(p: &Palette) -> String {
   background-color: transparent;
   background-image: none;
 }}
-/* Put the hover back, which the rule above would otherwise take with it. */
-.cz-qa-head row:hover {{
-  background-image: linear-gradient(alpha(@cz_text, 0.05), alpha(@cz_text, 0.05));
+/* Put the hover back, on the list rather than on the row. The row does not
+   draw the corners - the list does - so lighting the row left a ring of the
+   resting shade around the lit area, widest at the corners, which is what
+   made them look wrong on the way past. Lit here, the corners light with it.
+
+   Carried by a class the pointer handlers set, not by :hover. The pointer is
+   over the row, and prelight does not reach the list from there. */
+.cz-qa-head.cz-qa-lit {{
+  background-image: linear-gradient(alpha(@cz_text, 0.1), alpha(@cz_text, 0.1));
 }}
 /* The row, not just the list: a boxed list draws its rounded corners on its
    first and last rows, so squaring off the list alone changed nothing that
@@ -200,6 +206,15 @@ fn sheet(p: &Palette) -> String {
 .cz-qa-clip {{
   border-bottom-left-radius: 12px;
   border-bottom-right-radius: 12px;
+}}
+
+/* A status that can be pressed. Sized like the label it wraps rather than
+   like a button, so the column still lines up with the rows that have nothing
+   to show. */
+.cz-chip-button {{
+  padding: 2px 4px;
+  min-height: 0;
+  min-width: 0;
 }}
 
 /* ---- queue ---- */

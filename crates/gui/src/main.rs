@@ -1194,6 +1194,19 @@ fn build_nearby_panel() -> NearbyPanel {
 
     expander.add_suffix(&search);
 
+    // Lighting the header is done here rather than left to :hover, because the
+    // pointer is over the row inside and the list never sees the prelight.
+    let lift = gtk::EventControllerMotion::new();
+    {
+        let head = head_list.clone();
+        lift.connect_enter(move |_, _, _| head.add_css_class("cz-qa-lit"));
+    }
+    {
+        let head = head_list.clone();
+        lift.connect_leave(move |_| head.remove_css_class("cz-qa-lit"));
+    }
+    head_list.add_controller(lift);
+
     head_list.append(&expander);
     clip.set_child(Some(&list));
     panel.append(&head_list);
@@ -2666,9 +2679,10 @@ fn show_nearby_search(ui: &Rc<App>, offer: bool) {
 /// spent fading the box in before it starts to widen.
 const SEARCH_SECONDS: f64 = 0.28;
 const SEARCH_FADE: f64 = 0.34;
-/// The width the box fades in at, before it grows: a small rounded box beside
-/// the glass rather than a sliver.
-const SEARCH_SEED: i32 = 34;
+/// The width the box shrinks to before it fades, and grows from. Enough to
+/// hold the glass and an ellipsis - the field arrives and leaves as something
+/// recognisable rather than as a sliver of nothing.
+const SEARCH_SEED: i32 = 62;
 /// And what it grows to. A number rather than the field's own natural width,
 /// which is nothing now that it has no character width to claim one from.
 const SEARCH_WIDTH: i32 = 190;
@@ -3239,28 +3253,46 @@ fn refresh_queue(ui: &Rc<App>) {
         size.set_visible(!ui.compact.get());
         row.append(&size);
 
+        // Full technical text behind the status itself, as §28 asks. It used
+        // to be behind a Details button next to it, which is a second control
+        // saying the same thing as the first: "Failed" is already the thing
+        // you want to know more about, so it is the thing to press.
         let chip = f.status.chip();
-        chip.set_width_request(if ui.compact.get() { 0 } else { 104 });
-        row.append(&chip);
-
-        // Full technical text behind Details, as §28 asks.
-        if matches!(f.status, Status::Failed(_) | Status::Warning(_)) {
-            if let Some(detail) = f.status.detail() {
-                let details = gtk::Button::with_label("Details");
-                details.add_css_class("flat");
-                details.set_valign(gtk::Align::Center);
+        let detail = match f.status {
+            Status::Failed(_) | Status::Warning(_) => f.status.detail(),
+            _ => None,
+        };
+        let width = if ui.compact.get() { 0 } else { 104 };
+        match detail {
+            Some(detail) => {
+                let failed = matches!(f.status, Status::Failed(_));
+                let press = gtk::Button::builder().child(&chip).build();
+                press.add_css_class("flat");
+                press.add_css_class("cz-chip-button");
+                press.set_valign(gtk::Align::Center);
+                press.set_width_request(width);
+                press.set_tooltip_text(Some(if failed {
+                    "Show what went wrong"
+                } else {
+                    "Show what to watch for"
+                }));
+                press.set_cursor_from_name(Some("pointer"));
                 let win = ui.window.clone();
-                let heading = if matches!(f.status, Status::Failed(_)) {
+                let heading = if failed {
                     "This file could not be opened"
                 } else {
                     "Worth knowing about this file"
                 };
                 let name = f.name();
                 let suggestions = f.suggestions.clone();
-                details.connect_clicked(move |_| {
+                press.connect_clicked(move |_| {
                     show_details(&win, heading, &name, &detail, &suggestions);
                 });
-                row.append(&details);
+                row.append(&press);
+            }
+            None => {
+                chip.set_width_request(width);
+                row.append(&chip);
             }
         }
 
