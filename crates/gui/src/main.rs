@@ -272,6 +272,9 @@ struct App {
 
     // history page
     history_list: gtk::ListBox,
+    /// A tick box per history row, in the order the rows are shown, so several
+    /// can be taken out in one go rather than one X at a time.
+    history_ticks: RefCell<Vec<gtk::CheckButton>>,
     history_stack: gtk::Stack,
 
     // state
@@ -671,6 +674,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         preview_nav_ends,
         compact: Cell::new(false),
         history_list,
+        history_ticks: RefCell::new(Vec::new()),
         history_stack,
         files: RefCell::new(Vec::new()),
         selected: RefCell::new(0),
@@ -5564,6 +5568,14 @@ fn refresh_history(ui: &Rc<App>) {
         return;
     }
     ui.history_stack.set_visible_child_name("list");
+    ui.history_ticks.borrow_mut().clear();
+
+    // Built before the rows so their tick boxes can tell it how many are
+    // ticked, and added after them so it sits at the foot of the list.
+    let selected = gtk::Button::builder().halign(gtk::Align::Start).build();
+    selected.add_css_class("flat");
+    selected.add_css_class("cz-destructive");
+    selected.set_visible(false);
 
     for (i, e) in entries.iter().enumerate() {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
@@ -5571,6 +5583,35 @@ fn refresh_history(ui: &Rc<App>) {
         row.set_margin_bottom(theme::SPACE_2);
         row.set_margin_start(theme::SPACE_3);
         row.set_margin_end(theme::SPACE_2);
+
+        // The tick comes first, where a list of things to be picked from puts
+        // it, and does nothing on its own - it only tells the button at the
+        // foot of the list what it would be removing.
+        let tick = gtk::CheckButton::new();
+        tick.set_valign(gtk::Align::Center);
+        tick.set_tooltip_text(Some("Pick this one to remove"));
+        {
+            let ui = ui.clone();
+            let selected = selected.clone();
+            tick.connect_toggled(move |_| {
+                let ticked = ui
+                    .history_ticks
+                    .borrow()
+                    .iter()
+                    .filter(|t| t.is_active())
+                    .count();
+                selected.set_visible(ticked > 0);
+                selected.set_child(Some(&labelled_icon(
+                    "user-trash-symbolic",
+                    &match ticked {
+                        1 => "Remove 1 Selected".to_string(),
+                        n => format!("Remove {n} Selected"),
+                    },
+                )));
+            });
+        }
+        row.append(&tick);
+        ui.history_ticks.borrow_mut().push(tick);
 
         let icon = gtk::Image::from_icon_name(match e.outcome {
             history::Outcome::Complete => "object-select-symbolic",
@@ -5637,6 +5678,35 @@ fn refresh_history(ui: &Rc<App>) {
             .append(&gtk::ListBoxRow::builder().child(&row).build());
     }
 
+    {
+        let ui2 = ui.clone();
+        selected.connect_clicked(move |_| {
+            // Highest index first: removing from the front would shift every
+            // row after it and take the wrong ones out.
+            let mut going: Vec<usize> = ui2
+                .history_ticks
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.is_active())
+                .map(|(i, _)| i)
+                .collect();
+            going.sort_unstable_by(|a, b| b.cmp(a));
+            let count = going.len();
+            {
+                let mut history = ui2.history.borrow_mut();
+                for i in going {
+                    history.remove(i);
+                }
+            }
+            refresh_history(&ui2);
+            ui2.toasts.add_toast(adw::Toast::new(&match count {
+                1 => "1 entry removed".to_string(),
+                n => format!("{n} entries removed"),
+            }));
+        });
+    }
+
     let clear = gtk::Button::builder().halign(gtk::Align::Start).build();
     clear.set_child(Some(&labelled_icon("user-trash-symbolic", "Clear History")));
     clear.add_css_class("flat");
@@ -5646,9 +5716,13 @@ fn refresh_history(ui: &Rc<App>) {
         ui2.history.borrow_mut().clear();
         refresh_history(&ui2);
     });
+
+    let foot = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
+    foot.append(&selected);
+    foot.append(&clear);
     ui.history_list.append(
         &gtk::ListBoxRow::builder()
-            .child(&clear)
+            .child(&foot)
             .selectable(false)
             .build(),
     );
