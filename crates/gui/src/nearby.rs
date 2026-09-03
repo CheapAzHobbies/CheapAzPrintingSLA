@@ -38,8 +38,10 @@ pub struct Source {
     /// Stable identity for the off-list: a folder's path, or `drive:LABEL`.
     pub key: String,
     pub enabled: bool,
-    /// Drives come and go and cannot be removed from the list by hand;
-    /// folders were added deliberately and can be.
+    /// Whether this entry can be taken off the list rather than only switched
+    /// off. A drive is listed because it is plugged in, so unplugging it is
+    /// how it leaves; a folder is listed because of something the user did,
+    /// so it is theirs to undo.
     pub removable_entry: bool,
 }
 
@@ -53,7 +55,13 @@ const MAX_TOTAL: usize = 40;
 /// The folder the file chooser starts from comes first, then folders the user
 /// added, then every mounted drive. Anything named in `off` is listed but not
 /// scanned, so turning a source back on does not mean finding it again.
-pub fn sources(open_dir: Option<&Path>, extra: &[PathBuf], off: &[String]) -> Vec<Source> {
+/// Anything named in `hidden` is not listed at all.
+pub fn sources(
+    open_dir: Option<&Path>,
+    extra: &[PathBuf],
+    off: &[String],
+    hidden: &[String],
+) -> Vec<Source> {
     let name_of = |p: &Path| {
         p.file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -64,8 +72,17 @@ pub fn sources(open_dir: Option<&Path>, extra: &[PathBuf], off: &[String]) -> Ve
 
     let mut push = |path: PathBuf, label: String, key: String, removable_entry: bool| {
         // The same folder can arrive twice: the open folder may itself sit on
-        // a mounted drive, or be listed again as an added folder.
-        if seen.contains(&path) {
+        // a mounted drive, or be listed again as an added folder. The first
+        // entry keeps its place, but a later one that may be removed hands
+        // that over - otherwise adding the folder you last opened from would
+        // quietly produce an entry with no way to take it off again.
+        if let Some(seat) = seen.iter().position(|p| *p == path) {
+            if removable_entry {
+                out[seat].removable_entry = true;
+            }
+            return;
+        }
+        if hidden.contains(&key) {
             return;
         }
         seen.push(path.clone());
@@ -84,7 +101,7 @@ pub fn sources(open_dir: Option<&Path>, extra: &[PathBuf], off: &[String]) -> Ve
             d.to_path_buf(),
             name_of(d),
             d.to_string_lossy().into_owned(),
-            false,
+            true,
         );
     }
     for d in extra {
@@ -201,6 +218,38 @@ mod tests {
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_source_taken_off_the_list_is_not_offered_again() {
+        let d = Dir::new("hidden", &["a.sl1"]);
+        let key = d.0.to_string_lossy().into_owned();
+        let listed = sources(None, &[d.0.clone()], &[], &[]);
+        assert!(listed.iter().any(|s| s.path == d.0));
+        let listed = sources(None, &[d.0.clone()], &[], &[key]);
+        assert!(!listed.iter().any(|s| s.path == d.0));
+    }
+
+    #[test]
+    fn the_open_folder_can_be_taken_off_the_list_too() {
+        // It is offered automatically, but it is offered because of a file the
+        // user opened, so it is still theirs to be rid of.
+        let d = Dir::new("openable", &["a.sl1"]);
+        let listed = sources(Some(&d.0), &[], &[], &[]);
+        let entry = listed.iter().find(|s| s.path == d.0).expect("listed");
+        assert!(entry.removable_entry);
+    }
+
+    #[test]
+    fn adding_the_folder_already_open_still_leaves_it_removable() {
+        // The same path arrives twice and only the first is kept. If that one
+        // were the version that cannot be removed, adding a folder by hand
+        // could produce an entry with no way to take it off again.
+        let d = Dir::new("both", &["a.sl1"]);
+        let listed = sources(Some(&d.0), &[d.0.clone()], &[], &[]);
+        let mine: Vec<_> = listed.iter().filter(|s| s.path == d.0).collect();
+        assert_eq!(mine.len(), 1, "listed once, not twice");
+        assert!(mine[0].removable_entry);
     }
 
     #[test]

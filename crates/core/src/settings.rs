@@ -62,6 +62,14 @@ pub struct Settings {
     /// the first time is scanned without being enabled by hand, which is the
     /// behaviour that makes the feature worth having.
     pub quick_access_off: Vec<String>,
+    /// Sources taken off the "Look in" list altogether, by the same key.
+    ///
+    /// Distinct from `quick_access_off`, which is a source the user still
+    /// wants listed and may switch back on. This one is for a place that
+    /// should stop being offered at all - the folder is untouched on disk,
+    /// it is simply not one of the choices any more. Adding the folder back
+    /// through the picker clears it.
+    pub quick_access_hidden: Vec<String>,
     /// Drives the user has marked as never ejectable, by name.
     ///
     /// This is a second lock, not the only one. Filesystems the system needs
@@ -89,6 +97,7 @@ impl Default for Settings {
             show_nearby_files: true,
             quick_access_folders: Vec::new(),
             quick_access_off: Vec::new(),
+            quick_access_hidden: Vec::new(),
             never_eject: Vec::new(),
         }
     }
@@ -166,6 +175,13 @@ impl Settings {
                 .map(String::from)
                 .collect();
         }
+        if let Some(v) = map.get("quick_access_hidden") {
+            s.quick_access_hidden = v
+                .split('\x1f')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+        }
         if let Some(v) = map.get("never_eject") {
             s.never_eject = v
                 .split('\x1f')
@@ -222,7 +238,8 @@ impl Settings {
              show_nearby_files = {}\n\
              never_eject = {}\n\
              quick_access_folders = {}\n\
-             quick_access_off = {}\n",
+             quick_access_off = {}\n\
+             quick_access_hidden = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -251,6 +268,7 @@ impl Settings {
                 .collect::<Vec<_>>()
                 .join("\x1f"),
             self.quick_access_off.join("\x1f"),
+            self.quick_access_hidden.join("\x1f"),
         );
         std::fs::write(path, body)
     }

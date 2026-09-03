@@ -148,7 +148,9 @@ struct App {
     /// Where that height is now, where it is heading, and whether a tick
     /// callback is already walking it there.
     nearby_h: Rc<Cell<f64>>,
+    nearby_from: Rc<Cell<f64>>,
     nearby_target: Rc<Cell<f64>>,
+    nearby_elapsed: Rc<Cell<f64>>,
     nearby_moving: Rc<Cell<bool>>,
     /// The rows currently inside the expander, so a refresh can take them out
     /// again without rebuilding the row and losing whether it was open.
@@ -514,7 +516,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_expander,
         nearby_clip,
         nearby_h: Rc::new(Cell::new(0.0)),
+        nearby_from: Rc::new(Cell::new(0.0)),
         nearby_target: Rc::new(Cell::new(0.0)),
+        nearby_elapsed: Rc::new(Cell::new(0.0)),
         nearby_moving: Rc::new(Cell::new(false)),
         nearby_sources: nearby_sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
@@ -1997,15 +2001,16 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
         heading.set_margin_bottom(theme::SPACE_2);
         content.append(&heading);
 
-        let (open_dir, extra, off) = {
+        let (open_dir, extra, off, hidden) = {
             let s = ui.settings.borrow();
             (
                 s.open_start_dir(),
                 s.quick_access_folders.clone(),
                 s.quick_access_off.clone(),
+                s.quick_access_hidden.clone(),
             )
         };
-        let sources = nearby::sources(open_dir.as_deref(), &extra, &off);
+        let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden);
 
         if sources.is_empty() {
             let none = gtk::Label::new(Some("Nowhere to look yet"));
@@ -2041,23 +2046,43 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
                     refresh_nearby(&ui);
                 });
             }
-            // A drive is on the list because it is plugged in; only folders
-            // the user added are theirs to take off it.
+            // A drive is on the list because it is plugged in, so unplugging
+            // it is how it leaves. A folder is there because of something the
+            // user did, and switching it off is not the same as being done
+            // with it: off still leaves it sitting in the list.
             if source.removable_entry {
-                let drop =
-                    shell::icon_button("list-remove-symbolic", "Stop looking in this folder");
+                let drop = shell::icon_button("window-close-symbolic", "Remove from the list");
                 drop.set_valign(gtk::Align::Center);
                 let ui2 = ui.clone();
                 let path = source.path.clone();
-                let pop2 = pop.clone();
+                let key = source.key.clone();
+                // Weak, because the row owns the button which owns this
+                // closure: a strong handle back to the row is a cycle.
+                let gone = row.downgrade();
                 drop.connect_clicked(move |_| {
                     {
                         let mut s = ui2.settings.borrow_mut();
+                        // Dropped as an added folder and recorded as hidden.
+                        // The first covers a folder the user picked; the
+                        // second covers the one they last opened a file from,
+                        // which is offered automatically and would otherwise
+                        // reappear on the next refresh. A folder can be both.
                         s.quick_access_folders.retain(|p| *p != path);
+                        s.quick_access_off.retain(|k| *k != key);
+                        if !s.quick_access_hidden.contains(&key) {
+                            s.quick_access_hidden.push(key.clone());
+                        }
                         let _ = s.save();
                     }
                     refresh_nearby(&ui2);
-                    pop2.popdown();
+                    // Only the row goes, rather than the menu closing or
+                    // rebuilding itself: several can be cleared out in one
+                    // visit, and nothing flickers under the pointer.
+                    if let Some(row) = gone.upgrade() {
+                        if let Some(list) = row.parent().and_downcast::<gtk::ListBox>() {
+                            list.remove(&row);
+                        }
+                    }
                 });
                 row.add_suffix(&drop);
             }
@@ -2109,10 +2134,12 @@ fn choose_scan_folder(ui: &Rc<App>) {
                         if !s.quick_access_folders.contains(&path) {
                             s.quick_access_folders.push(path.clone());
                         }
-                        // Adding a folder that was previously switched off is
-                        // a request to look in it again.
+                        // Adding a folder that was previously switched off,
+                        // or taken off the list entirely, is a request to look
+                        // in it again.
                         let key = path.to_string_lossy().into_owned();
                         s.quick_access_off.retain(|k| *k != key);
+                        s.quick_access_hidden.retain(|k| *k != key);
                         let _ = s.save();
                     }
                     refresh_nearby(&ui);
@@ -2150,15 +2177,16 @@ fn refresh_nearby(ui: &Rc<App>) {
         return;
     }
 
-    let (open_dir, extra, off) = {
+    let (open_dir, extra, off, hidden) = {
         let s = ui.settings.borrow();
         (
             s.open_start_dir(),
             s.quick_access_folders.clone(),
             s.quick_access_off.clone(),
+            s.quick_access_hidden.clone(),
         )
     };
-    let sources = nearby::sources(open_dir.as_deref(), &extra, &off);
+    let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden);
     let queued: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
     let found = nearby::scan(&sources, &queued);
 
@@ -2282,11 +2310,15 @@ fn refresh_nearby(ui: &Rc<App>) {
     animate_nearby_height(ui, was);
 }
 
-/// How fast the list settles on its new height. The distance left shrinks by
-/// the same proportion every second, with a floor underneath so the last few
-/// pixels do not crawl - an exponential never quite arrives on its own.
-const NEARBY_TAU: f64 = 0.06;
-const NEARBY_MIN_SPEED: f64 = 260.0;
+/// How long the list takes to move between two heights, in seconds.
+///
+/// A fixed duration rather than a rate. The first attempt eased by a fraction
+/// of the distance left each frame, which looks right over fifty pixels and
+/// wrong over a thousand: a list of forty files covered most of its travel in
+/// the opening frame and read as a snap, while a short list drifted. Holding
+/// the duration instead is also what the expander above it does, so opening
+/// the list and emptying it now move at the same pace.
+const NEARBY_SECONDS: f64 = EXPANDER_MS as f64 / 1000.0;
 
 /// Hand the list's height back to the list.
 ///
@@ -2314,8 +2346,8 @@ fn hold_nearby(clip: &gtk::ScrolledWindow, height: i32) {
 /// Switching a source off takes its rows out on the next frame and everything
 /// below jumps up to meet the gap. Nothing in GTK animates that: a list box is
 /// exactly as tall as its rows. So the list is held inside a scrolled window,
-/// which is allowed to be a height its child is not, and both ends of that
-/// height are walked from the old value to the new one and then released.
+/// which is allowed to be a height its child is not, and that height is walked
+/// from the old value to the new one and then released.
 fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let clip = ui.nearby_clip.clone();
     let Some(child) = clip.child() else {
@@ -2327,9 +2359,13 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let (_, to, _, _) = child.measure(gtk::Orientation::Vertical, for_width);
 
     if ui.nearby_moving.get() {
-        // Already walking. Hand it the new destination and let it carry on
-        // from where the panel actually is, rather than starting again.
-        ui.nearby_target.set(to as f64);
+        // Already walking. Aim it somewhere else from wherever it has got to,
+        // rather than starting again from where it set off.
+        if ui.nearby_target.get() != to as f64 {
+            ui.nearby_from.set(ui.nearby_h.get());
+            ui.nearby_target.set(to as f64);
+            ui.nearby_elapsed.set(0.0);
+        }
         return;
     }
     if from <= 0 || from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
@@ -2341,14 +2377,18 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         return;
     };
 
-    ui.nearby_target.set(to as f64);
+    ui.nearby_from.set(from as f64);
     ui.nearby_h.set(from as f64);
+    ui.nearby_target.set(to as f64);
+    ui.nearby_elapsed.set(0.0);
     hold_nearby(&clip, from);
     ui.nearby_moving.set(true);
 
     let root: gtk::Widget = root.upcast();
+    let start = ui.nearby_from.clone();
     let target = ui.nearby_target.clone();
     let height = ui.nearby_h.clone();
+    let elapsed = ui.nearby_elapsed.clone();
     let moving = ui.nearby_moving.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
@@ -2359,25 +2399,21 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
             Some(previous) => ((now - previous) as f64 / 1e6).clamp(0.0, 0.1),
             None => 0.0,
         };
+        elapsed.set(elapsed.get() + dt);
 
-        let want = target.get();
-        let at = height.get();
-        let remaining = want - at;
-        let mut step = remaining * (1.0 - (-dt / NEARBY_TAU).exp());
-        let floor = NEARBY_MIN_SPEED * dt;
-        if step.abs() < floor {
-            step = floor * remaining.signum();
-        }
+        let t = (elapsed.get() / NEARBY_SECONDS).clamp(0.0, 1.0);
+        // Ease out: quick to leave, slow to arrive, which is the shape every
+        // other movement in the window uses.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let at = start.get() + (target.get() - start.get()) * eased;
+        height.set(at);
 
-        if remaining.abs() < 1.0 || step.abs() >= remaining.abs() {
-            height.set(want);
+        if t >= 1.0 {
             settle_nearby(&clip);
             moving.set(false);
             return glib::ControlFlow::Break;
         }
-
-        height.set(at + step);
-        hold_nearby(&clip, (at + step).round() as i32);
+        hold_nearby(&clip, at.round() as i32);
         glib::ControlFlow::Continue
     });
 }
