@@ -165,6 +165,13 @@ struct App {
     nearby_head_list: gtk::ListBox,
     /// The file rows, inside it.
     nearby_rows_list: gtk::ListBox,
+    nearby_refresh: gtk::Button,
+    /// Counts scans, so a slow one finishing after a later one started cannot
+    /// overwrite it.
+    scan_gen: Cell<u64>,
+    /// When the running scan began, and whether it was asked for by hand.
+    scan_since: Cell<Option<std::time::Instant>>,
+    scan_asked: Cell<bool>,
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
@@ -402,6 +409,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     clear_all.add_css_class("flat");
     clear_all.set_widget_name("queue-clear");
     let clear_label = labelled_icon("user-trash-symbolic", "Clear Files");
+    clear_all.add_css_class("cz-bin");
     clear_label.set_halign(gtk::Align::End);
     clear_label.set_margin_top(theme::SPACE_3);
     clear_label.set_margin_bottom(theme::SPACE_3);
@@ -601,6 +609,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_clip: nearby.clip,
         nearby_head_list: nearby.head_list,
         nearby_rows_list: nearby.rows_list,
+        nearby_refresh: nearby.refresh,
+        scan_gen: Cell::new(0),
+        scan_since: Cell::new(None),
+        scan_asked: Cell::new(false),
         nearby_search: nearby.search,
         search_full: Rc::new(Cell::new(SEARCH_WIDTH)),
         search_t: Rc::new(Cell::new(0.0)),
@@ -1231,8 +1243,6 @@ fn build_nearby_panel() -> NearbyPanel {
     let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
     refresh.set_widget_name("nearby-refresh");
     refresh.set_valign(gtk::Align::Center);
-    expander.add_suffix(&refresh);
-
     // Search lives in the header rather than in a row of its own, because a
     // row of its own is a row of the list spent on something that is not a
     // file.
@@ -1287,6 +1297,7 @@ fn build_nearby_panel() -> NearbyPanel {
         clip,
         head_list,
         rows_list: list,
+        refresh,
         search,
     }
 }
@@ -1299,6 +1310,7 @@ struct NearbyPanel {
     clip: gtk::ScrolledWindow,
     head_list: gtk::ListBox,
     rows_list: gtk::ListBox,
+    refresh: gtk::Button,
     search: gtk::Entry,
 }
 
@@ -1840,9 +1852,14 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     // "Found nearby": manual refresh, plus the events that can change the
     // answer. Drives are watched through GIO rather than polled, so nothing
     // runs while the window sits idle.
-    if let Some(btn) = find_named(&ui.nearby_panel, "nearby-refresh") {
-        let ui = ui.clone();
-        btn.connect_clicked(move |_| refresh_nearby(&ui));
+    {
+        let ui2 = ui.clone();
+        ui.nearby_refresh.connect_clicked(move |_| {
+            // Noted before the scan starts: a press is owed a visible answer
+            // even when there was nothing to find.
+            ui2.scan_asked.set(true);
+            refresh_nearby(&ui2);
+        });
     }
     {
         let monitor = gio::VolumeMonitor::get();
@@ -2514,17 +2531,10 @@ fn choose_scan_folder(ui: &Rc<App>) {
 /// The expander itself is reused rather than rebuilt, so a refresh does not
 /// snap it shut while the user is reading it.
 fn refresh_nearby(ui: &Rc<App>) {
-    // Read before the rows go, so the animation knows where it is starting
-    // from. Mid-flight this is the animated height rather than the content's,
-    // which is what makes a second change during the first one continue from
-    // where the panel actually is instead of snapping back.
-    let was = ui.nearby_clip.height();
-
-    for row in ui.nearby_rows.borrow_mut().drain(..) {
-        ui.nearby_rows_list.remove(&row);
-    }
-
     if !ui.settings.borrow().show_nearby_files {
+        for row in ui.nearby_rows.borrow_mut().drain(..) {
+            ui.nearby_rows_list.remove(&row);
+        }
         ui.nearby_panel.set_visible(false);
         return;
     }
@@ -2539,9 +2549,106 @@ fn refresh_nearby(ui: &Rc<App>) {
             s.quick_access_drives_on.clone(),
         )
     };
+    // Which places to look is a question about mounted drives, so it is
+    // answered here. Reading them is not, and a drive that has gone to sleep
+    // can take seconds to answer - long enough that doing it here froze the
+    // window, and long enough that a spinning arrow is worth having.
     let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden, &drives_on);
     let queued: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
-    let found = nearby::scan(&sources, &queued);
+
+    let generation = ui.scan_gen.get().wrapping_add(1);
+    ui.scan_gen.set(generation);
+    ui.scan_since.set(Some(std::time::Instant::now()));
+    scan_spin(ui, true);
+
+    let (tx, rx) = async_channel::bounded(1);
+    let looking = sources.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(nearby::scan(&looking, &queued));
+    });
+
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let Ok(found) = rx.recv().await else { return };
+        // A scan that finishes after a later one has started is stale, and
+        // writing its answer over the newer one would undo the change that
+        // asked for it.
+        if ui.scan_gen.get() != generation {
+            return;
+        }
+        scan_spin(&ui, false);
+        show_nearby(&ui, sources, found);
+    });
+}
+
+/// How long a scan has to run before the arrow starts turning, and how long a
+/// turn lasts once someone has pressed for it.
+const SCAN_SPIN_AFTER: u128 = 150;
+const SCAN_SPIN_LEAST: u64 = 480;
+
+/// Turn the refresh arrow while a scan is running.
+///
+/// A scan of one folder is over in a few milliseconds and a spin that brief is
+/// a flicker, so an automatic refresh only shows one if it is actually taking
+/// time. A press is different: someone who pressed a button is owed an answer
+/// whether or not there was anything to do, so that one always turns, and goes
+/// on turning until the scan is finished however long that is.
+fn scan_spin(ui: &Rc<App>, on: bool) {
+    if on {
+        if ui.scan_asked.get() {
+            ui.nearby_refresh.add_css_class("cz-turning");
+            return;
+        }
+        let ui2 = ui.clone();
+        let generation = ui.scan_gen.get();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(SCAN_SPIN_AFTER as u64),
+            move || {
+                if ui2.scan_gen.get() == generation && ui2.scan_since.get().is_some() {
+                    ui2.nearby_refresh.add_css_class("cz-turning");
+                }
+            },
+        );
+        return;
+    }
+
+    let asked = ui.scan_asked.replace(false);
+    let ran = ui
+        .scan_since
+        .replace(None)
+        .map(|t| t.elapsed().as_millis())
+        .unwrap_or(0);
+    let owed = if asked {
+        SCAN_SPIN_LEAST.saturating_sub(ran.min(u128::from(u64::MAX)) as u64)
+    } else if ran >= SCAN_SPIN_AFTER {
+        // Already turning, and stopping mid-turn reads as a stumble.
+        120
+    } else {
+        0
+    };
+    if owed == 0 {
+        ui.nearby_refresh.remove_css_class("cz-turning");
+        return;
+    }
+    let ui2 = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(owed), move || {
+        if ui2.scan_since.get().is_none() {
+            ui2.nearby_refresh.remove_css_class("cz-turning");
+        }
+    });
+}
+
+/// Put the result of a scan on screen.
+fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Found>) {
+    // Read before the rows go, so the animation knows where it is starting
+    // from. Mid-flight this is the animated height rather than the content's,
+    // which is what makes a second change during the first one continue from
+    // where the panel actually is instead of snapping back.
+    let was = ui.nearby_clip.height();
+
+    for row in ui.nearby_rows.borrow_mut().drain(..) {
+        ui.nearby_rows_list.remove(&row);
+    }
 
     if found.is_empty() {
         // Still shown, collapsed and empty. Hiding it took the folder picker
@@ -4830,15 +4937,22 @@ fn set_out_dir(ui: &Rc<App>, dir: Option<PathBuf>) {
         .map(|d| d.name);
     *ui.dest_base.borrow_mut() = base;
     *ui.dest_base_detail.borrow_mut() = detail;
-    *ui.out_dir.borrow_mut() = dir;
-    ui.out_auto_drive.set(false);
+    // Recorded here, not only after a conversion. Choosing where output goes
+    // and then closing the window used to lose the choice entirely, because
+    // the only thing that wrote it down was a finished convert - so the answer
+    // was always the last place something was written, never the last place
+    // that was asked for.
     {
         let mut s = ui.settings.borrow_mut();
-        if s.follow_drive {
-            s.follow_drive = false;
+        let changed = s.follow_drive || s.last_output_dir != dir;
+        s.follow_drive = false;
+        s.last_output_dir = dir.clone();
+        if changed {
             let _ = s.save();
         }
     }
+    *ui.out_dir.borrow_mut() = dir;
+    ui.out_auto_drive.set(false);
     refresh_dest_label(ui);
     update_eject_button(ui);
     suggest_name(ui);
@@ -5720,6 +5834,36 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     saving.add(&recents_row);
+
+    let pin_row = adw::SwitchRow::builder()
+        .title("Always start with these")
+        .subtitle(
+            "Open with the destination and output format set now. \
+             Off, the window carries on where it left off.",
+        )
+        .active(current.startup_pinned)
+        .build();
+    {
+        let ui = ui.clone();
+        pin_row.connect_active_notify(move |r| {
+            let on = r.is_active();
+            // Captured at the moment it is switched on, from what is on screen
+            // - which is the only reading of "these" that matches the switch
+            // the user just looked at.
+            let follow = ui.out_auto_drive.get();
+            let dir = ui.out_dir.borrow().clone();
+            let format = ui.output_picker.selected().map(|s| s.to_string());
+            let mut s = ui.settings.borrow_mut();
+            s.startup_pinned = on;
+            if on {
+                s.startup_follow_drive = follow;
+                s.startup_output_dir = dir;
+                s.startup_output_format = format;
+            }
+            let _ = s.save();
+        });
+    }
+    saving.add(&pin_row);
     page.add(&saving);
 
     // Formats. Two groups rather than one, because a format can be readable
@@ -5949,6 +6093,73 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     }
     page.add(&drives_group);
 
+    // Last on the page, because it is the one control here that undoes every
+    // other one and nobody should meet it on the way to something else.
+    let reset_group = adw::PreferencesGroup::builder()
+        .title("Start over")
+        .description("Puts every setting on this page back to how it arrived")
+        .build();
+    let reset_row = adw::ActionRow::builder()
+        .title("Reset all settings")
+        .subtitle("Your files, history and drives are not touched")
+        .build();
+    let reset_btn = gtk::Button::with_label("Reset");
+    reset_btn.add_css_class("destructive-action");
+    reset_btn.set_valign(gtk::Align::Center);
+    {
+        let ui = ui.clone();
+        let container = container.clone();
+        reset_btn.connect_clicked(move |_| {
+            let ask = adw::MessageDialog::builder()
+                .transient_for(&ui.window)
+                .modal(true)
+                .heading("Reset all settings?")
+                .body(
+                    "Every setting on this page goes back to how it arrived. \
+                     Nothing you have converted is affected.",
+                )
+                .build();
+            ask.add_response("cancel", "Cancel");
+            ask.add_response("reset", "Reset");
+            ask.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            ask.set_default_response(Some("cancel"));
+            let ui = ui.clone();
+            let container = container.clone();
+            ask.connect_response(None, move |d, response| {
+                d.close();
+                if response != "reset" {
+                    return;
+                }
+                {
+                    let mut s = ui.settings.borrow_mut();
+                    *s = Settings::default();
+                    let _ = s.save();
+                }
+                // Everything the settings feed, put back by hand: the page is
+                // built once from the values it was given, and so is most of
+                // what it controls.
+                let fresh = ui.settings.borrow().clone();
+                ui.shell.set_animate(fresh.animations);
+                ui.controls_reveal
+                    .set_transition_duration(if fresh.animations { CONTROLS_MS } else { 0 });
+                ui.page_faces
+                    .set_transition_duration(if fresh.animations { MORPH_MS } else { 0 });
+                ui.output_picker.set_hidden(Vec::new());
+                set_out_auto_drive(&ui);
+                refresh_nearby(&ui);
+                while let Some(child) = container.first_child() {
+                    container.remove(&child);
+                }
+                build_settings_page(&ui, &container);
+                ui.toasts
+                    .add_toast(adw::Toast::new("Settings are back to their defaults"));
+            });
+            ask.present();
+        });
+    }
+    reset_row.add_suffix(&reset_btn);
+    reset_group.add(&reset_row);
+
     let about = adw::PreferencesGroup::builder().title("About").build();
     about.add(
         &adw::ActionRow::builder()
@@ -5997,6 +6208,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         )
         .build();
     about.add(&settings_file);
+    page.add(&reset_group);
     page.add(&about);
 
     container.append(&page);
@@ -6017,7 +6229,12 @@ fn restore_session(ui: &Rc<App>) {
         registry::by_id(id).map(|h| h.info().capabilities.writes) == Some(true)
             && !hidden.iter().any(|h| h == id)
     };
-    let chosen = saved.last_output_format.clone().filter(usable).or_else(|| {
+    let remembered = if saved.startup_pinned {
+        saved.startup_output_format.clone()
+    } else {
+        saved.last_output_format.clone()
+    };
+    let chosen = remembered.filter(usable).or_else(|| {
         let mut writable: Vec<_> = registry::writable()
             .into_iter()
             .filter(|i| !hidden.iter().any(|h| h == i.id))
@@ -6029,13 +6246,21 @@ fn restore_session(ui: &Rc<App>) {
         ui.output_picker.set_selected(&id);
     }
 
-    // Following a drive is a standing instruction, so it is restored ahead of
-    // any remembered folder - the folder is only where following happened to
-    // land last time. A remembered folder is restored only if it is still
+    // A pinned answer is what the window opens with, whatever happened last
+    // time. Otherwise it carries on where it left off.
+    //
+    // Following a drive is restored ahead of any remembered folder, because it
+    // is a standing instruction and the folder is only where following
+    // happened to land. A remembered folder is restored only if it is still
     // there.
-    if saved.follow_drive {
+    let (follow, folder) = if saved.startup_pinned {
+        (saved.startup_follow_drive, saved.startup_output_dir.clone())
+    } else {
+        (saved.follow_drive, saved.last_output_dir.clone())
+    };
+    if follow {
         set_out_auto_drive(ui);
-    } else if let Some(dir) = saved.last_output_dir.filter(|d| d.is_dir()) {
+    } else if let Some(dir) = folder.filter(|d| d.is_dir()) {
         set_out_dir(ui, Some(dir));
     } else {
         set_out_dir(ui, None);

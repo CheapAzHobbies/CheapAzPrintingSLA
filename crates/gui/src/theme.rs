@@ -221,6 +221,27 @@ fn sheet(p: &Palette) -> String {
   min-width: 0;
 }}
 
+/* The bin's lid lifts as the pointer arrives. A symbolic icon is one piece,
+   so there is no lid to raise on its own - tipping the whole can reads as the
+   same gesture and needs no artwork that does not exist. */
+.cz-bin image {{
+  transition: -gtk-icon-transform 140ms ease-out;
+}}
+.cz-bin:hover image {{
+  -gtk-icon-transform: rotate(-14deg);
+}}
+
+/* Turns for as long as a scan is running. A drive that has gone to sleep can
+   take seconds to answer, and the question a spinning arrow settles is not
+   "did my press land" but "is it still going". */
+@keyframes cz-turn {{
+  from {{ -gtk-icon-transform: rotate(0deg); }}
+  to {{ -gtk-icon-transform: rotate(360deg); }}
+}}
+.cz-turning image {{
+  animation: cz-turn 900ms linear infinite;
+}}
+
 /* ---- queue ---- */
 .cz-queue > row {{
   border-bottom: 1px solid @cz_border;

@@ -68,6 +68,17 @@ pub struct Settings {
     /// place: choosing it once and finding it forgotten next launch makes it
     /// look like it did not take.
     pub follow_drive: bool,
+    /// Open with a fixed destination and format rather than with whatever was
+    /// last used.
+    ///
+    /// Off by default, because carrying on where you left off is what most
+    /// people mean by a program remembering things. On, for someone whose
+    /// answer is the same every time and who does not want yesterday's
+    /// one-off becoming today's default.
+    pub startup_pinned: bool,
+    pub startup_follow_drive: bool,
+    pub startup_output_dir: Option<PathBuf>,
+    pub startup_output_format: Option<String>,
     /// Extra folders Quick Access looks in, beyond the one the file chooser
     /// starts from.
     pub quick_access_folders: Vec<PathBuf>,
@@ -130,7 +141,13 @@ impl Default for Settings {
             pinned_subfolder: String::new(),
             auto_lock_new_drives: false,
             show_nearby_files: true,
-            follow_drive: false,
+            // Saving to the printer's drive is what this program is for, so
+            // that is where a first run points. Changing it is remembered.
+            follow_drive: true,
+            startup_pinned: false,
+            startup_follow_drive: true,
+            startup_output_dir: None,
+            startup_output_format: None,
             recent_output_shown: 1,
             hidden_input_formats: Vec::new(),
             hidden_output_formats: Vec::new(),
@@ -224,6 +241,18 @@ impl Settings {
         }
         if let Some(v) = map.get("follow_drive") {
             s.follow_drive = v == "true";
+        }
+        if let Some(v) = map.get("startup_pinned") {
+            s.startup_pinned = v == "true";
+        }
+        if let Some(v) = map.get("startup_follow_drive") {
+            s.startup_follow_drive = v == "true";
+        }
+        if let Some(v) = map.get("startup_output_dir") {
+            s.startup_output_dir = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Some(v) = map.get("startup_output_format") {
+            s.startup_output_format = (!v.is_empty()).then(|| v.to_string());
         }
         if let Some(v) = map.get("quick_access_folders") {
             s.quick_access_folders = v
@@ -327,7 +356,11 @@ impl Settings {
              follow_drive = {}\n\
              recent_output_shown = {}\n\
              hidden_input_formats = {}\n\
-             hidden_output_formats = {}\n",
+             hidden_output_formats = {}\n\
+             startup_pinned = {}\n\
+             startup_follow_drive = {}\n\
+             startup_output_dir = {}\n\
+             startup_output_format = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -364,6 +397,13 @@ impl Settings {
             self.recent_output_shown,
             self.hidden_input_formats.join("\x1f"),
             self.hidden_output_formats.join("\x1f"),
+            self.startup_pinned,
+            self.startup_follow_drive,
+            self.startup_output_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            self.startup_output_format.clone().unwrap_or_default(),
         );
         std::fs::write(path, body)
     }
