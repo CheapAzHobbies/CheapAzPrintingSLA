@@ -31,6 +31,25 @@ pub enum Error {
     LayerOutOfRange { index: u32, count: u32 },
 }
 
+impl Error {
+    /// One line saying what went wrong, in the words someone would use to
+    /// describe it to a colleague.
+    ///
+    /// `Display` gives the particulars - byte offsets, expected lengths - and
+    /// those belong in the panel someone opens on purpose. This is for the
+    /// glance: it says which of the handful of things that can go wrong did,
+    /// and nothing else.
+    pub fn headline(&self) -> &'static str {
+        match self {
+            Error::Io { .. } => "This file could not be read from disk",
+            Error::UnknownFormat => "This is not a print file CheapAzSLA knows",
+            Error::UnsupportedConversion { .. } => "This pair of formats cannot be converted",
+            Error::LayerOutOfRange { .. } => "That layer is not in this file",
+            Error::Format(f) => f.headline(),
+        }
+    }
+}
+
 /// A problem with the contents of a print file.
 ///
 /// Input files are untrusted (§42). These variants exist so a malformed file
@@ -75,4 +94,24 @@ pub enum FormatError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl FormatError {
+    /// The same glance-level line, for a problem inside the file rather than
+    /// with the file. Every one of these means the same thing to the person
+    /// holding it - the file is not going to open - so they say what is wrong
+    /// with it without asking anyone to care about offsets.
+    pub fn headline(&self) -> &'static str {
+        match self {
+            FormatError::Truncated { .. } => "This file is incomplete",
+            FormatError::BadMagic => "This file is not the format it claims to be",
+            FormatError::UnsupportedVersion { .. } => "This file is a version not yet supported",
+            FormatError::MissingField(_)
+            | FormatError::InvalidValue { .. }
+            | FormatError::OffsetOutOfBounds { .. }
+            | FormatError::AllocationTooLarge { .. }
+            | FormatError::LayerDecode(_)
+            | FormatError::Other(_) => "This file is damaged and cannot be read",
+        }
+    }
 }

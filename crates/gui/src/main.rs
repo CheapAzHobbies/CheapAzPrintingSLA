@@ -2658,23 +2658,30 @@ fn refresh_nearby(ui: &Rc<App>) {
         };
         keys.push(format!("{name} {}", facts.join(" ")).to_lowercase());
 
+        // The name is carried by a marquee rather than by the row's own title,
+        // so a name too long for the row can be read by hovering it. The title
+        // is left empty and the marquee added as a prefix, which keeps the
+        // row's styling, its padding and its activation while taking over the
+        // one part that needed to move.
         let row = if in_columns {
-            adw::ActionRow::builder()
-                .title(&name)
-                // One line: the name shares the row with the columns, and a
-                // long one wrapping would shove them around.
-                .title_lines(1)
-                .activatable(true)
-                .build()
+            adw::ActionRow::builder().activatable(true).build()
         } else {
             adw::ActionRow::builder()
-                .title(&name)
                 .subtitle(facts.join("  \u{b7}  "))
-                .title_lines(1)
                 .subtitle_lines(1)
                 .activatable(true)
                 .build()
         };
+        // Added in reverse: a prefix goes in ahead of the ones already there,
+        // so the marquee first and the icon second leaves the icon leading.
+        if in_columns {
+            let name = marquee(&name);
+            name.set_margin_start(theme::SPACE_2);
+            row.add_prefix(&name);
+        } else {
+            row.set_title(&name);
+            row.set_title_lines(1);
+        }
         row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
 
         if in_columns {
@@ -3309,12 +3316,116 @@ fn refresh_input_label(ui: &Rc<App>) {
             if f.forced_format.is_some() || ui.compact.get() {
                 name
             } else {
-                format!("{name} (Automatically Detect)")
+                format!("{name} (Detect Automatically)")
             }
+        }
+        // A file that has not been read yet, or could not be. It still has a
+        // setting, and "—" alone said nothing about what that setting was -
+        // the row looked the same whether the format was being worked out or
+        // had been chosen by hand.
+        Some(f) if f.forced_format.is_none() && !ui.compact.get() => {
+            "Detect Automatically".to_string()
         }
         _ => "—".to_string(),
     };
     ui.input_label.set_text(&text);
+}
+
+/// How fast a name slides past, in pixels per second, and the gap left between
+/// the end of one pass and the start of the next.
+const MARQUEE_SPEED: f64 = 46.0;
+const MARQUEE_GAP: i32 = 48;
+
+/// A name that slides itself past a fixed width while the pointer is over it.
+///
+/// Only when it has to. A name that fits does not move, because movement
+/// carrying no information is noise; it is the crushed ones - and only while
+/// they are being looked at - that have something left to say.
+///
+/// At rest it is an ordinary ellipsized label, because the ellipsis is what
+/// says the name is longer than the space. On hover the ellipsis goes, a
+/// second copy of the text appears behind the first, and the pair slides by
+/// exactly one copy's width before starting again - so the loop has no rewind
+/// in it, and a name can be read round and round without waiting.
+fn marquee(text: &str) -> gtk::ScrolledWindow {
+    let first = gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    let second = gtk::Label::builder().label(text).xalign(0.0).build();
+    second.set_visible(false);
+
+    let train = gtk::Box::new(gtk::Orientation::Horizontal, MARQUEE_GAP);
+    train.append(&first);
+    train.append(&second);
+
+    let view = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .child(&train)
+        .build();
+    view.set_overflow(gtk::Overflow::Hidden);
+
+    let running = Rc::new(Cell::new(false));
+    let hover = gtk::EventControllerMotion::new();
+    {
+        let view2 = view.clone();
+        let first = first.clone();
+        let second = second.clone();
+        let running = running.clone();
+        hover.connect_enter(move |_, _, _| {
+            // Nothing to slide if the whole name is already on screen.
+            let wanted = first.measure(gtk::Orientation::Horizontal, -1).1;
+            if wanted <= view2.width() || running.replace(true) {
+                return;
+            }
+            first.set_ellipsize(gtk::pango::EllipsizeMode::None);
+            second.set_visible(true);
+
+            let adj = view2.hadjustment();
+            let lead = first.clone();
+            let running = running.clone();
+            let stop = {
+                let view3 = view2.clone();
+                let first = first.clone();
+                let second = second.clone();
+                move || {
+                    first.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                    second.set_visible(false);
+                    view3.hadjustment().set_value(0.0);
+                }
+            };
+            let last = Cell::new(None::<i64>);
+            view2.add_tick_callback(move |w, clock| {
+                if !running.get() {
+                    stop();
+                    return glib::ControlFlow::Break;
+                }
+                let now = clock.frame_time();
+                let dt = match last.replace(Some(now)) {
+                    Some(previous) => ((now - previous) as f64 / 1e6).clamp(0.0, 0.1),
+                    None => 0.0,
+                };
+                // One copy plus the gap: at that point the second copy is
+                // exactly where the first started, so resetting is invisible.
+                let lap = (lead.width() + MARQUEE_GAP) as f64;
+                if lap <= 1.0 || w.width() == 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                let next = adj.value() + MARQUEE_SPEED * dt;
+                adj.set_value(if next >= lap { next - lap } else { next });
+                glib::ControlFlow::Continue
+            });
+        });
+    }
+    {
+        let running = running.clone();
+        hover.connect_leave(move |_| running.set(false));
+    }
+    view.add_controller(hover);
+    view
 }
 
 /// The list of formats the selected file can be read as (§21).
@@ -3433,8 +3544,14 @@ fn force_input_format(ui: &Rc<App>, format: Option<String>) {
 
 fn read_file(path: &Path, forced: Option<&str>) -> Result<ReadFile, ReadFailure> {
     let facts = remedy::FileFacts::observe(path);
+    // The headline first, then the particulars underneath. What comes back is
+    // shown on hover, where the first line is all anyone reads, and again in
+    // the panel behind it, where the rest is what they came for.
     let explain = |e: cheapazsla_core::Error| -> ReadFailure {
-        (e.to_string(), remedy::for_error(&e, &facts))
+        (
+            format!("{}\n{e}", e.headline()),
+            remedy::for_error(&e, &facts),
+        )
     };
 
     // Detection still runs even when the format is being forced, so the file
@@ -3473,13 +3590,7 @@ fn refresh_queue(ui: &Rc<App>) {
 
         row.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
 
-        let name = gtk::Label::builder()
-            .label(f.name())
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
-        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        row.append(&name);
+        row.append(&marquee(&f.name()));
 
         // Source and target on every row. The output format applies to the
         // whole queue, so without this a file's fate is only visible while it
@@ -3545,11 +3656,17 @@ fn refresh_queue(ui: &Rc<App>) {
                 press.add_css_class("cz-chip-button");
                 press.set_valign(gtk::Align::Center);
                 press.set_width_request(width);
-                press.set_tooltip_text(Some(if failed {
-                    "Show what went wrong"
-                } else {
-                    "Show what to watch for"
-                }));
+                // The reason, on the status itself rather than on every widget
+                // in the row. It used to be on all of them, which meant a
+                // tooltip came up over the file's name as well - and a tooltip
+                // over the name is in the way of reading the name, which is
+                // what hovering there is now for.
+                //
+                // The first line only. That is the plain-words headline; the
+                // particulars behind it are what the panel is for, and for
+                // some failures the two would otherwise say the same thing
+                // twice in a row.
+                press.set_tooltip_text(Some(detail.lines().next().unwrap_or(&detail)));
                 press.set_cursor_from_name(Some("pointer"));
                 let win = ui.window.clone();
                 let heading = if failed {
@@ -3577,12 +3694,6 @@ fn refresh_queue(ui: &Rc<App>) {
         row.append(&remove);
 
         let list_row = gtk::ListBoxRow::builder().child(&row).build();
-        // The reason is on hover, anywhere on the row. GTK resolves a tooltip
-        // against the widget under the pointer, so setting it only on the
-        // container leaves dead spots over every child.
-        if let Some(detail) = f.status.detail() {
-            shell::set_tooltip_deep(&list_row, &detail);
-        }
         ui.queue_list.append(&list_row);
         if i == selected {
             ui.queue_list.select_row(Some(&list_row));
