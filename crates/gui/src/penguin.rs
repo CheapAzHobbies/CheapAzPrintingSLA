@@ -29,11 +29,12 @@ const FRAME_W: u32 = 248;
 const FRAME_H: u32 = 240;
 /// 20fps, the rate the frames were authored at.
 const FRAME_MS: u64 = 50;
-/// And half that while it is only waiting. Slow enough to read as idling
-/// rather than working, and half the drawing of the real thing - which
-/// matters, because waiting can go on all afternoon on a machine that has
-/// better things to do with its afternoon.
-const IDLE_FRAME_MS: u64 = 100;
+/// Waiting runs at the same rate. Half speed was an attempt to save a slow
+/// machine some drawing, and it read as a penguin in treacle - the frames are
+/// timed for one pace and playing them at another looks broken rather than
+/// calm. If this ever needs to cost less, the answer is fewer frames or a
+/// smaller picture, not a slower clock.
+const IDLE_FRAME_MS: u64 = FRAME_MS;
 
 thread_local! {
     /// Sliced once and reused. Decoding the sheet costs a few milliseconds and
@@ -233,12 +234,7 @@ impl Penguin {
         self.run_at(FRAME_MS);
     }
 
-    /// Keep moving, but at half speed: here and waiting, not working.
-    ///
-    /// The difference between waiting and working is carried by the pace
-    /// rather than by stopping, because something frozen reads as something
-    /// broken. Half the frames is also half the drawing, which matters when
-    /// waiting can go on all afternoon.
+    /// Keep moving: here and waiting, rather than stopped and broken-looking.
     ///
     /// `moving` is the animations setting: switched off, it sits on one frame
     /// instead, because someone who has turned animation off has said what
