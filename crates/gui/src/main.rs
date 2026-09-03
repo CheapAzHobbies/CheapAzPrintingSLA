@@ -2387,22 +2387,41 @@ fn reset_dropzone(ui: &Rc<App>) {
 /// inviting files the moment a folder is chosen, because converting one file
 /// by hand is still worth being able to do while WatchDog is running.
 fn refresh_dropzone_text(ui: &Rc<App>) {
-    let (armed, needs_folder) = {
+    let (armed, needs_folder, watching, moving) = {
         let s = ui.settings.borrow();
-        (s.auto_convert, s.auto_convert && s.auto_watch_dir.is_none())
+        (
+            s.auto_convert,
+            s.auto_convert && s.auto_watch_dir.is_none(),
+            s.auto_watch_dir
+                .as_ref()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())),
+            s.animations,
+        )
     };
-    // Sitting there while it waits. It is the answer to "is this thing
-    // actually running", which a line of text answers less convincingly than
-    // something that is plainly present.
+
+    // Moving while it waits. Something frozen reads as something broken, and
+    // the question this answers is whether the thing is alive - so it dances,
+    // slowly, and saves the full pace for when it is actually converting.
     if armed && !needs_folder {
-        ui.watchdog_penguin.rest();
+        ui.watchdog_penguin.idle(moving);
     } else {
         ui.watchdog_penguin.stop();
     }
+
     if needs_folder {
         ui.dropzone_title.set_text("Choose a folder to watch");
         ui.dropzone_sub
             .set_text("WatchDog will convert whatever your slicer leaves there");
+    } else if armed {
+        // Says what it is doing, not what you could do - and then says what
+        // you could do anyway, because dropping a file by hand still works
+        // and a page that stops mentioning it looks like it stopped allowing
+        // it.
+        ui.dropzone_title.set_text("Watching for files");
+        ui.dropzone_sub.set_text(&match &watching {
+            Some(folder) => format!("in {folder} - or drop one here to convert it now"),
+            None => "or drop one here to convert it now".to_string(),
+        });
     } else {
         ui.dropzone_title.set_text("Drop files here");
         ui.dropzone_sub.set_text("or browse your computer");

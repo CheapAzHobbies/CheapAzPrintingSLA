@@ -29,6 +29,11 @@ const FRAME_W: u32 = 248;
 const FRAME_H: u32 = 240;
 /// 20fps, the rate the frames were authored at.
 const FRAME_MS: u64 = 50;
+/// And half that while it is only waiting. Slow enough to read as idling
+/// rather than working, and half the drawing of the real thing - which
+/// matters, because waiting can go on all afternoon on a machine that has
+/// better things to do with its afternoon.
+const IDLE_FRAME_MS: u64 = 100;
 
 thread_local! {
     /// Sliced once and reused. Decoding the sheet costs a few milliseconds and
@@ -225,48 +230,62 @@ impl Penguin {
             return;
         }
         self.widget.set_visible(true);
-        let me = self.clone();
-        let id =
-            gtk::glib::timeout_add_local(std::time::Duration::from_millis(FRAME_MS), move || {
-                let Some(frames) = me.frames.as_ref() else {
-                    return gtk::glib::ControlFlow::Break;
-                };
-                let mut i = me.index.borrow_mut();
-                *i = (*i + 1) % frames.len();
-                me.widget.set_paintable(Some(&frames[*i]));
-                gtk::glib::ControlFlow::Continue
-            });
-        *self.timer.borrow_mut() = Some(id);
+        self.run_at(FRAME_MS);
     }
 
-    /// Sit still and be visible: here, but not working.
+    /// Keep moving, but at half speed: here and waiting, not working.
     ///
-    /// Twenty frames a second forever is not a status light, it is a heater -
-    /// and this program is meant to run on machines somebody is not proud of.
-    /// So waiting is one frame, and only actual work moves.
-    pub fn rest(&self) {
+    /// The difference between waiting and working is carried by the pace
+    /// rather than by stopping, because something frozen reads as something
+    /// broken. Half the frames is also half the drawing, which matters when
+    /// waiting can go on all afternoon.
+    ///
+    /// `moving` is the animations setting: switched off, it sits on one frame
+    /// instead, because someone who has turned animation off has said what
+    /// they think of a dancing penguin.
+    pub fn idle(self: &Rc<Self>, moving: bool) {
+        if self.frames.is_none() {
+            return;
+        }
+        self.halt();
+        if let Some(first) = self.frames.as_ref().and_then(|f| f.first()) {
+            self.widget.set_paintable(Some(first));
+        }
+        self.widget.set_visible(true);
+        if !moving {
+            return;
+        }
+        self.run_at(IDLE_FRAME_MS);
+    }
+
+    /// Cancel whatever is scheduled without hiding anything.
+    fn halt(&self) {
         if let Some(id) = self.pending.borrow_mut().take() {
             id.remove();
         }
         if let Some(id) = self.timer.borrow_mut().take() {
             id.remove();
         }
-        *self.index.borrow_mut() = 0;
-        if let Some(first) = self.frames.as_ref().and_then(|f| f.first()) {
-            self.widget.set_paintable(Some(first));
-            self.widget.set_visible(true);
-        }
+    }
+
+    fn run_at(self: &Rc<Self>, every: u64) {
+        let me = self.clone();
+        let id = gtk::glib::timeout_add_local(std::time::Duration::from_millis(every), move || {
+            let Some(frames) = me.frames.as_ref() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let mut i = me.index.borrow_mut();
+            *i = (*i + 1) % frames.len();
+            me.widget.set_paintable(Some(&frames[*i]));
+            gtk::glib::ControlFlow::Continue
+        });
+        *self.timer.borrow_mut() = Some(id);
     }
 
     pub fn stop(&self) {
         // Cancelling before it is shown is the common case, and the point:
         // the work finished quickly and nothing should have appeared.
-        if let Some(id) = self.pending.borrow_mut().take() {
-            id.remove();
-        }
-        if let Some(id) = self.timer.borrow_mut().take() {
-            id.remove();
-        }
+        self.halt();
         self.widget.set_visible(false);
         *self.index.borrow_mut() = 0;
     }
