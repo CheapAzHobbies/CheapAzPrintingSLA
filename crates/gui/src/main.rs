@@ -289,6 +289,10 @@ struct App {
     history_ticks: RefCell<Vec<gtk::CheckButton>>,
     /// Held so the folder monitor outlives the function that made it.
     auto_watch: RefCell<Option<gio::FileMonitor>>,
+    /// The two places automatic mode announces itself: a badge in the title
+    /// bar, visible from anywhere, and a banner over the work it is doing.
+    auto_badge: gtk::Button,
+    auto_banner: adw::Banner,
     /// Files seen but not yet finished being written.
     auto_settling: RefCell<Vec<auto::Settling>>,
     /// Files ready to convert, and whether one is being converted now.
@@ -418,7 +422,27 @@ fn build(app: &adw::Application) -> Rc<App> {
     let palette_btn = shell::icon_button("system-search-symbolic", "Commands  (Ctrl+K)");
     header.pack_start(&palette_btn);
 
+    // Automatic mode showing in the title bar, so it is visible from every
+    // page and not only from the one it happens to act on. A mode that does
+    // things by itself and looks exactly like the mode that does not is the
+    // worst of both: the whole point of the indicator is that nobody should
+    // ever wonder which one they are in.
+    let auto_badge = gtk::Button::builder()
+        .child(&labelled_icon("emblem-synchronizing-symbolic", "Automatic"))
+        .tooltip_text("Automatic mode is on. Press to see what it is doing.")
+        .visible(false)
+        .build();
+    auto_badge.add_css_class("cz-armed");
+    header.pack_end(&auto_badge);
+
     // --- convert page -----------------------------------------------------
+    // Says what automatic mode is doing, over the page it is doing it to, with
+    // the way to stop it in the same strip. Told, not hidden in Settings.
+    let auto_banner = adw::Banner::builder()
+        .revealed(false)
+        .button_label("Turn Off")
+        .build();
+
     let (dropzone, dropzone_title, dropzone_formats) = build_dropzone();
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
@@ -562,6 +586,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     let (problem, problem_label) = build_problem_bar();
 
     let convert_page = build_convert_page(
+        &auto_banner,
         &dropzone,
         &nearby_panel,
         &queue_panel,
@@ -711,6 +736,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         history_ticks: RefCell::new(Vec::new()),
         overwrite_switch: RefCell::new(None),
         auto_watch: RefCell::new(None),
+        auto_badge: auto_badge.clone(),
+        auto_banner: auto_banner.clone(),
         auto_settling: RefCell::new(Vec::new()),
         auto_queue: RefCell::new(std::collections::VecDeque::new()),
         auto_busy: Cell::new(false),
@@ -1522,6 +1549,7 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
 
 #[allow(clippy::too_many_arguments)]
 fn build_convert_page(
+    auto_banner: &adw::Banner,
     dropzone: &gtk::Box,
     nearby: &gtk::Box,
     queue_panel: &gtk::Box,
@@ -1546,6 +1574,7 @@ fn build_convert_page(
     gtk::Stack,
 ) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
+    content.append(auto_banner);
 
     // The drop zone and the queue are two faces of the same place, so they are
     // two pages of a stack rather than two widgets taking turns at being
@@ -2010,6 +2039,34 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         let ui2 = ui.clone();
         ui.nearby_search
             .connect_icon_release(move |_, _| ui2.nearby_search.set_text(""));
+    }
+
+    {
+        // Straight to the section that explains it and can stop it.
+        let ui2 = ui.clone();
+        ui.auto_badge
+            .connect_clicked(move |_| ui2.shell.show(Section::Settings));
+    }
+    {
+        let ui2 = ui.clone();
+        ui.auto_banner.connect_button_clicked(move |_| {
+            let unfinished = {
+                let s = ui2.settings.borrow();
+                s.auto_watch_dir.is_none() || s.auto_target_uuid.is_none()
+            };
+            if unfinished {
+                ui2.shell.show(Section::Settings);
+                return;
+            }
+            {
+                let mut s = ui2.settings.borrow_mut();
+                s.auto_convert = false;
+                let _ = s.save();
+            }
+            rearm_auto(&ui2);
+            ui2.toasts
+                .add_toast(adw::Toast::new("Automatic mode is off"));
+        });
     }
 
     build_sources_menu(ui, &ui.nearby_sources.clone());
@@ -2618,12 +2675,63 @@ fn choose_scan_folder(ui: &Rc<App>) {
     );
 }
 
+/// Say, on screen, whether automatic mode is running and what it will do.
+///
+/// Two places, on purpose. The badge in the title bar is there from every page
+/// so the answer to "is this thing armed" never needs looking for. The banner
+/// is over the Convert page, where the files it acts on appear, and it spells
+/// out the whole sentence - which folder, which format, which drive - because
+/// a light that says only "on" leaves the reader to guess at the rest.
+fn refresh_auto_indicator(ui: &Rc<App>) {
+    let (on, dir, to, target) = {
+        let s = ui.settings.borrow();
+        (
+            s.auto_convert,
+            s.auto_watch_dir.clone(),
+            s.auto_to_format.clone(),
+            s.auto_target_label.clone(),
+        )
+    };
+    ui.auto_badge.set_visible(on);
+    ui.auto_banner.set_revealed(on);
+    if !on {
+        return;
+    }
+
+    let where_ = dir
+        .as_ref()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "a folder you have not chosen yet".into());
+    let format = registry::by_id(&to)
+        .map(|h| h.info().name.to_string())
+        .unwrap_or_else(|| to.to_uppercase());
+    let onto = match &target {
+        Some(label) => format!("for {label}"),
+        None => "but no drive is chosen, so they will wait".into(),
+    };
+    ui.auto_banner.set_title(&format!(
+        "Watching {where_}. New files become {format} {onto}."
+    ));
+
+    // A setup that is switched on but cannot work says so with its button
+    // rather than with a colour. Two tints of the same accent are not a
+    // distinction anyone can read at a glance, and "Finish Setup" is a better
+    // answer than a shade anyway: it says what is wrong and goes there.
+    ui.auto_banner
+        .set_button_label(Some(if dir.is_none() || target.is_none() {
+            "Finish Setup"
+        } else {
+            "Turn Off"
+        }));
+}
+
 /// Start or stop watching the folder that automatic mode reads.
 ///
 /// A folder monitor rather than a timer: the interesting moment is a slicer
 /// finishing an export, and asking the filesystem to say when that happens
 /// costs nothing while nothing is happening.
 fn rearm_auto(ui: &Rc<App>) {
+    refresh_auto_indicator(ui);
     *ui.auto_watch.borrow_mut() = None;
     ui.auto_settling.borrow_mut().clear();
     ui.auto_queue.borrow_mut().clear();

@@ -262,6 +262,14 @@ fn sheet(p: &Palette) -> String {
   animation: cz-turn 900ms linear infinite;
 }}
 
+/* Automatic mode's badge. Tinted rather than shouted: it has to be noticed
+   without becoming the loudest thing in a window that is mostly not about it. */
+.cz-armed {{
+  background-color: alpha(@cz_accent, 0.18);
+  color: @cz_accent;
+}}
+.cz-armed:hover {{ background-color: alpha(@cz_accent, 0.28); }}
+
 /* ---- queue ---- */
 .cz-queue > row {{
   border-bottom: 1px solid @cz_border;
