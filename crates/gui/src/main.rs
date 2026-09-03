@@ -890,6 +890,11 @@ fn show_about(parent: &adw::ApplicationWindow) {
     );
     for (title, subtitle, url) in [
         (
+            "Licence",
+            "GNU GPL v3 or later — free to use, change and share, and it cannot be closed up and sold",
+            "https://www.gnu.org/licenses/gpl-3.0.html",
+        ),
+        (
             "Project on GitHub",
             "github.com/CheapAzHobbies/CheapAzPrintingSLA",
             "https://github.com/CheapAzHobbies/CheapAzPrintingSLA",
@@ -5673,21 +5678,69 @@ fn ago(when: u64) -> String {
 /// no help at all in finding it. Closed, the page is its own table of
 /// contents; a heading is a small enough thing to read that a reader can pick
 /// the one they want without reading anything else.
-fn settings_section(title: &str, subtitle: &str) -> (adw::PreferencesGroup, adw::ExpanderRow) {
+fn settings_section(
+    found: &mut Vec<SettingsSection>,
+    title: &str,
+    subtitle: &str,
+    keywords: &str,
+) -> adw::ExpanderRow {
     let group = adw::PreferencesGroup::new();
     let row = adw::ExpanderRow::builder()
         .title(title)
         .subtitle(subtitle)
         .build();
     group.add(&row);
-    (group, row)
+    found.push(SettingsSection {
+        group,
+        row: row.clone(),
+        terms: format!("{title} {subtitle} {keywords}").to_lowercase(),
+    });
+    row
+}
+
+/// A section of the settings page, and the words that find it.
+///
+/// The words are written out rather than scraped off the labels, because what
+/// someone types is what they call the thing and not what the page happens to
+/// call it. Nothing on the Drives section says "USB" and nothing on Converting
+/// says "overwrite", and those are the first words anyone would reach for.
+struct SettingsSection {
+    group: adw::PreferencesGroup,
+    row: adw::ExpanderRow,
+    terms: String,
+}
+
+/// Show the sections matching what has been typed, and open them.
+///
+/// Opening them is the point. A search that only narrowed the list would leave
+/// the reader to find the heading, open it, and then look for the setting
+/// inside; the whole reason to type is to be shown the thing itself.
+fn filter_settings(sections: &[SettingsSection], typed: &str) {
+    let needle = typed.trim().to_lowercase();
+    for section in sections {
+        if needle.is_empty() {
+            section.group.set_visible(true);
+            section.row.set_expanded(false);
+            continue;
+        }
+        let hit = needle
+            .split_whitespace()
+            .all(|word| section.terms.contains(word));
+        section.group.set_visible(hit);
+        section.row.set_expanded(hit);
+    }
 }
 
 fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     let page = adw::PreferencesPage::new();
+    let mut sections: Vec<SettingsSection> = Vec::new();
 
-    let (conversion_group, conversion) =
-        settings_section("Converting", "Checks to run before a file is written");
+    let conversion = settings_section(
+        &mut sections,
+        "Converting",
+        "Checks to run before a file is written",
+        "warn overwrite replace lose information confirm quality",
+    );
     let current = ui.settings.borrow().clone();
 
     let warn = adw::SwitchRow::builder()
@@ -5719,10 +5772,13 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     conversion.add_row(&overwrite);
-    page.add(&conversion_group);
 
-    let (appearance_group, appearance) =
-        settings_section("Appearance", "How the window looks and moves");
+    let appearance = settings_section(
+        &mut sections,
+        "Appearance",
+        "How the window looks and moves",
+        "animation animate motion speed slide",
+    );
     let animate = adw::SwitchRow::builder()
         .title("Animations")
         .subtitle("Menus and pages slide. Turn off and they change instantly.")
@@ -5743,11 +5799,12 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     appearance.add_row(&animate);
-    page.add(&appearance_group);
 
-    let (opening_group, opening) = settings_section(
+    let opening = settings_section(
+        &mut sections,
         "Opening files",
-        "Where the file chooser starts, and what Quick Access offers",
+        "Where browsing starts, and what Quick Access lists",
+        "quick access browse default folder rows scroll columns details removed places",
     );
     let open_row = adw::ActionRow::builder()
         .title("Default folder")
@@ -5893,7 +5950,6 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     opening.add_row(&layout_row);
-    page.add(&opening_group);
 
     // A removed folder can be added again through the picker; a removed drive
     // is only ever offered because it is attached, so without this there would
@@ -5928,9 +5984,11 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         opening.add_row(&row);
     }
 
-    let (saving_group, saving) = settings_section(
+    let saving = settings_section(
+        &mut sections,
         "Saving files",
-        "What the Save to menu offers, and in what order",
+        "What the Save to menu lists, and in what order",
+        "save to destination output recent folders startup launch default",
     );
     let recents_row = adw::SpinRow::builder()
         .title("Recent folders to list")
@@ -5983,40 +6041,30 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     saving.add_row(&pin_row);
-    page.add(&saving_group);
 
-    // Formats. Two groups rather than one, because a format can be readable
-    // and writable and switching it off in one direction is not a statement
-    // about the other: someone who receives .ctb files but never writes them
-    // wants it in the first list and not the second.
-    let formats_group = adw::PreferencesGroup::builder()
-        .title("Formats")
-        .description(
-            "Turn off the ones you never use to keep the menus short. Nothing is lost: \
-             a file in a format you switched off still opens if you pick it yourself.",
-        )
-        .build();
-
-    for (title, subtitle, listed, hidden_now, writing) in [
+    // Two sections rather than one heading over two lists. Being readable and
+    // being writable are separate facts - receiving .ctb files without ever
+    // writing them is a real position to be in - and as sections of their own
+    // they can be searched for separately as well.
+    for (title, subtitle, listed, hidden_now, writing, keywords) in [
         (
-            "Opens",
-            "Which formats show up when picking a file to read",
+            "Formats it opens",
+            "Turn off the ones you never read. Nothing is lost - you can still pick one by hand.",
             registry::readable(),
             current.hidden_input_formats.clone(),
             false,
+            "input read import sl1 goo ctb phz uvj hide menu",
         ),
         (
-            "Saves as",
-            "Which formats show up in the output menu",
+            "Formats it saves",
+            "Turn off the ones you never write, to keep the output menu short",
             registry::writable(),
             current.hidden_output_formats.clone(),
             true,
+            "output write export sl1 goo ctb phz uvj hide menu",
         ),
     ] {
-        let expander = adw::ExpanderRow::builder()
-            .title(title)
-            .subtitle(subtitle)
-            .build();
+        let expander = settings_section(&mut sections, title, subtitle, keywords);
         let mut sorted = listed;
         sorted.sort_by_key(|i| i.name.to_lowercase());
         for info in sorted {
@@ -6048,13 +6096,13 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             });
             expander.add_row(&row);
         }
-        formats_group.add(&expander);
     }
-    page.add(&formats_group);
 
-    let (drives_group, drives) = settings_section(
+    let drives = settings_section(
+        &mut sections,
         "Drives",
         "USB drives and SD cards, and where files go on them",
+        "usb sd card stick removable eject pin pinned subfolder mount",
     );
     let sub_row = adw::EntryRow::builder()
         .title("Folder to save into on a drive")
@@ -6211,14 +6259,15 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         row.set_activatable_widget(Some(&pin));
         drives.add_row(&row);
     }
-    page.add(&drives_group);
 
     // Last on the page, because it is the one control here that undoes every
     // other one and nobody should meet it on the way to something else.
-    let reset_group = adw::PreferencesGroup::builder()
-        .title("Start over")
-        .description("Put everything on this page back to how it came")
-        .build();
+    let reset_section = settings_section(
+        &mut sections,
+        "Start over",
+        "Put everything on this page back to how it came",
+        "reset defaults factory clear wipe",
+    );
     let reset_row = adw::ActionRow::builder()
         .title("Reset all settings")
         .subtitle("Only settings. Your files, history and drives are untouched.")
@@ -6278,10 +6327,14 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     reset_row.add_suffix(&reset_btn);
-    reset_group.add(&reset_row);
+    reset_section.add_row(&reset_row);
 
-    let (about_group, about) =
-        settings_section("About", "Version, formats, and where the code lives");
+    let about = settings_section(
+        &mut sections,
+        "About",
+        "Version, formats, and where the code lives",
+        "version licence license gpl open source github copyright",
+    );
     about.add_row(
         &adw::ActionRow::builder()
             .title("CheapAzSLA")
@@ -6308,6 +6361,24 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             .subtitle(formats.join("\n"))
             .build(),
     );
+    let licence = adw::ActionRow::builder()
+        .title("Licence")
+        .subtitle(
+            "GNU GPL v3 or later. Free to use, change and share - and anyone who \
+             shares it has to share the source too, so it cannot be turned into a \
+             paid, closed program.",
+        )
+        .activatable(true)
+        .build();
+    licence.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
+    licence.connect_activated(|_| {
+        let _ = gio::AppInfo::launch_default_for_uri(
+            "https://www.gnu.org/licenses/gpl-3.0.html",
+            gio::AppLaunchContext::NONE,
+        );
+    });
+    about.add_row(&licence);
+
     let repo = adw::ActionRow::builder()
         .title("Source code")
         .subtitle("github.com/CheapAzHobbies/CheapAzPrintingSLA")
@@ -6329,9 +6400,38 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         )
         .build();
     about.add_row(&settings_file);
-    page.add(&reset_group);
-    page.add(&about_group);
 
+    // Added at the end, in the order they were made, so the page reads the way
+    // it always has and only the search knows there is a list of them.
+    for section in &sections {
+        page.add(&section.group);
+    }
+
+    // The search sits above the page rather than in it, because a field that
+    // scrolls away with the thing it is filtering is no use once you have
+    // scrolled.
+    let find = gtk::SearchEntry::new();
+    find.set_placeholder_text(Some("Search settings"));
+    find.set_margin_start(theme::SPACE_5);
+    find.set_margin_end(theme::SPACE_5);
+    find.set_margin_top(theme::SPACE_4);
+    let sections = Rc::new(sections);
+    {
+        let sections = sections.clone();
+        find.connect_search_changed(move |e| filter_settings(&sections, &e.text()));
+    }
+    // Cleared when the page is left and come back to, so it never opens
+    // already filtered by something typed a week ago.
+    {
+        let find = find.clone();
+        let sections = sections.clone();
+        container.connect_map(move |_| {
+            find.set_text("");
+            filter_settings(&sections, "");
+        });
+    }
+
+    container.append(&find);
     container.append(&page);
 }
 
