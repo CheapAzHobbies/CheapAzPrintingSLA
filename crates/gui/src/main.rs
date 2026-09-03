@@ -145,6 +145,16 @@ struct App {
     nearby_sources: gtk::MenuButton,
     /// Holds the list at whatever height the animation is currently on.
     nearby_clip: gtk::ScrolledWindow,
+    /// Filters the rows already on screen. Never triggers a rescan: it is for
+    /// finding a file among the ones offered, not for looking harder.
+    nearby_search: gtk::SearchEntry,
+    /// The strip the search box sits in, held so it can be taken out of the
+    /// expander again when there are too few files to be worth searching.
+    nearby_search_row: gtk::Box,
+    nearby_search_shown: Cell<bool>,
+    /// What the expander says when nothing is being searched for, so the count
+    /// can be put back when the box is cleared.
+    nearby_subtitle: RefCell<String>,
     /// Where that height is now, where it is heading, and whether a tick
     /// callback is already walking it there.
     /// Height of the expander's own row, remembered while the list is shut so
@@ -317,7 +327,14 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
-    let (nearby_panel, nearby_expander, nearby_sources, nearby_clip) = build_nearby_panel();
+    let (
+        nearby_panel,
+        nearby_expander,
+        nearby_sources,
+        nearby_clip,
+        nearby_search,
+        nearby_search_row,
+    ) = build_nearby_panel();
     let queue_list = gtk::ListBox::new();
     queue_list.set_selection_mode(gtk::SelectionMode::Single);
     queue_list.add_css_class("cz-queue");
@@ -523,6 +540,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_panel: nearby_panel.clone(),
         nearby_expander,
         nearby_clip,
+        nearby_search,
+        nearby_search_row,
+        nearby_search_shown: Cell::new(false),
+        nearby_subtitle: RefCell::new(String::new()),
         nearby_head: Cell::new(0),
         nearby_cap: Rc::new(Cell::new(-1)),
         nearby_h: Rc::new(Cell::new(0.0)),
@@ -1037,6 +1058,21 @@ fn wire_responsive(ui: &Rc<App>) {
     }
 }
 
+/// Draw a protection lock as the state it is in, not as the thing it does.
+///
+/// A padlock that looks identical locked and unlocked says nothing, and this
+/// one guards whether a drive can be ejected at all - worth being able to read
+/// at a glance rather than by hovering.
+fn show_lock(button: &gtk::ToggleButton) {
+    if button.is_active() {
+        button.set_icon_name("changes-prevent-symbolic");
+        button.set_tooltip_text(Some("Locked: this drive will not be ejected"));
+    } else {
+        button.set_icon_name("changes-allow-symbolic");
+        button.set_tooltip_text(Some("Unlocked: this drive can be ejected"));
+    }
+}
+
 /// An icon and a label side by side, for buttons that deserve both (§6).
 fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
@@ -1068,6 +1104,8 @@ fn build_nearby_panel() -> (
     adw::ExpanderRow,
     gtk::MenuButton,
     gtk::ScrolledWindow,
+    gtk::SearchEntry,
+    gtk::Box,
 ) {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     panel.set_visible(false);
@@ -1113,7 +1151,19 @@ fn build_nearby_panel() -> (
     clip.set_child(Some(&list));
     panel.append(&clip);
 
-    (panel, expander, folder, clip)
+    // Offered only once the list is long enough to scroll, and added to the
+    // expander then. A search box above four files is furniture.
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Search these files"));
+    search.set_hexpand(true);
+    let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    search_row.set_margin_top(theme::SPACE_2);
+    search_row.set_margin_bottom(theme::SPACE_2);
+    search_row.set_margin_start(theme::SPACE_2);
+    search_row.set_margin_end(theme::SPACE_2);
+    search_row.append(&search);
+
+    (panel, expander, folder, clip, search, search_row)
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -1686,6 +1736,14 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
 
     // Choosing where the suggestions come from, at the point they are shown
     // rather than buried in Settings.
+    {
+        let ui2 = ui.clone();
+        ui.nearby_search.connect_search_changed(move |_| {
+            apply_nearby_filter(&ui2);
+            animate_nearby_height(&ui2, ui2.nearby_clip.height());
+        });
+    }
+
     build_sources_menu(ui, &ui.nearby_sources.clone());
 
     // Opening the list has to be caught as well as refreshing it. The expander
@@ -2249,6 +2307,9 @@ fn refresh_nearby(ui: &Rc<App>) {
     for row in ui.nearby_rows.borrow_mut().drain(..) {
         ui.nearby_expander.remove(&row);
     }
+    if ui.nearby_search_shown.replace(false) {
+        ui.nearby_expander.remove(&ui.nearby_search_row);
+    }
 
     if !ui.settings.borrow().show_nearby_files {
         ui.nearby_panel.set_visible(false);
@@ -2279,11 +2340,13 @@ fn refresh_nearby(ui: &Rc<App>) {
             .filter(|s| s.enabled)
             .map(|s| s.label.clone())
             .collect();
-        ui.nearby_expander.set_subtitle(&if on.is_empty() {
+        let said = if on.is_empty() {
             "Nothing selected to look in".to_string()
         } else {
             format!("Nothing to convert in {}", on.join(", "))
-        });
+        };
+        ui.nearby_expander.set_subtitle(&said);
+        *ui.nearby_subtitle.borrow_mut() = said;
 
         // An empty list that only says "empty" leaves the user to work out
         // that the fix is behind the folder button. When nothing is selected
@@ -2334,8 +2397,19 @@ fn refresh_nearby(ui: &Rc<App>) {
         1 => "1 file".to_string(),
         n => format!("{n} files"),
     };
-    ui.nearby_expander
-        .set_subtitle(&format!("{count} in {}", places.join(", ")));
+    let said = format!("{count} in {}", places.join(", "));
+    ui.nearby_expander.set_subtitle(&said);
+    *ui.nearby_subtitle.borrow_mut() = said;
+
+    // Added before the files so it sits above them, and only once there are
+    // more of them than fit: below that the whole list is already on screen
+    // and a search box is furniture.
+    if found.len() > ui.settings.borrow().quick_access_visible as usize {
+        ui.nearby_expander.add_row(&ui.nearby_search_row);
+        ui.nearby_search_shown.set(true);
+    } else {
+        ui.nearby_search.set_text("");
+    }
 
     for item in found {
         let row = adw::ActionRow::builder()
@@ -2386,6 +2460,9 @@ fn refresh_nearby(ui: &Rc<App>) {
         ui.nearby_rows.borrow_mut().push(row);
     }
     ui.nearby_panel.set_visible(true);
+    // A rebuild makes every row visible again; whatever is in the search box
+    // still applies to them.
+    apply_nearby_filter(ui);
     animate_nearby_height(ui, was);
 }
 
@@ -2455,17 +2532,67 @@ fn nearby_rest(ui: &Rc<App>, for_width: i32) -> (i32, i32) {
         return (natural, -1);
     };
     let limit = ui.settings.borrow().quick_access_visible as usize;
-    let shown: i32 = rows
+    // Only the rows actually on screen. A search that hides four of seven
+    // files should shrink the list, not leave it holding room for them.
+    let on: Vec<&adw::ActionRow> = rows.iter().filter(|r| r.is_visible()).collect();
+    let shown: i32 = on
         .iter()
         .take(limit)
         .map(|r| r.measure(gtk::Orientation::Vertical, for_width).1)
         .sum();
-    let height = head + shown;
-    if rows.len() > limit {
+    // The search strip is measured through its list row, which carries the
+    // padding the strip itself knows nothing about.
+    let search = if ui.nearby_search_shown.get() {
+        let w = ui
+            .nearby_search_row
+            .parent()
+            .unwrap_or_else(|| ui.nearby_search_row.clone().upcast());
+        w.measure(gtk::Orientation::Vertical, for_width).1
+    } else {
+        0
+    };
+    let height = head + search + shown;
+    if on.len() > limit {
         (height, height)
     } else {
         (height, -1)
     }
+}
+
+/// Show only the rows matching what has been typed, and say so.
+///
+/// Filtering never rescans. The rows are already built and the question is
+/// which of them the user wants to look at, so this is a visibility pass and
+/// a subtitle, nothing more.
+fn apply_nearby_filter(ui: &Rc<App>) {
+    let typed = ui.nearby_search.text().trim().to_string();
+    let needle = typed.to_lowercase();
+    let rows = ui.nearby_rows.borrow();
+    let total = rows.len();
+    let mut hits = 0;
+    for row in rows.iter() {
+        // The subtitle counts too: it carries the format and the drive the
+        // file came from, which is how you would say what you are after.
+        let hit = needle.is_empty()
+            || row.title().to_lowercase().contains(&needle)
+            || row
+                .subtitle()
+                .is_some_and(|t| t.to_lowercase().contains(&needle));
+        row.set_visible(hit);
+        if hit {
+            hits += 1;
+        }
+    }
+    drop(rows);
+
+    let said = if typed.is_empty() {
+        ui.nearby_subtitle.borrow().clone()
+    } else if hits == 0 {
+        format!("Nothing here matches \u{201c}{typed}\u{201d}")
+    } else {
+        format!("{hits} of {total} match \u{201c}{typed}\u{201d}")
+    };
+    ui.nearby_expander.set_subtitle(&said);
 }
 
 /// Hold the list at one height, whatever its contents now measure.
@@ -4767,19 +4894,27 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
                 )
             })
             .unwrap_or_else(|| d.path.display().to_string());
-        let row = adw::SwitchRow::builder()
+        // An action row with the switch added by hand rather than a switch
+        // row. A switch row owns its switch and puts it first among the
+        // suffixes, so anything else added lands to the right of it and pushes
+        // it in off the edge the other switches on the page line up on.
+        let row = adw::ActionRow::builder()
             .title(&d.name)
             .subtitle(&space)
-            .active(current.is_pinned(&d.name))
             .build();
         row.add_prefix(&gtk::Image::from_icon_name(if d.removable {
             "drive-removable-media-symbolic"
         } else {
             "drive-harddisk-symbolic"
         }));
+        let pin = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .active(current.is_pinned(&d.name))
+            .tooltip_text("Offer this drive in the Save to menu")
+            .build();
         let ui2 = ui.clone();
         let name = d.name.clone();
-        row.connect_active_notify(move |r| {
+        pin.connect_active_notify(move |r| {
             let mut s = ui2.settings.borrow_mut();
             if r.is_active() {
                 s.pin_volume(&name);
@@ -4803,12 +4938,11 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             // The lock is what makes the blacklist reachable: a drive you
             // never want ejected is marked here rather than in a text file.
             let lock = gtk::ToggleButton::builder()
-                .icon_name("changes-prevent-symbolic")
-                .tooltip_text("Protect this drive from being ejected")
                 .valign(gtk::Align::Center)
                 .active(protected)
                 .build();
             lock.add_css_class("flat");
+            show_lock(&lock);
             {
                 let ui = ui.clone();
                 let name = d.name.clone();
@@ -4822,6 +4956,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
                         }
                         let _ = s.save();
                     }
+                    show_lock(b);
                     eject.set_visible(!b.is_active());
                 });
             }
@@ -4855,6 +4990,9 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             });
             row.add_suffix(&eject);
         }
+        // Last, so it sits where every other switch on the page sits.
+        row.add_suffix(&pin);
+        row.set_activatable_widget(Some(&pin));
         drives_group.add(&row);
     }
     page.add(&drives_group);
