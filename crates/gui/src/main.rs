@@ -1243,6 +1243,8 @@ fn build_nearby_panel() -> NearbyPanel {
     let refresh = shell::icon_button("view-refresh-symbolic", "Scan again for files");
     refresh.set_widget_name("nearby-refresh");
     refresh.set_valign(gtk::Align::Center);
+    refresh.add_css_class("cz-refresh");
+    expander.add_suffix(&refresh);
     // Search lives in the header rather than in a row of its own, because a
     // row of its own is a row of the list spent on something that is not a
     // file.
@@ -5588,13 +5590,28 @@ fn ago(when: u64) -> String {
 // settings page
 // ---------------------------------------------------------------------------
 
+/// A settings section that starts closed.
+///
+/// The page had grown to seven headings of switches, all open, all the time -
+/// which is a lot to scroll past to reach the one thing being looked for, and
+/// no help at all in finding it. Closed, the page is its own table of
+/// contents; a heading is a small enough thing to read that a reader can pick
+/// the one they want without reading anything else.
+fn settings_section(title: &str, subtitle: &str) -> (adw::PreferencesGroup, adw::ExpanderRow) {
+    let group = adw::PreferencesGroup::new();
+    let row = adw::ExpanderRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .build();
+    group.add(&row);
+    (group, row)
+}
+
 fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     let page = adw::PreferencesPage::new();
 
-    let conversion = adw::PreferencesGroup::builder()
-        .title("Conversion")
-        .description("What CheapAzSLA checks before writing a file")
-        .build();
+    let (conversion_group, conversion) =
+        settings_section("Conversion", "What CheapAzSLA checks before writing a file");
     let current = ui.settings.borrow().clone();
 
     let warn = adw::SwitchRow::builder()
@@ -5610,7 +5627,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    conversion.add(&warn);
+    conversion.add_row(&warn);
 
     let overwrite = adw::SwitchRow::builder()
         .title("Confirm before replacing a file")
@@ -5625,10 +5642,10 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    conversion.add(&overwrite);
-    page.add(&conversion);
+    conversion.add_row(&overwrite);
+    page.add(&conversion_group);
 
-    let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+    let (appearance_group, appearance) = settings_section("Appearance", "How the window moves");
     let animate = adw::SwitchRow::builder()
         .title("Animate the interface")
         .subtitle("The sidebar folding and pages changing. Off, they happen at once")
@@ -5648,13 +5665,13 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    appearance.add(&animate);
-    page.add(&appearance);
+    appearance.add_row(&animate);
+    page.add(&appearance_group);
 
-    let opening = adw::PreferencesGroup::builder()
-        .title("Opening files")
-        .description("Where the file chooser starts")
-        .build();
+    let (opening_group, opening) = settings_section(
+        "Opening files",
+        "Where the file chooser starts, and what Quick Access offers",
+    );
     let open_row = adw::ActionRow::builder()
         .title("Default folder")
         .subtitle(
@@ -5705,7 +5722,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     }
     open_row.add_suffix(&choose);
     open_row.add_suffix(&reset);
-    opening.add(&open_row);
+    opening.add_row(&open_row);
 
     let nearby_row = adw::SwitchRow::builder()
         .title("Quick Access list")
@@ -5726,7 +5743,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             refresh_nearby(&ui);
         });
     }
-    opening.add(&nearby_row);
+    opening.add_row(&nearby_row);
 
     let visible_row = adw::SpinRow::builder()
         .title("Files shown at once")
@@ -5751,7 +5768,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             refresh_nearby(&ui);
         });
     }
-    opening.add(&visible_row);
+    opening.add_row(&visible_row);
 
     let layout_row = adw::ComboRow::builder()
         .title("File details")
@@ -5773,8 +5790,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             refresh_nearby(&ui);
         });
     }
-    opening.add(&layout_row);
-    page.add(&opening);
+    opening.add_row(&layout_row);
+    page.add(&opening_group);
 
     // A removed folder can be added again through the picker; a removed drive
     // is only ever offered because it is attached, so without this there would
@@ -5806,13 +5823,13 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             });
         }
         row.add_suffix(&restore);
-        opening.add(&row);
+        opening.add_row(&row);
     }
 
-    let saving = adw::PreferencesGroup::builder()
-        .title("Saving files")
-        .description("What the Save to menu offers, and in what order")
-        .build();
+    let (saving_group, saving) = settings_section(
+        "Saving files",
+        "What the Save to menu offers, and in what order",
+    );
     let recents_row = adw::SpinRow::builder()
         .title("Recent folders offered")
         .subtitle("Beyond the drive and beside the original, which are always there")
@@ -5833,7 +5850,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    saving.add(&recents_row);
+    saving.add_row(&recents_row);
 
     let pin_row = adw::SwitchRow::builder()
         .title("Always start with these")
@@ -5863,8 +5880,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    saving.add(&pin_row);
-    page.add(&saving);
+    saving.add_row(&pin_row);
+    page.add(&saving_group);
 
     // Formats. Two groups rather than one, because a format can be readable
     // and writable and switching it off in one direction is not a statement
@@ -5934,13 +5951,10 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     }
     page.add(&formats_group);
 
-    let drives_group = adw::PreferencesGroup::builder()
-        .title("Drives")
-        .description(
-            "Pinned drives appear in the Save to menu. They are remembered by name, \
-             so they still work when the mount point changes.",
-        )
-        .build();
+    let (drives_group, drives) = settings_section(
+        "Drives",
+        "Pinned drives appear in the Save to menu, remembered by name",
+    );
     let sub_row = adw::EntryRow::builder()
         .title("Subfolder on pinned drives")
         .build();
@@ -5953,7 +5967,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    drives_group.add(&sub_row);
+    drives.add_row(&sub_row);
 
     let follow_row = adw::SwitchRow::builder()
         .title("Follow new drives")
@@ -5968,11 +5982,11 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             let _ = s.save();
         });
     }
-    drives_group.add(&follow_row);
+    drives.add_row(&follow_row);
 
     let mounted = drives::mounted();
     if mounted.is_empty() {
-        drives_group.add(
+        drives.add_row(
             &adw::ActionRow::builder()
                 .title("No drives detected")
                 .subtitle("Connect a USB drive or SD card and it will appear here")
@@ -6089,7 +6103,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         // Last, so it sits where every other switch on the page sits.
         row.add_suffix(&pin);
         row.set_activatable_widget(Some(&pin));
-        drives_group.add(&row);
+        drives.add_row(&row);
     }
     page.add(&drives_group);
 
@@ -6160,8 +6174,9 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     reset_row.add_suffix(&reset_btn);
     reset_group.add(&reset_row);
 
-    let about = adw::PreferencesGroup::builder().title("About").build();
-    about.add(
+    let (about_group, about) =
+        settings_section("About", "Version, formats and where to find the source");
+    about.add_row(
         &adw::ActionRow::builder()
             .title("CheapAzSLA")
             .subtitle(format!("Version {}", cheapazsla_core::VERSION))
@@ -6181,7 +6196,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             format!("{} ({})", i.name, caps.join(", "))
         })
         .collect();
-    about.add(
+    about.add_row(
         &adw::ActionRow::builder()
             .title("Supported formats")
             .subtitle(formats.join("\n"))
@@ -6198,7 +6213,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             gio::AppLaunchContext::NONE,
         );
     });
-    about.add(&repo);
+    about.add_row(&repo);
     let settings_file = adw::ActionRow::builder()
         .title("Settings file")
         .subtitle(
@@ -6207,9 +6222,9 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
                 .unwrap_or_else(|| "not available".into()),
         )
         .build();
-    about.add(&settings_file);
+    about.add_row(&settings_file);
     page.add(&reset_group);
-    page.add(&about);
+    page.add(&about_group);
 
     container.append(&page);
 }

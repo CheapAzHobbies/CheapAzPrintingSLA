@@ -231,14 +231,26 @@ fn sheet(p: &Palette) -> String {
   -gtk-icon-transform: rotate(-14deg);
 }}
 
-/* Turns for as long as a scan is running. A drive that has gone to sleep can
-   take seconds to answer, and the question a spinning arrow settles is not
-   "did my press land" but "is it still going". */
+/* The arrow leans a quarter turn under the pointer and settles back when it
+   leaves - the control saying which way it is about to go before it goes.
+   Pressed, it turns for as long as the scan runs: a drive that has gone to
+   sleep can take seconds to answer, and the question a spinning arrow settles
+   is not "did my press land" but "is it still going". */
+.cz-refresh image {{
+  transition: -gtk-icon-transform 180ms ease-out;
+}}
+.cz-refresh:hover image {{
+  -gtk-icon-transform: rotate(90deg);
+}}
 @keyframes cz-turn {{
   from {{ -gtk-icon-transform: rotate(0deg); }}
   to {{ -gtk-icon-transform: rotate(360deg); }}
 }}
-.cz-turning image {{
+/* No transition while it is turning: a 180ms ease fighting a 900ms rotation
+   drags the arrow backwards every time the keyframe wraps. */
+.cz-refresh.cz-turning image,
+.cz-refresh.cz-turning:hover image {{
+  transition: none;
   animation: cz-turn 900ms linear infinite;
 }}
 
