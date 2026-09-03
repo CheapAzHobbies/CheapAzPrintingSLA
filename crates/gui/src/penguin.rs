@@ -239,6 +239,25 @@ impl Penguin {
         *self.timer.borrow_mut() = Some(id);
     }
 
+    /// Sit still and be visible: here, but not working.
+    ///
+    /// Twenty frames a second forever is not a status light, it is a heater -
+    /// and this program is meant to run on machines somebody is not proud of.
+    /// So waiting is one frame, and only actual work moves.
+    pub fn rest(&self) {
+        if let Some(id) = self.pending.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.timer.borrow_mut().take() {
+            id.remove();
+        }
+        *self.index.borrow_mut() = 0;
+        if let Some(first) = self.frames.as_ref().and_then(|f| f.first()) {
+            self.widget.set_paintable(Some(first));
+            self.widget.set_visible(true);
+        }
+    }
+
     pub fn stop(&self) {
         // Cancelling before it is shown is the common case, and the point:
         // the work finished quickly and nothing should have appeared.

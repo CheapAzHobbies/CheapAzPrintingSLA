@@ -163,6 +163,10 @@ struct App {
     dropzone: gtk::Box,
     dropzone_title: gtk::Label,
     dropzone_sub: gtk::Label,
+    /// Shows WatchDog is alive: sitting still while it waits, moving while it
+    /// converts. Separate from the one the manual queue uses, which lives
+    /// beside the Convert button and means something else.
+    watchdog_penguin: Rc<penguin::Penguin>,
     /// The list of readable formats under the drop zone. First thing out when
     /// the window is squeezed: it is a reference, not an instruction, and the
     /// instruction above it still stands without it.
@@ -511,6 +515,12 @@ fn build(app: &adw::Application) -> Rc<App> {
     watchdog_panel.append(&watchdog_row);
 
     let (dropzone, dropzone_title, dropzone_sub, dropzone_formats) = build_dropzone();
+    // WatchDog's own penguin, in the empty middle of the page. Still while it
+    // waits, moving while it works - which is the difference worth showing and
+    // the only one that costs anything to draw.
+    let watchdog_penguin = penguin::Penguin::new(56);
+    watchdog_penguin.widget.set_margin_top(theme::SPACE_2);
+    dropzone.append(&watchdog_penguin.widget);
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
@@ -737,6 +747,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone,
         dropzone_title,
         dropzone_sub,
+        watchdog_penguin,
         dropzone_formats,
         nearby_panel: nearby_panel.clone(),
         nearby_expander: nearby.expander,
@@ -2376,10 +2387,18 @@ fn reset_dropzone(ui: &Rc<App>) {
 /// inviting files the moment a folder is chosen, because converting one file
 /// by hand is still worth being able to do while WatchDog is running.
 fn refresh_dropzone_text(ui: &Rc<App>) {
-    let needs_folder = {
+    let (armed, needs_folder) = {
         let s = ui.settings.borrow();
-        s.auto_convert && s.auto_watch_dir.is_none()
+        (s.auto_convert, s.auto_convert && s.auto_watch_dir.is_none())
     };
+    // Sitting there while it waits. It is the answer to "is this thing
+    // actually running", which a line of text answers less convincingly than
+    // something that is plainly present.
+    if armed && !needs_folder {
+        ui.watchdog_penguin.rest();
+    } else {
+        ui.watchdog_penguin.stop();
+    }
     if needs_folder {
         ui.dropzone_title.set_text("Choose a folder to watch");
         ui.dropzone_sub
@@ -3268,11 +3287,14 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
     std::thread::spawn(move || {
         let _ = tx.send_blocking(convert::run(&plan).map_err(|e| e.to_string()));
     });
+    ui.watchdog_penguin.stop();
+    ui.watchdog_penguin.start();
     let ui = ui.clone();
     let landed = drive.is_some();
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.auto_busy.set(false);
+        refresh_dropzone_text(&ui);
         let ui2 = ui.clone();
         glib::idle_add_local_once(move || auto_pump(&ui2));
         let Ok(result) = result else { return };
