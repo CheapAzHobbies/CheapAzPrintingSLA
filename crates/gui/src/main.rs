@@ -403,7 +403,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     // than the detector they need a way to say so, and the place they will
     // look is the box that told them what it thinks the file is.
     // Ellipsized, and asking for very little. A plain label's minimum width is
-    // its whole text, and "(Automatically Detect)" beside the format name took
+    // its whole text, and "(Detect Automatically)" beside the format name took
     // this control's minimum from about 80 pixels to 260 — enough to push the
     // whole page wider than a narrow window and leave its right-hand side off
     // screen.
@@ -3304,10 +3304,13 @@ type ReadFailure = (String, Vec<Suggestion>);
 
 /// What the Input control says: the format, and how it was arrived at.
 ///
-/// "GOO (Automatically Detect)" answers both questions at once, where a bare
-/// "GOO" left the menu's tick on "Detect automatically" looking like it
+/// "GOO (Detect Automatically)" answers both questions at once, where a bare
+/// "GOO" left the menu's tick on "Detect Automatically" looking like it
 /// disagreed with the field. Narrow, the suffix goes rather than being cut
 /// off in the middle of itself.
+///
+/// The same words as the destination's, deliberately. Two names for one idea
+/// reads as two ideas.
 fn refresh_input_label(ui: &Rc<App>) {
     let files = ui.files.borrow();
     let text = match files.get(*ui.selected.borrow()) {
@@ -3430,7 +3433,7 @@ fn marquee(text: &str) -> gtk::ScrolledWindow {
 
 /// The list of formats the selected file can be read as (§21).
 ///
-/// "Detect automatically" first, then every format that can read, so the
+/// "Detect Automatically" first, then every format that can read, so the
 /// normal case is the default and the override is a deliberate act.
 fn build_input_menu(ui: &Rc<App>) {
     let list = gtk::ListBox::new();
@@ -3451,13 +3454,13 @@ fn build_input_menu(ui: &Rc<App>) {
 
     // Say what automatic detection settled on, not just that it is on. The
     // field beside this reads "GOO" while the tick sits on "Detect
-    // automatically", and without this the two look like they disagree.
+    // Automatically", and without this the two look like they disagree.
     let detected = registry::by_id(&reading_as)
         .map(|h| h.info().name)
         .filter(|_| current.is_none());
     let mut entries: Vec<(Option<String>, String, String)> = vec![(
         None,
-        "Detect automatically".into(),
+        "Detect Automatically".into(),
         match detected {
             Some(name) => format!("Reading it as {name}"),
             None => "Read the contents and work it out".into(),
@@ -4507,7 +4510,7 @@ fn build_destination_menu(ui: &Rc<App>) {
             // useful to make before plugging the drive in.
             add(
                 "drive-removable-media-symbolic",
-                "Connected drive (Automatically Detect)".into(),
+                "Connected drive (Detect Automatically)".into(),
                 Some(match auto_drive(&ui2) {
                     Some(d) => format!(
                         "{} · {}",
@@ -4636,10 +4639,10 @@ fn set_out_auto_drive(ui: &Rc<App>) {
     }
     match resolved {
         Some(d) => {
-            *ui.dest_base.borrow_mut() = format!("{} (Automatically Detect)", d.name);
+            *ui.dest_base.borrow_mut() = format!("{} (Detect Automatically)", d.name);
         }
         None => {
-            *ui.dest_base.borrow_mut() = "Connected drive (Automatically Detect)".to_string();
+            *ui.dest_base.borrow_mut() = "Connected drive (Detect Automatically)".to_string();
             *ui.dest_base_detail.borrow_mut() =
                 "No drive connected. Plug one in and it will be used.".to_string();
         }
