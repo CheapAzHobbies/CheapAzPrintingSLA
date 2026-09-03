@@ -2169,8 +2169,16 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
     button.set_popover(Some(&popover));
 
     let ui = ui.clone();
-    let pop = popover.clone();
-    popover.connect_show(move |_| {
+    popover.connect_show(move |_| fill_sources_menu(&ui, &content));
+}
+
+/// Build the body of the "Look in" menu.
+///
+/// Separate from the popover so it can be called again in place. Restoring
+/// removed places adds rows, which redrawing the list cannot do on its own,
+/// and shutting the menu to rebuild it would lose the user's place.
+fn fill_sources_menu(ui: &Rc<App>, content: &gtk::Box) {
+    {
         while let Some(child) = content.first_child() {
             content.remove(&child);
         }
@@ -2244,10 +2252,11 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
                     refresh_nearby(&ui);
                 });
             }
-            // A drive is on the list because it is plugged in, so unplugging
-            // it is how it leaves. A folder is there because of something the
-            // user did, and switching it off is not the same as being done
-            // with it: off still leaves it sitting in the list.
+            // Switching a source off is not the same as being done with it:
+            // off still leaves it sitting in the list. Drives can be taken off
+            // as well as folders - one being plugged in is not the same as it
+            // being wanted, and a drive that lives in the machine should not
+            // have to keep offering itself.
             //
             // Removal is on the secondary click rather than a button in the
             // row. A button had to sit somewhere, and the only place for it
@@ -2278,6 +2287,7 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
                         // reappear on the next refresh. A folder can be both.
                         s.quick_access_folders.retain(|p| *p != path);
                         s.quick_access_off.retain(|k| *k != key);
+                        s.quick_access_drives_on.retain(|k| *k != key);
                         if !s.quick_access_hidden.contains(&key) {
                             s.quick_access_hidden.push(key.clone());
                         }
@@ -2296,7 +2306,7 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
                     // a row disappear is indistinguishable from a misclick -
                     // and the way back is not obvious enough to leave unsaid.
                     ui2.toasts.add_toast(adw::Toast::new(&format!(
-                        "{label} removed. Add Folder puts it back."
+                        "{label} removed. Show removed places puts it back."
                     )));
                 });
                 row.add_controller(menu);
@@ -2311,14 +2321,44 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
         add.set_margin_top(theme::SPACE_2);
         {
             let ui = ui.clone();
-            let pop2 = pop.clone();
             add.connect_clicked(move |_| {
-                pop2.popdown();
+                if let Some(pop) = ui.nearby_sources.popover() {
+                    pop.popdown();
+                }
                 choose_scan_folder(&ui);
             });
         }
         content.append(&add);
-    });
+
+        // The way back. A folder can be added again through the picker, but a
+        // drive cannot - it is only ever offered because it is attached - so
+        // without this, removing one would be permanent and silent.
+        let removed = hidden.len();
+        if removed > 0 {
+            let back = gtk::Button::builder().build();
+            back.set_child(Some(&labelled_icon(
+                "edit-undo-symbolic",
+                &if removed == 1 {
+                    "Show 1 removed place".to_string()
+                } else {
+                    format!("Show {removed} removed places")
+                },
+            )));
+            back.add_css_class("flat");
+            let ui = ui.clone();
+            let body = content.clone();
+            back.connect_clicked(move |_| {
+                {
+                    let mut s = ui.settings.borrow_mut();
+                    s.quick_access_hidden.clear();
+                    let _ = s.save();
+                }
+                refresh_nearby(&ui);
+                fill_sources_menu(&ui, &body);
+            });
+            content.append(&back);
+        }
+    }
 }
 
 /// Add a folder to the places Quick Access looks.

@@ -39,9 +39,10 @@ pub struct Source {
     pub key: String,
     pub enabled: bool,
     /// Whether this entry can be taken off the list rather than only switched
-    /// off. A drive is listed because it is plugged in, so unplugging it is
-    /// how it leaves; a folder is listed because of something the user did,
-    /// so it is theirs to undo.
+    /// off. Everything can: a drive is listed because it happens to be
+    /// plugged in, which is not the same as being wanted, and someone who
+    /// keeps a drive attached for other reasons should not have to keep
+    /// seeing it offered.
     pub removable_entry: bool,
     /// Whether being listed means being read. A folder is scanned unless it is
     /// switched off; a drive is left alone until it is switched on, because
@@ -128,7 +129,7 @@ pub fn sources(
     }
     for drive in crate::drives::mounted() {
         let key = format!("drive:{}", drive.name);
-        push(drive.path, drive.name, key, false, true);
+        push(drive.path, drive.name, key, true, true);
     }
     out
 }
