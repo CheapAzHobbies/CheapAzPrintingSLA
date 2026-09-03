@@ -142,8 +142,13 @@ fn sheet(p: &Palette) -> String {
    seam invisible: the header loses its bottom corners while the list is open,
    and the list loses its top corners and its top border, so the two read as
    one card with a single line across it. */
+/* Linear, not eased. Eased, the radius holds square for most of the two
+   hundred milliseconds and then swings round at the end, which does not read
+   as a corner rounding - it reads as the corner changing colour and then
+   moving. Acceleration belongs to the search box, which travels far enough
+   for it to mean something. */
 .cz-qa-head, .cz-qa-head > row {{
-  transition: border-radius 200ms ease;
+  transition: border-radius 200ms linear;
 }}
 /* The row, not just the list: a boxed list draws its rounded corners on its
    first and last rows, so squaring off the list alone changed nothing that
@@ -159,6 +164,15 @@ fn sheet(p: &Palette) -> String {
   border-top-right-radius: 0;
 }}
 .cz-qa-body {{ border-top: none; }}
+/* The bottom corners belong to the window the files are seen through, not to
+   the last of them. On the list they are drawn by the final row, which is off
+   the bottom of the view until it is scrolled to - so the visible bottom edge
+   was square for the whole of the scroll and only rounded on arrival. Rounding
+   the scroller and clipping to it makes them round throughout. */
+.cz-qa-clip {{
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}}
 
 /* ---- queue ---- */
 .cz-queue > row {{

@@ -1140,6 +1140,10 @@ fn build_nearby_panel() -> NearbyPanel {
         .propagate_natural_height(true)
         .vexpand(false)
         .build();
+    clip.add_css_class("cz-qa-clip");
+    // Clipped to its own rounded box, which is what makes the bottom corners
+    // the view's rather than the last row's.
+    clip.set_overflow(gtk::Overflow::Hidden);
 
     let expander = adw::ExpanderRow::builder()
         .title("Quick Access")
@@ -2715,7 +2719,15 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
         // The box arrives before it grows, and leaves after it has shrunk.
         entry.set_opacity((at / SEARCH_FADE).clamp(0.0, 1.0));
         let grown = ((at - SEARCH_FADE) / (1.0 - SEARCH_FADE)).clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - grown).powi(3);
+        // Eased in the direction of travel. One curve run backwards is the
+        // other curve: opening slowed as it arrived, but shutting then sped up
+        // into the close, which is the opposite of what it should feel like.
+        // Both now leave quickly and arrive slowly.
+        let eased = if opening {
+            1.0 - (1.0 - grown).powi(3)
+        } else {
+            grown.powi(3)
+        };
         entry.set_size_request(
             SEARCH_SEED + ((SEARCH_WIDTH - SEARCH_SEED) as f64 * eased).round() as i32,
             -1,
