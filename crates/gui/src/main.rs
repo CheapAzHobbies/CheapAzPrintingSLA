@@ -31,6 +31,11 @@ const CORNER_MS: u64 = 120;
 /// The corner's own radius, from the stylesheet. Once the folding list is
 /// shorter than this, rounding the header cannot put a curve through anything.
 const CORNER_RADIUS: f64 = 12.0;
+/// How long the drop zone takes to become the queue, and back.
+const MORPH_MS: u32 = 240;
+/// And how long the form waits before following it down, so the two read as
+/// one thing after another rather than everything moving at once.
+const STAGGER_MS: u64 = 150;
 
 use adw::prelude::*;
 use cheapazsla_core::history::{self, History};
@@ -204,11 +209,13 @@ struct App {
     nearby_shown: RefCell<Vec<adw::ActionRow>>,
     /// Held so the volume-monitor signal handlers outlive `wire`.
     volume_monitor: RefCell<Option<gio::VolumeMonitor>>,
-    queue_panel: gtk::Box,
     queue_list: gtk::ListBox,
     controls: gtk::Box,
-    /// Wraps `controls` so the form fades in rather than appearing whole.
+    /// Wraps `controls` so the form swings down behind the queue rather than
+    /// the whole page changing in one frame.
     controls_reveal: gtk::Revealer,
+    /// The drop zone and the queue, as two faces of one place.
+    page_faces: gtk::Stack,
     input_label: gtk::Label,
     /// Opens the list of formats the input can be read as.
     input_button: gtk::MenuButton,
@@ -388,7 +395,6 @@ fn build(app: &adw::Application) -> Rc<App> {
     add_more.set_child(Some(&add_label));
     queue_panel.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     queue_panel.append(&add_more);
-    queue_panel.set_visible(false);
 
     // Detected, but overridable (§21). Detection reads the contents rather
     // than the name, which is right almost always and wrong occasionally: a
@@ -505,6 +511,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     );
     let controls = convert_page.1;
     let controls_reveal = convert_page.5;
+    let page_faces = convert_page.6.clone();
     let name_row = convert_page.2;
     let format_row = convert_page.3;
     let swap_col = convert_page.4;
@@ -594,10 +601,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_keys: RefCell::new(Vec::new()),
         nearby_shown: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
-        queue_panel,
         queue_list,
         controls,
         controls_reveal,
+        page_faces,
         input_label,
         input_button: input_button.clone(),
         output_picker: output_picker.clone(),
@@ -663,6 +670,8 @@ fn build(app: &adw::Application) -> Rc<App> {
     ui.shell.set_animate(animate);
     ui.controls_reveal
         .set_transition_duration(if animate { CONTROLS_MS } else { 0 });
+    ui.page_faces
+        .set_transition_duration(if animate { MORPH_MS } else { 0 });
     wire_responsive(&ui);
     restore_session(&ui);
     refresh_history(&ui);
@@ -1444,10 +1453,25 @@ fn build_convert_page(
     gtk::Box,
     gtk::Box,
     gtk::Revealer,
+    gtk::Stack,
 ) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
-    content.append(dropzone);
-    content.append(queue_panel);
+
+    // The drop zone and the queue are two faces of the same place, so they are
+    // two pages of a stack rather than two widgets taking turns at being
+    // visible. A stack crossfades between them and, with interpolate-size,
+    // carries its own height across at the same time - so a 240px invitation
+    // becomes a one-row queue by shrinking into it, rather than by vanishing
+    // and letting everything below jump up to fill the hole.
+    let faces = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(MORPH_MS)
+        .interpolate_size(true)
+        .vhomogeneous(false)
+        .build();
+    faces.add_named(dropzone, Some("drop"));
+    faces.add_named(queue_panel, Some("queue"));
+    content.append(&faces);
     content.append(nearby);
 
     // Controls stay hidden until there is a file, so a new user sees one
@@ -1455,8 +1479,11 @@ fn build_convert_page(
     let controls = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
     // Revealed rather than shown, so the form fades in behind the queue
     // instead of the whole page changing in one frame.
+    // Swings down rather than fading in. A fade gives the eye nothing to
+    // follow - the form is simply there a moment later - where a downward
+    // unfold arrives from the queue above it and says where it came from.
     let controls_reveal = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::Crossfade)
+        .transition_type(gtk::RevealerTransitionType::SwingDown)
         .transition_duration(CONTROLS_MS)
         .reveal_child(false)
         .child(&controls)
@@ -1573,6 +1600,7 @@ fn build_convert_page(
         formats,
         swap_col,
         controls_reveal,
+        faces,
     )
 }
 
@@ -3149,14 +3177,62 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
         // A queued file should stop being offered as a suggestion.
         refresh_nearby(ui);
         // Morph rather than jump: the drop zone gives way to the queue (§24).
-        ui.dropzone.set_visible(false);
-        ui.queue_panel.set_visible(true);
-        ui.controls.set_visible(true);
-        ui.controls_reveal.set_reveal_child(true);
+        swap_page(ui, true);
         if ui.files.borrow().len() == added {
             select_file(ui, 0);
         }
     }
+}
+
+/// Move between the two faces of the Convert page.
+///
+/// The page has two states - an invitation to open something, and a queue with
+/// a form under it - and they used to change over in a single frame. That is
+/// most of the page rearranging at once, with nothing to tell the eye which
+/// part to follow.
+///
+/// It resolves in one direction now, one thing after another. Filling: the
+/// drop zone shrinks into the queue where it stands, and once that has settled
+/// the form swings down underneath it - so the movement runs top to bottom and
+/// ends where the next thing to do is. Emptying is the same sequence
+/// backwards: the form folds away first, and only then does the queue give the
+/// space back. Neither direction has two things moving at once.
+fn swap_page(ui: &Rc<App>, to_queue: bool) {
+    let animate = ui.settings.borrow().animations;
+    if to_queue {
+        ui.page_faces.set_visible_child_name("queue");
+        ui.controls.set_visible(true);
+        if !animate {
+            ui.controls_reveal.set_reveal_child(true);
+            return;
+        }
+        let ui2 = ui.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(STAGGER_MS), move || {
+            // Checked again on arrival: the file may have been taken back
+            // out while the drop zone was still shrinking.
+            if !ui2.files.borrow().is_empty() {
+                ui2.controls_reveal.set_reveal_child(true);
+            }
+        });
+        return;
+    }
+
+    ui.controls_reveal.set_reveal_child(false);
+    if !animate {
+        ui.page_faces.set_visible_child_name("drop");
+        ui.controls.set_visible(false);
+        return;
+    }
+    let ui2 = ui.clone();
+    glib::timeout_add_local_once(
+        std::time::Duration::from_millis(CONTROLS_MS as u64),
+        move || {
+            if ui2.files.borrow().is_empty() {
+                ui2.page_faces.set_visible_child_name("drop");
+                ui2.controls.set_visible(false);
+            }
+        },
+    );
 }
 
 fn read_in_background(ui: &Rc<App>, path: PathBuf, forced: Option<String>) {
@@ -3602,10 +3678,7 @@ fn remove_file(ui: &Rc<App>, path: &Path) {
     if len == 0 {
         stop_play(ui);
         *ui.selected.borrow_mut() = 0;
-        ui.dropzone.set_visible(true);
-        ui.queue_panel.set_visible(false);
-        ui.controls.set_visible(false);
-        ui.controls_reveal.set_reveal_child(false);
+        swap_page(ui, false);
         ui.preview_stack.set_visible_child_name("empty");
         // Drop the texture as well, so the last layer of a removed file is
         // not still sitting in memory waiting to reappear.
@@ -5246,6 +5319,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
             ui.shell.set_animate(on);
             ui.controls_reveal
                 .set_transition_duration(if on { CONTROLS_MS } else { 0 });
+            ui.page_faces
+                .set_transition_duration(if on { MORPH_MS } else { 0 });
             let mut s = ui.settings.borrow_mut();
             s.animations = on;
             let _ = s.save();
