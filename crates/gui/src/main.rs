@@ -2034,13 +2034,7 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         // SL1 as a GOO can fail. It says so when it does, and the input menu's
         // "Detect Automatically" puts it back.
         swap.connect_clicked(move |_| {
-            let input = ui
-                .files
-                .borrow()
-                .get(*ui.selected.borrow())
-                .map(|f| f.format.clone())
-                .filter(|id| !id.is_empty());
-            let Some(input) = input else {
+            let Some(input) = input_format(&ui) else {
                 ui.toasts.add_toast(adw::Toast::new(
                     "Nothing to swap yet - the file is still being read",
                 ));
@@ -3748,6 +3742,21 @@ fn build_input_menu(ui: &Rc<App>) {
     });
 
     ui.input_button.set_popover(Some(&popover));
+}
+
+/// The format the Input control is set to.
+///
+/// What was asked for if anything was, and otherwise what detection found.
+/// The two can disagree - a forced format the file turns out not to be leaves
+/// the last detected one in place - and anything reading the control has to
+/// read the same one the control is showing, or it ends up arguing with what
+/// is on screen.
+fn input_format(ui: &Rc<App>) -> Option<String> {
+    let files = ui.files.borrow();
+    let f = files.get(*ui.selected.borrow())?;
+    f.forced_format
+        .clone()
+        .or_else(|| (!f.format.is_empty()).then(|| f.format.clone()))
 }
 
 /// Re-read the selected file as a named format, or by detection again.
