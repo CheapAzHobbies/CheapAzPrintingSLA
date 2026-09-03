@@ -235,12 +235,15 @@ fn sheet(p: &Palette) -> String {
    leaves - the control saying which way it is about to go before it goes.
    Pressed, it turns for as long as the scan runs: a drive that has gone to
    sleep can take seconds to answer, and the question a spinning arrow settles
-   is not "did my press land" but "is it still going". */
+   is not "did my press land" but "is it still going". It always stops on a
+   whole revolution, which is why the rotation begins and ends on the eighth
+   the hover leaves it at - the arrow never has to be dragged back from an
+   angle it stopped at by accident. */
 .cz-refresh image {{
   transition: -gtk-icon-transform 180ms ease-out;
 }}
 .cz-refresh:hover image {{
-  -gtk-icon-transform: rotate(90deg);
+  -gtk-icon-transform: rotate(45deg);
 }}
 /* Starts where the hover left it. The pointer is on the button at the moment
    it is clicked, so the arrow is already a quarter turn round; a rotation
@@ -248,8 +251,8 @@ fn sheet(p: &Palette) -> String {
    turn later puts it back on the quarter, which is where the hover wants it
    anyway - so stopping is as seamless as starting. */
 @keyframes cz-turn {{
-  from {{ -gtk-icon-transform: rotate(90deg); }}
-  to {{ -gtk-icon-transform: rotate(450deg); }}
+  from {{ -gtk-icon-transform: rotate(45deg); }}
+  to {{ -gtk-icon-transform: rotate(405deg); }}
 }}
 /* No transition while it is turning: a 180ms ease fighting a 900ms rotation
    drags the arrow backwards every time the keyframe wraps. */

@@ -172,6 +172,10 @@ struct App {
     /// When the running scan began, and whether it was asked for by hand.
     scan_since: Cell<Option<std::time::Instant>>,
     scan_asked: Cell<bool>,
+    /// When the arrow actually started turning, which is not when the scan
+    /// started - an automatic one waits to see whether it is slow enough to be
+    /// worth saying anything about.
+    spin_since: Cell<Option<std::time::Instant>>,
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
@@ -613,6 +617,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         scan_gen: Cell::new(0),
         scan_since: Cell::new(None),
         scan_asked: Cell::new(false),
+        spin_since: Cell::new(None),
         nearby_search: nearby.search,
         search_full: Rc::new(Cell::new(SEARCH_WIDTH)),
         search_t: Rc::new(Cell::new(0.0)),
@@ -2615,10 +2620,12 @@ fn refresh_nearby(ui: &Rc<App>) {
     });
 }
 
-/// How long a scan has to run before the arrow starts turning, and how long a
-/// turn lasts once someone has pressed for it.
+/// How long a scan has to run before the arrow starts turning, how long a turn
+/// lasts once someone has pressed for it, and how long one revolution takes.
 const SCAN_SPIN_AFTER: u128 = 150;
-const SCAN_SPIN_LEAST: u64 = 480;
+const SCAN_SPIN_LEAST: u128 = 480;
+/// Must match the animation in the stylesheet.
+const SCAN_SPIN_TURN: u128 = 900;
 
 /// Turn the refresh arrow while a scan is running.
 ///
@@ -2627,9 +2634,15 @@ const SCAN_SPIN_LEAST: u64 = 480;
 /// time. A press is different: someone who pressed a button is owed an answer
 /// whether or not there was anything to do, so that one always turns, and goes
 /// on turning until the scan is finished however long that is.
+///
+/// However long it runs, it stops on a whole revolution. Stopping wherever the
+/// scan happened to finish leaves the arrow at some arbitrary angle and then
+/// slides it back to rest, which is the one moment in the whole gesture that
+/// looks like a mistake.
 fn scan_spin(ui: &Rc<App>, on: bool) {
     if on {
         if ui.scan_asked.get() {
+            ui.spin_since.set(Some(std::time::Instant::now()));
             ui.nearby_refresh.add_css_class("cz-turning");
             return;
         }
@@ -2639,6 +2652,7 @@ fn scan_spin(ui: &Rc<App>, on: bool) {
             std::time::Duration::from_millis(SCAN_SPIN_AFTER as u64),
             move || {
                 if ui2.scan_gen.get() == generation && ui2.scan_since.get().is_some() {
+                    ui2.spin_since.set(Some(std::time::Instant::now()));
                     ui2.nearby_refresh.add_css_class("cz-turning");
                 }
             },
@@ -2652,21 +2666,29 @@ fn scan_spin(ui: &Rc<App>, on: bool) {
         .replace(None)
         .map(|t| t.elapsed().as_millis())
         .unwrap_or(0);
-    let owed = if asked {
-        SCAN_SPIN_LEAST.saturating_sub(ran.min(u128::from(u64::MAX)) as u64)
-    } else if ran >= SCAN_SPIN_AFTER {
-        // Already turning, and stopping mid-turn reads as a stumble.
-        120
+    let Some(turning_since) = ui.spin_since.get() else {
+        // Never started turning: the scan beat the delay.
+        ui.nearby_refresh.remove_css_class("cz-turning");
+        return;
+    };
+
+    // The earliest it is allowed to stop, and then the end of whatever
+    // revolution that lands in.
+    let least = if asked {
+        SCAN_SPIN_LEAST.saturating_sub(ran)
     } else {
         0
     };
-    if owed == 0 {
-        ui.nearby_refresh.remove_css_class("cz-turning");
-        return;
-    }
+    let turned = turning_since.elapsed().as_millis();
+    let earliest = turned + least;
+    let whole = earliest.div_ceil(SCAN_SPIN_TURN) * SCAN_SPIN_TURN;
+    let owed = whole.saturating_sub(turned).min(u128::from(u64::MAX)) as u64;
+
     let ui2 = ui.clone();
     glib::timeout_add_local_once(std::time::Duration::from_millis(owed), move || {
+        // Only if nothing has started up again in the meantime.
         if ui2.scan_since.get().is_none() {
+            ui2.spin_since.set(None);
             ui2.nearby_refresh.remove_css_class("cz-turning");
         }
     });
