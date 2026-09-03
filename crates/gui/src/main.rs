@@ -127,6 +127,17 @@ struct Queued {
     suggestions: Vec<Suggestion>,
     /// Set when the user has said what this file is, overriding detection.
     forced_format: Option<String>,
+    /// Whether this one goes when Convert is pressed.
+    ///
+    /// On by default: adding a file is asking for it to be converted. It comes
+    /// off by itself once the file has been converted, so pressing Convert
+    /// twice does not do the same work again.
+    selected: bool,
+    /// When the source was last written, as of the last time it was read.
+    /// A file that has changed since is worth offering again.
+    edited: Option<std::time::SystemTime>,
+    /// Set when the source changed on disk after being converted.
+    changed_since: bool,
 }
 
 impl Queued {
@@ -1910,6 +1921,7 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         ui.window.clone().connect_is_active_notify(move |w| {
             if w.is_active() {
                 refresh_nearby(&ui);
+                recheck_edits(&ui);
             }
         });
     }
@@ -2570,6 +2582,46 @@ fn choose_scan_folder(ui: &Rc<App>) {
             }
         },
     );
+}
+
+/// Notice sources that have been written again since they were converted.
+///
+/// Re-slicing over the same filename is the ordinary way of working: fix the
+/// supports, export again, convert again. Without this the row still says
+/// Complete and the tick is still off, so the file that has just changed is
+/// the one file the button will not touch.
+fn recheck_edits(ui: &Rc<App>) {
+    let mut woken: Vec<String> = Vec::new();
+    {
+        let mut files = ui.files.borrow_mut();
+        for f in files.iter_mut() {
+            if !matches!(f.status, Status::Complete(_)) || f.changed_since {
+                continue;
+            }
+            let Some(now) = std::fs::metadata(&f.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+            else {
+                continue;
+            };
+            if f.edited.is_some_and(|was| now <= was) {
+                continue;
+            }
+            f.edited = Some(now);
+            f.changed_since = true;
+            f.selected = true;
+            woken.push(f.name());
+        }
+    }
+    if woken.is_empty() {
+        return;
+    }
+    refresh_queue(ui);
+    revalidate(ui);
+    ui.toasts.add_toast(adw::Toast::new(&match woken.len() {
+        1 => format!("{} changed on disk - ticked to convert again", woken[0]),
+        n => format!("{n} files changed on disk - ticked to convert again"),
+    }));
 }
 
 /// Rebuild the "Quick Access" list.
@@ -3352,6 +3404,11 @@ fn add_files(ui: &Rc<App>, paths: Vec<PathBuf>) {
             status: Status::Reading,
             suggestions: Vec::new(),
             forced_format: None,
+            selected: true,
+            edited: std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok()),
+            changed_since: false,
         });
         added += 1;
         read_in_background(ui, path, None);
@@ -3841,6 +3898,29 @@ fn refresh_queue(ui: &Rc<App>) {
         row.set_margin_start(theme::SPACE_3);
         row.set_margin_end(theme::SPACE_2);
 
+        // Ticked by default, and the only thing it decides is whether this
+        // file goes when Convert is pressed. It comes off by itself once the
+        // file is done, so a second press does not redo finished work.
+        let tick = gtk::CheckButton::new();
+        tick.set_valign(gtk::Align::Center);
+        tick.set_active(f.selected);
+        tick.set_tooltip_text(Some("Convert this one"));
+        {
+            let ui = ui.clone();
+            let path = f.path.clone();
+            tick.connect_toggled(move |t| {
+                let on = t.is_active();
+                if let Some(f) = ui.files.borrow_mut().iter_mut().find(|f| f.path == path) {
+                    if f.selected == on {
+                        return;
+                    }
+                    f.selected = on;
+                }
+                revalidate(&ui);
+            });
+        }
+        row.append(&tick);
+
         row.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
 
         let name = marquee(&f.name());
@@ -3896,7 +3976,11 @@ fn refresh_queue(ui: &Rc<App>) {
         // to be behind a Details button next to it, which is a second control
         // saying the same thing as the first: "Failed" is already the thing
         // you want to know more about, so it is the thing to press.
-        let chip = f.status.chip();
+        let chip = if f.changed_since {
+            shell::status_chip("document-edit-symbolic", "Edited", "cz-warn").upcast()
+        } else {
+            f.status.chip()
+        };
         let detail = match f.status {
             Status::Failed(_) | Status::Warning(_) => f.status.detail(),
             _ => None,
@@ -5129,11 +5213,18 @@ fn revalidate(ui: &Rc<App>) {
             ui.convert_btn.set_sensitive(true);
         }
     }
-    let n = ui.files.borrow().len();
-    ui.convert_label.set_text(&if n > 1 {
-        format!("Convert {n} Files")
-    } else {
-        "Convert".to_string()
+    // The button says which files it means. "Convert 6 Files" when every one is
+    // ticked is the same sentence as "Convert All" and shorter to read; the
+    // moment some are not, the count is the whole point.
+    let (total, picked) = {
+        let files = ui.files.borrow();
+        (files.len(), files.iter().filter(|f| f.selected).count())
+    };
+    ui.convert_label.set_text(&match (total, picked) {
+        (_, 0) => "Convert".to_string(),
+        (1, _) => "Convert".to_string(),
+        (t, p) if p == t => "Convert All".to_string(),
+        (_, p) => format!("Convert {p} Selected"),
     });
 }
 
@@ -5144,6 +5235,16 @@ fn check(ui: &Rc<App>) -> Option<String> {
     }
     if files.iter().all(|f| f.opened.is_none()) {
         return Some("Waiting for the file to be read.".into());
+    }
+    if !files.iter().any(|f| f.selected) {
+        return Some("Tick a file to convert it.".into());
+    }
+    if files
+        .iter()
+        .filter(|f| f.selected)
+        .all(|f| f.opened.is_none())
+    {
+        return Some("Waiting for the ticked files to be read.".into());
     }
     let format = ui.output_picker.selected()?;
 
@@ -5233,7 +5334,7 @@ fn start_convert(ui: &Rc<App>) {
     {
         let files = ui.files.borrow();
         for f in files.iter() {
-            if f.opened.is_none() {
+            if f.opened.is_none() || !f.selected {
                 continue;
             }
             let Some(dest) = destination_for(ui, f, format) else {
@@ -5490,7 +5591,22 @@ fn run_batch(ui: &Rc<App>, plans: Vec<(PathBuf, convert::Plan)>) {
                     }
                 };
                 if let Some(f) = files.iter_mut().find(|f| &f.path == source) {
+                    let done = matches!(f.status, Status::Complete(_))
+                        || matches!(entry_status, Status::Complete(_));
                     f.status = entry_status;
+                    // A finished file unticks itself. Converting six and then
+                    // adding a seventh should convert the seventh, not all
+                    // seven again - and the tick is the thing that says so.
+                    // A failure stays ticked, because it has not been done.
+                    if done {
+                        f.selected = false;
+                        f.changed_since = false;
+                        // Noted as of now, so a later edit is measured against
+                        // the version that was actually converted.
+                        f.edited = std::fs::metadata(&f.path)
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                    }
                 }
                 hist.record(history::Entry {
                     when: history::now(),
