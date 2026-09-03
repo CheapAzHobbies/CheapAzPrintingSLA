@@ -1328,6 +1328,18 @@ fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Box) {
     }
     formats.append(&grid);
 
+    // The same list again, on the drop zone itself. Not instead of the panel:
+    // "will this thing read my file" is the question someone has before they
+    // touch anything, and an answer you have to hover to find is no answer at
+    // all for a first-time reader - nor for anyone on a touchscreen, where
+    // there is no hover to give. It is here so that the narrow window, which
+    // hides the panel for want of room, still has somewhere to say it.
+    let listed: Vec<String> = registry::readable()
+        .iter()
+        .map(|info| format!("{}  .{}", info.name, info.extension))
+        .collect();
+    zone.set_tooltip_text(Some(&format!("Opens\n{}", listed.join("\n"))));
+
     zone.append(&icon);
     zone.append(&title);
     zone.append(&sub);
