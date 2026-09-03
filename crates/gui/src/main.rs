@@ -142,6 +142,10 @@ struct App {
     // convert page
     dropzone: gtk::Box,
     dropzone_title: gtk::Label,
+    /// The list of readable formats under the drop zone. First thing out when
+    /// the window is squeezed: it is a reference, not an instruction, and the
+    /// instruction above it still stands without it.
+    dropzone_formats: gtk::Box,
     /// "Found nearby": readable files in the open folder and on mounted
     /// drives, offered so a file can be picked without a file dialog.
     nearby_panel: gtk::Box,
@@ -351,7 +355,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     header.pack_start(&palette_btn);
 
     // --- convert page -----------------------------------------------------
-    let (dropzone, dropzone_title) = build_dropzone();
+    let (dropzone, dropzone_title, dropzone_formats) = build_dropzone();
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
@@ -556,6 +560,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         toasts,
         dropzone,
         dropzone_title,
+        dropzone_formats,
         nearby_panel: nearby_panel.clone(),
         nearby_expander: nearby.expander,
         nearby_clip: nearby.clip,
@@ -992,6 +997,7 @@ fn wire_responsive(ui: &Rc<App>) {
                 // The Quick Access rows give up their columns at the same
                 // width the queue rows do.
                 refresh_nearby(&ui);
+                ui.dropzone_formats.set_visible(!narrow);
             }
         })
     };
@@ -1256,7 +1262,7 @@ struct NearbyPanel {
     search: gtk::Entry,
 }
 
-fn build_dropzone() -> (gtk::Box, gtk::Label) {
+fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Box) {
     let zone = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     zone.add_css_class("cz-dropzone");
     zone.set_valign(gtk::Align::Center);
@@ -1327,7 +1333,7 @@ fn build_dropzone() -> (gtk::Box, gtk::Label) {
     zone.append(&sub);
     zone.append(&browse);
     zone.append(&formats);
-    (zone, title)
+    (zone, title, formats)
 }
 
 fn build_problem_bar() -> (gtk::Box, gtk::Label) {
