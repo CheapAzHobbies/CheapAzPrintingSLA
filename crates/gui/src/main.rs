@@ -1940,7 +1940,8 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             let ui2 = ui.clone();
             let btn = b.clone();
             let name = drive.name.clone();
-            drives::eject(&drive, move |res| {
+            let sort = ui.settings.borrow().sort_drive_on_eject;
+            drives::eject(&drive, sort, move |res| {
                 btn.set_sensitive(true);
                 match res {
                     Ok(()) => {
@@ -6413,6 +6414,31 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     }
     drives.add_row(&follow_row);
 
+    let sort_row = adw::SwitchRow::builder()
+        .title("Put the newest file first when ejecting")
+        .subtitle(
+            "Printers list files in the order they were copied, so the newest ends up \
+             at the bottom. This reorders the drive as it is ejected. Needs fatsort.",
+        )
+        .active(current.sort_drive_on_eject)
+        .build();
+    if drives::fatsort_missing() {
+        sort_row.set_subtitle(
+            "Needs the fatsort tool, which is not installed. \
+             Install it with: sudo apt install fatsort",
+        );
+        sort_row.set_sensitive(false);
+    }
+    {
+        let ui = ui.clone();
+        sort_row.connect_active_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.sort_drive_on_eject = r.is_active();
+            let _ = s.save();
+        });
+    }
+    drives.add_row(&sort_row);
+
     let mounted = drives::mounted();
     if mounted.is_empty() {
         drives.add_row(
@@ -6511,7 +6537,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
                 let ui4 = ui3.clone();
                 let name2 = name.clone();
                 let btn2 = btn.clone();
-                drives::eject(&drive, move |res| {
+                let sort = ui3.settings.borrow().sort_drive_on_eject;
+                drives::eject(&drive, sort, move |res| {
                     btn2.set_sensitive(true);
                     match res {
                         Ok(()) => {

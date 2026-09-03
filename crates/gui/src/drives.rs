@@ -162,7 +162,99 @@ pub fn is_ejectable(name: &str, protected: &[String]) -> bool {
 /// The flush is the point of the whole feature. Pulling a stick with dirty
 /// buffers is how a print file arrives at the printer truncated, and the
 /// truncation shows up as a failed print rather than as a copy error.
-pub fn eject<F: Fn(Result<(), String>) + 'static>(drive: &Drive, done: F) {
+/// The block device behind a mounted drive, e.g. `/dev/sdb1`.
+///
+/// Wanted for one thing only: a FAT directory table can be reordered, and
+/// doing that means naming the partition rather than the folder it appears at.
+pub fn device_of(path: &std::path::Path) -> Option<PathBuf> {
+    let monitor = gio::VolumeMonitor::get();
+    let mount = monitor
+        .mounts()
+        .into_iter()
+        .filter(|m| !m.is_shadowed())
+        .find(|m| m.root().path().as_deref() == Some(path))?;
+    let volume = mount.volume()?;
+    volume
+        .identifier(gio::VOLUME_IDENTIFIER_KIND_UNIX_DEVICE)
+        .map(|s| PathBuf::from(s.as_str()))
+}
+
+/// Whether a mounted drive holds a FAT filesystem.
+///
+/// Only FAT can be reordered, and only FAT is what a resin printer reads, so
+/// the two questions have the same answer.
+pub fn is_fat(path: &std::path::Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    let target = path.to_string_lossy();
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let (_dev, at, kind) = (parts.next(), parts.next(), parts.next());
+        let (Some(at), Some(kind)) = (at, kind) else {
+            continue;
+        };
+        // /proc escapes spaces as \040; nothing else here needs unescaping.
+        if at.replace("\\040", " ") == target {
+            return matches!(kind, "vfat" | "msdos" | "exfat");
+        }
+    }
+    false
+}
+
+/// Rewrite a FAT directory table so the newest file is listed first.
+///
+/// Chitu firmware - which the Elegoo Saturn line runs - does no sorting. It
+/// lists files in the order their entries sit in the directory table, which is
+/// the order they were written, so the file just copied is always last however
+/// it is named. Renaming cannot fix that; the table itself has to be rewritten,
+/// which is what `fatsort` does.
+///
+/// The filesystem has to be unmounted first - rewriting directory entries
+/// under a live mount is how filesystems get eaten - and rewriting a block
+/// device needs root, so this is a best effort. It never blocks anything: a
+/// missing tool or a refused password leaves the drive exactly as it was.
+pub fn sort_newest_first(device: &std::path::Path) -> Result<(), String> {
+    if which_fatsort().is_none() {
+        return Err("fatsort is not installed".into());
+    }
+    let out = std::process::Command::new("sudo")
+        // Never prompt. A password dialog nobody asked for, appearing behind
+        // the window during an eject, is worse than not sorting.
+        .arg("-n")
+        .arg("fatsort")
+        .arg("-t") // by last modification time
+        .arg("-r") // newest first
+        .arg("-c") // and ignore case, since the list is read by eye
+        .arg(device)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(said.lines().next().unwrap_or("fatsort failed").to_string())
+}
+
+/// Whether the reordering tool is absent, so the interface can say so rather
+/// than offering a switch that quietly does nothing.
+pub fn fatsort_missing() -> bool {
+    which_fatsort().is_none()
+}
+
+fn which_fatsort() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("fatsort"))
+            .find(|p| p.is_file())
+    })
+}
+
+pub fn eject<F: Fn(Result<(), String>) + Clone + 'static>(
+    drive: &Drive,
+    sort_first: bool,
+    done: F,
+) {
     let name = drive.name.clone();
     let monitor = gio::VolumeMonitor::get();
     // Matched on the mount point, not the label. Two unlabelled sticks are
@@ -196,21 +288,65 @@ pub fn eject<F: Fn(Result<(), String>) + 'static>(drive: &Drive, done: F) {
     }
 
     let op = gtk::gio::MountOperation::new();
-    if mount.can_eject() {
-        mount.eject_with_operation(
-            gio::MountUnmountFlags::NONE,
-            Some(&op),
-            gio::Cancellable::NONE,
-            move |res| done(res.map_err(|e| e.message().to_string())),
-        );
-    } else {
-        mount.unmount_with_operation(
-            gio::MountUnmountFlags::NONE,
-            Some(&op),
-            gio::Cancellable::NONE,
-            move |res| done(res.map_err(|e| e.message().to_string())),
-        );
+
+    // Sorting has to happen between the unmount and the eject: the table
+    // cannot be rewritten while the filesystem is mounted, and after an eject
+    // the device may be powered down and gone. So when it is wanted, this is
+    // three steps rather than one - and if any of the sorting fails the eject
+    // still happens, because getting the drive out safely is the job and
+    // ordering its file list is a courtesy.
+    let device = mount.root().path().and_then(|p| device_of(&p));
+    let wants_sort =
+        sort_first && device.is_some() && mount.root().path().map(|p| is_fat(&p)).unwrap_or(false);
+
+    if !wants_sort {
+        if mount.can_eject() {
+            mount.eject_with_operation(
+                gio::MountUnmountFlags::NONE,
+                Some(&op),
+                gio::Cancellable::NONE,
+                move |res| done(res.map_err(|e| e.message().to_string())),
+            );
+        } else {
+            mount.unmount_with_operation(
+                gio::MountUnmountFlags::NONE,
+                Some(&op),
+                gio::Cancellable::NONE,
+                move |res| done(res.map_err(|e| e.message().to_string())),
+            );
+        }
+        return;
     }
+
+    let device = device.expect("checked just above");
+    let drive = mount.drive();
+    mount.unmount_with_operation(
+        gio::MountUnmountFlags::NONE,
+        Some(&op),
+        gio::Cancellable::NONE,
+        move |res| {
+            if let Err(e) = res {
+                done(Err(e.message().to_string()));
+                return;
+            }
+            let sorted = sort_newest_first(&device);
+            let Some(drive) = drive.clone() else {
+                done(sorted.map(|_| ()).or(Ok(())));
+                return;
+            };
+            if !drive.can_eject() {
+                done(Ok(()));
+                return;
+            }
+            let op = gtk::gio::MountOperation::new();
+            drive.eject_with_operation(
+                gio::MountUnmountFlags::NONE,
+                Some(&op),
+                gio::Cancellable::NONE,
+                move |res| done(res.map_err(|e| e.message().to_string())),
+            );
+        },
+    );
 }
 
 #[cfg(test)]

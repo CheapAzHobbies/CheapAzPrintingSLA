@@ -63,6 +63,13 @@ pub struct Settings {
     pub hidden_input_formats: Vec<String>,
     /// And the same when writing.
     pub hidden_output_formats: Vec<String>,
+    /// Put the drive's file list in newest-first order when ejecting it.
+    ///
+    /// A resin printer lists files in the order they were written to the
+    /// stick, so the one just copied is always last. Reordering fixes that,
+    /// but it rewrites the drive's directory table and needs a helper and
+    /// permission to do it, so it is a thing the user can turn off.
+    pub sort_drive_on_eject: bool,
     /// Save to whichever removable drive is attached, rather than to a fixed
     /// folder. Remembered, because it is a standing instruction rather than a
     /// place: choosing it once and finding it forgotten next launch makes it
@@ -150,6 +157,7 @@ impl Default for Settings {
             // Saving to the printer's drive is what this program is for, so
             // that is where a first run points. Changing it is remembered.
             follow_drive: true,
+            sort_drive_on_eject: true,
             startup_pinned: false,
             startup_follow_drive: true,
             startup_output_dir: None,
@@ -245,6 +253,9 @@ impl Settings {
                     s.hidden_output_formats = list;
                 }
             }
+        }
+        if let Some(v) = map.get("sort_drive_on_eject") {
+            s.sort_drive_on_eject = v == "true";
         }
         if let Some(v) = map.get("follow_drive") {
             s.follow_drive = v == "true";
@@ -367,6 +378,7 @@ impl Settings {
              quick_access_columns = {}\n\
              quick_access_limit = {}\n\
              follow_drive = {}\n\
+             sort_drive_on_eject = {}\n\
              recent_output_shown = {}\n\
              hidden_input_formats = {}\n\
              hidden_output_formats = {}\n\
@@ -408,6 +420,7 @@ impl Settings {
             self.quick_access_columns,
             self.quick_access_limit,
             self.follow_drive,
+            self.sort_drive_on_eject,
             self.recent_output_shown,
             self.hidden_input_formats.join("\x1f"),
             self.hidden_output_formats.join("\x1f"),
