@@ -32,6 +32,9 @@ const CORNER_MS: u64 = 120;
 /// The corner's own radius, from the stylesheet. Once the folding list is
 /// shorter than this, rounding the header cannot put a curve through anything.
 const CORNER_RADIUS: f64 = 12.0;
+/// WatchDog's picture: a folder with a search over it. Deliberately not an
+/// eye - Preview is the eye, and one picture should mean one thing.
+const WATCHDOG_ICON: &str = "folder-saved-search-symbolic";
 /// How long the drop zone takes to become the queue, and back.
 const MORPH_MS: u32 = 240;
 /// And how long the form waits before following it down, so the two read as
@@ -291,9 +294,10 @@ struct App {
     auto_watch: RefCell<Option<gio::FileMonitor>>,
     /// The eye in the title bar: the switch and the indicator in one.
     watchdog_eye: gtk::ToggleButton,
-    /// And the banner over the work it is doing, which says the whole
-    /// sentence the eye can only hint at.
-    auto_banner: adw::Banner,
+    /// And its row on the Convert page, which says the whole sentence the eye
+    /// can only hint at.
+    watchdog_row: adw::ActionRow,
+    watchdog_switch: gtk::Switch,
     /// The Settings switch, kept in step with the eye. The page is built once,
     /// so it cannot find out on its own that the eye has been pressed.
     auto_switch: RefCell<Option<adw::SwitchRow>>,
@@ -426,25 +430,41 @@ fn build(app: &adw::Application) -> Rc<App> {
     let palette_btn = shell::icon_button("system-search-symbolic", "Commands  (Ctrl+K)");
     header.pack_start(&palette_btn);
 
-    // WatchDog's eye, in the title bar, on every page. One control that both
-    // switches it on and says whether it is on - a separate indicator and a
-    // separate switch would be two things to keep in step and two things to
-    // look for. Shut and grey when it is not watching, open and lit when it
-    // is, so the state is the picture rather than something to read.
+    // WatchDog in the title bar, on every page: the switch and the indicator
+    // in one, so there is nothing to keep in step and nowhere else to look.
+    //
+    // A watched folder rather than an eye, because Preview already is an eye
+    // and two of the same picture meaning two different things is worse than
+    // either picture being wrong. This one says what it actually does.
     let watchdog_eye = gtk::ToggleButton::builder()
-        .child(&gtk::Image::from_icon_name("view-conceal-symbolic"))
+        .child(&gtk::Image::from_icon_name(WATCHDOG_ICON))
         .tooltip_text("WatchDog is off")
         .build();
     watchdog_eye.set_widget_name("watchdog-eye");
     header.pack_end(&watchdog_eye);
 
     // --- convert page -----------------------------------------------------
-    // Says what automatic mode is doing, over the page it is doing it to, with
-    // the way to stop it in the same strip. Told, not hidden in Settings.
-    let auto_banner = adw::Banner::builder()
-        .revealed(false)
-        .button_label("Turn Off")
+    // WatchDog on the Convert page, always there, whether it is watching or
+    // not. The eye in the title bar is right for telling you at a glance from
+    // another page, and wrong for finding in the first place - a small icon
+    // beside the window controls is where nobody looks for a feature they do
+    // not know exists yet. This is a row on the page the feature is about,
+    // saying its name and what it would do.
+    let watchdog_row = adw::ActionRow::builder()
+        .title("WatchDog")
+        .subtitle("Off")
         .build();
+    watchdog_row.add_prefix(&gtk::Image::from_icon_name(WATCHDOG_ICON));
+    let watchdog_switch = gtk::Switch::builder()
+        .valign(gtk::Align::Center)
+        .tooltip_text("Watch a folder and convert what your slicer leaves there")
+        .build();
+    watchdog_row.add_suffix(&watchdog_switch);
+    watchdog_row.set_activatable_widget(Some(&watchdog_switch));
+    let watchdog_panel = gtk::ListBox::new();
+    watchdog_panel.add_css_class("boxed-list");
+    watchdog_panel.set_selection_mode(gtk::SelectionMode::None);
+    watchdog_panel.append(&watchdog_row);
 
     let (dropzone, dropzone_title, dropzone_formats) = build_dropzone();
     let nearby = build_nearby_panel();
@@ -589,7 +609,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     let (problem, problem_label) = build_problem_bar();
 
     let convert_page = build_convert_page(
-        &auto_banner,
+        &watchdog_panel,
         &dropzone,
         &nearby_panel,
         &queue_panel,
@@ -740,7 +760,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         overwrite_switch: RefCell::new(None),
         auto_watch: RefCell::new(None),
         watchdog_eye: watchdog_eye.clone(),
-        auto_banner: auto_banner.clone(),
+        watchdog_row: watchdog_row.clone(),
+        watchdog_switch: watchdog_switch.clone(),
         auto_switch: RefCell::new(None),
         auto_settling: RefCell::new(Vec::new()),
         auto_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -1553,7 +1574,7 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
 
 #[allow(clippy::too_many_arguments)]
 fn build_convert_page(
-    auto_banner: &adw::Banner,
+    watchdog_panel: &gtk::ListBox,
     dropzone: &gtk::Box,
     nearby: &gtk::Box,
     queue_panel: &gtk::Box,
@@ -1578,7 +1599,6 @@ fn build_convert_page(
     gtk::Stack,
 ) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_4);
-    content.append(auto_banner);
 
     // The drop zone and the queue are two faces of the same place, so they are
     // two pages of a stack rather than two widgets taking turns at being
@@ -1596,6 +1616,9 @@ fn build_convert_page(
     faces.add_named(queue_panel, Some("queue"));
     content.append(&faces);
     content.append(nearby);
+    // Under Quick Access, which is the other thing on this page that watches
+    // folders - and above the form, which is about the file in hand.
+    content.append(watchdog_panel);
 
     // Controls stay hidden until there is a file, so a new user sees one
     // instruction rather than a form (§2, §36).
@@ -2058,36 +2081,30 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 let _ = s.save();
             }
             rearm_auto(&ui2);
-            // Switched on with nothing to watch is a decision half made, so it
-            // goes where the other half is rather than sitting there armed and
-            // doing nothing.
-            let unfinished = {
-                let s = ui2.settings.borrow();
-                s.auto_watch_dir.is_none() || s.auto_target_uuid.is_none()
-            };
-            if on && unfinished {
-                ui2.shell.show(Section::Settings);
-            }
+            // To Convert, where WatchDog's row is and where the files it acts
+            // on appear. The eye is visible from every page, so pressing it
+            // from History or Settings has to land somewhere that shows what
+            // just changed - and that is not the page you happened to be on.
+            ui2.shell.show(Section::Convert);
+            watchdog_needs_setup(&ui2, on);
         });
     }
     {
+        // The switch on the page and the eye in the title bar are the same
+        // switch; either one sets the setting and the other follows it.
         let ui2 = ui.clone();
-        ui.auto_banner.connect_button_clicked(move |_| {
-            let unfinished = {
-                let s = ui2.settings.borrow();
-                s.auto_watch_dir.is_none() || s.auto_target_uuid.is_none()
-            };
-            if unfinished {
-                ui2.shell.show(Section::Settings);
-                return;
-            }
+        ui.watchdog_switch.connect_active_notify(move |sw| {
+            let on = sw.is_active();
             {
                 let mut s = ui2.settings.borrow_mut();
-                s.auto_convert = false;
+                if s.auto_convert == on {
+                    return;
+                }
+                s.auto_convert = on;
                 let _ = s.save();
             }
             rearm_auto(&ui2);
-            ui2.toasts.add_toast(adw::Toast::new("WatchDog is off"));
+            watchdog_needs_setup(&ui2, on);
         });
     }
 
@@ -2697,6 +2714,31 @@ fn choose_scan_folder(ui: &Rc<App>) {
     );
 }
 
+/// Say what is missing, rather than walking off to another page to show it.
+///
+/// Switching this on used to jump straight to Settings, which is a page change
+/// nobody asked for in answer to a switch they did press - and the row on the
+/// Convert page already says what is not set up yet. So it says it again here,
+/// once, and stays where it is.
+fn watchdog_needs_setup(ui: &Rc<App>, on: bool) {
+    if !on {
+        return;
+    }
+    let (dir, target) = {
+        let s = ui.settings.borrow();
+        (s.auto_watch_dir.is_some(), s.auto_target_uuid.is_some())
+    };
+    let missing = match (dir, target) {
+        (true, true) => return,
+        (false, true) => "a folder to watch",
+        (true, false) => "a drive to copy to",
+        (false, false) => "a folder to watch and a drive to copy to",
+    };
+    ui.toasts.add_toast(adw::Toast::new(&format!(
+        "WatchDog is on, but still needs {missing}. Settings, WatchDog mode."
+    )));
+}
+
 /// Say, on screen, whether automatic mode is running and what it will do.
 ///
 /// Two places, on purpose. The badge in the title bar is there from every page
@@ -2720,12 +2762,6 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
     if ui.watchdog_eye.is_active() != on {
         ui.watchdog_eye.set_active(on);
     }
-    ui.watchdog_eye
-        .set_child(Some(&gtk::Image::from_icon_name(if on {
-            "view-reveal-symbolic"
-        } else {
-            "view-conceal-symbolic"
-        })));
     if on {
         ui.watchdog_eye.add_css_class("cz-armed");
     } else {
@@ -2737,8 +2773,12 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
         }
     }
 
-    ui.auto_banner.set_revealed(on);
+    if ui.watchdog_switch.is_active() != on {
+        ui.watchdog_switch.set_active(on);
+    }
     if !on {
+        ui.watchdog_row
+            .set_subtitle("Off. Turn on to convert new files from a folder by itself.");
         ui.watchdog_eye.set_tooltip_text(Some(
             "WatchDog is off. Press to have it watch a folder for you.",
         ));
@@ -2757,20 +2797,9 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
         None => "but no drive is chosen, so they will wait".into(),
     };
     let said = format!("Watching {where_}. New files become {format} {onto}.");
-    ui.auto_banner.set_title(&said);
+    ui.watchdog_row.set_subtitle(&said);
     ui.watchdog_eye
         .set_tooltip_text(Some(&format!("WatchDog is watching. {said}")));
-
-    // A setup that is switched on but cannot work says so with its button
-    // rather than with a colour. Two tints of the same accent are not a
-    // distinction anyone can read at a glance, and "Finish Setup" is a better
-    // answer than a shade anyway: it says what is wrong and goes there.
-    ui.auto_banner
-        .set_button_label(Some(if dir.is_none() || target.is_none() {
-            "Finish Setup"
-        } else {
-            "Turn Off"
-        }));
 }
 
 /// Start or stop watching the folder that automatic mode reads.
