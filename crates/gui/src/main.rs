@@ -164,10 +164,6 @@ struct App {
     dropzone: gtk::Box,
     dropzone_title: gtk::Label,
     dropzone_sub: gtk::Label,
-    /// Shows WatchDog is alive: sitting still while it waits, moving while it
-    /// converts. Separate from the one the manual queue uses, which lives
-    /// beside the Convert button and means something else.
-    watchdog_penguin: Rc<penguin::Penguin>,
     /// The milestone chain, and what it is currently saying.
     watchdog_steps: Rc<steps::Steps>,
     /// The file being converted right now, for the chain's third stop.
@@ -545,12 +541,6 @@ fn build(app: &adw::Application) -> Rc<App> {
     watchdog_panel.append(&watchdog_row);
 
     let (dropzone, dropzone_title, dropzone_sub, dropzone_formats) = build_dropzone();
-    // WatchDog's own penguin, in the empty middle of the page. Still while it
-    // waits, moving while it works - which is the difference worth showing and
-    // the only one that costs anything to draw.
-    let watchdog_penguin = penguin::Penguin::new(56);
-    watchdog_penguin.widget.set_margin_top(theme::SPACE_2);
-    dropzone.append(&watchdog_penguin.widget);
 
     // The chain: where a file comes from, what happens to it, and where it
     // ends up. Shown in the drop zone because that is the empty middle of the
@@ -789,7 +779,6 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone,
         dropzone_title,
         dropzone_sub,
-        watchdog_penguin,
         watchdog_steps,
         watchdog_doing: RefCell::new(None),
         watchdog_sending: Cell::new(false),
@@ -2449,7 +2438,7 @@ fn reset_dropzone(ui: &Rc<App>) {
 /// inviting files the moment a folder is chosen, because converting one file
 /// by hand is still worth being able to do while WatchDog is running.
 fn refresh_dropzone_text(ui: &Rc<App>) {
-    let (armed, needs_folder, watching, moving) = {
+    let (armed, needs_folder, watching) = {
         let s = ui.settings.borrow();
         (
             s.auto_convert,
@@ -2457,21 +2446,9 @@ fn refresh_dropzone_text(ui: &Rc<App>) {
             s.auto_watch_dir
                 .as_ref()
                 .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())),
-            s.animations,
         )
     };
 
-    // The penguin was there to say the thing was alive while it waited. The
-    // chain says that now, and says which part is waiting - so two answers to
-    // one question, one of them less use than the other. It stands down
-    // whenever the chain is up.
-    if armed {
-        ui.watchdog_penguin.stop();
-        ui.watchdog_penguin.widget.set_visible(false);
-    } else {
-        ui.watchdog_penguin.widget.set_visible(true);
-        ui.watchdog_penguin.idle(moving);
-    }
     refresh_watchdog_steps(ui);
 
     if needs_folder {

@@ -29,13 +29,6 @@ const FRAME_W: u32 = 248;
 const FRAME_H: u32 = 240;
 /// 20fps, the rate the frames were authored at.
 const FRAME_MS: u64 = 50;
-/// Waiting runs at the same rate. Half speed was an attempt to save a slow
-/// machine some drawing, and it read as a penguin in treacle - the frames are
-/// timed for one pace and playing them at another looks broken rather than
-/// calm. If this ever needs to cost less, the answer is fewer frames or a
-/// smaller picture, not a slower clock.
-const IDLE_FRAME_MS: u64 = FRAME_MS;
-
 thread_local! {
     /// Sliced once and reused. Decoding the sheet costs a few milliseconds and
     /// there is no reason to pay it every time a conversion starts.
@@ -232,26 +225,6 @@ impl Penguin {
         }
         self.widget.set_visible(true);
         self.run_at(FRAME_MS);
-    }
-
-    /// Keep moving: here and waiting, rather than stopped and broken-looking.
-    ///
-    /// `moving` is the animations setting: switched off, it sits on one frame
-    /// instead, because someone who has turned animation off has said what
-    /// they think of a dancing penguin.
-    pub fn idle(self: &Rc<Self>, moving: bool) {
-        if self.frames.is_none() {
-            return;
-        }
-        self.halt();
-        if let Some(first) = self.frames.as_ref().and_then(|f| f.first()) {
-            self.widget.set_paintable(Some(first));
-        }
-        self.widget.set_visible(true);
-        if !moving {
-            return;
-        }
-        self.run_at(IDLE_FRAME_MS);
     }
 
     /// Cancel whatever is scheduled without hiding anything.
