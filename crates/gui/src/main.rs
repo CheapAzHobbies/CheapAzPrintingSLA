@@ -309,6 +309,12 @@ struct App {
     watchdog_more: adw::ActionRow,
     watchdog_folder_btn: gtk::Button,
     watchdog_drive_btn: gtk::MenuButton,
+    /// Held, because nothing else holds it. A size group is a plain object
+    /// and the widgets in it do not keep it alive - let the last reference go
+    /// and the widths quietly stop being equal.
+    watchdog_widths: gtk::SizeGroup,
+    /// The same for the queue's columns, which are rebuilt on every refresh.
+    queue_columns: RefCell<Vec<gtk::SizeGroup>>,
     /// The Settings switch, kept in step with the eye. The page is built once,
     /// so it cannot find out on its own that the eye has been pressed.
     auto_switch: RefCell<Option<adw::SwitchRow>>,
@@ -505,6 +511,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         .build();
     watchdog_drive.add_suffix(&choose_drive);
     watchdog_row.add_row(&watchdog_drive);
+
+    let watchdog_widths = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
     let watchdog_more = adw::ActionRow::builder()
         .title("Everything else")
@@ -829,6 +837,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_more: watchdog_more.clone(),
         watchdog_folder_btn: choose_folder.clone(),
         watchdog_drive_btn: choose_drive.clone(),
+        watchdog_widths: watchdog_widths.clone(),
+        queue_columns: RefCell::new(Vec::new()),
         auto_switch: RefCell::new(None),
         auto_settling: RefCell::new(Vec::new()),
         auto_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -2190,6 +2200,11 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         ui.watchdog_more
             .connect_activated(move |_| ui2.shell.show(Section::Settings));
     }
+    // The same width, whichever is holding the longer name. Two controls that
+    // do the same kind of thing, one above the other, should not read as two
+    // different controls because their labels differ in length.
+    ui.watchdog_widths.add_widget(&ui.watchdog_folder_btn);
+    ui.watchdog_widths.add_widget(&ui.watchdog_drive_btn);
     {
         let ui2 = ui.clone();
         ui.watchdog_folder_btn
@@ -2861,6 +2876,16 @@ fn choose_scan_folder(ui: &Rc<App>) {
     );
 }
 
+/// A name short enough to sit on a button without pushing the row apart.
+fn shorten(name: &str) -> String {
+    const MOST: usize = 18;
+    if name.chars().count() <= MOST {
+        return name.to_string();
+    }
+    let kept: String = name.chars().take(MOST - 1).collect();
+    format!("{kept}\u{2026}")
+}
+
 /// Ask for the folder WatchDog should watch.
 fn choose_watch_folder(ui: &Rc<App>) {
     let dialog = gtk::FileDialog::builder().title("Folder to watch").build();
@@ -3026,14 +3051,38 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
     let where_ = dir
         .as_ref()
         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
+    // Where the chosen drive is right now, if it is here at all. Said out
+    // loud because a drive that is set but unplugged looks identical to one
+    // that is set and ready, and they are not the same situation.
+    let drive_at = {
+        let s = ui.settings.borrow();
+        s.auto_target_uuid
+            .as_deref()
+            .and_then(drives::by_uuid)
+            .map(|d| d.path.display().to_string())
+    };
     refresh_dropzone_text(ui);
+    // The buttons carry the answer, the rows carry the detail. A control that
+    // still says "Choose..." after something has been chosen looks like it did
+    // not take - which is exactly what it looked like.
     ui.watchdog_folder.set_subtitle(&match &dir {
         Some(d) => d.display().to_string(),
         None => "Not chosen".into(),
     });
-    ui.watchdog_drive.set_subtitle(match &target {
-        Some(label) => label.as_str(),
-        None => "Not chosen",
+    ui.watchdog_folder_btn.set_label(&match &where_ {
+        Some(name) => shorten(name),
+        None => "Choose…".to_string(),
+    });
+    ui.watchdog_drive.set_subtitle(&match &target {
+        Some(label) => match &drive_at {
+            Some(mount) => format!("{label} - {mount}"),
+            None => format!("{label} - not plugged in"),
+        },
+        None => "Not chosen".into(),
+    });
+    ui.watchdog_drive_btn.set_label(&match &target {
+        Some(label) => shorten(label),
+        None => "Choose…".to_string(),
     });
 
     if !on {
@@ -3707,6 +3756,9 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
     let columns: Vec<gtk::SizeGroup> = (0..if in_columns && !narrow { 4 } else { 1 })
         .map(|_| gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal))
         .collect();
+    // Kept past the end of this function, or they are finalised before the
+    // rows they are meant to be lining up have been given a size.
+    *ui.queue_columns.borrow_mut() = columns.clone();
 
     let mut keys: Vec<String> = Vec::new();
     for item in found {
