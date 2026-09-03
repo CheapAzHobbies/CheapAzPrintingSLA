@@ -159,6 +159,8 @@ struct App {
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
+    /// The width the field is opening to, fixed when it starts moving.
+    search_full: Rc<Cell<i32>>,
     /// How far open the field is, where it is heading, and whether a tick
     /// callback is walking it there.
     search_t: Rc<Cell<f64>>,
@@ -560,6 +562,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_head_list: nearby.head_list,
         nearby_rows_list: nearby.rows_list,
         nearby_search: nearby.search,
+        search_full: Rc::new(Cell::new(SEARCH_WIDTH)),
         search_t: Rc::new(Cell::new(0.0)),
         search_open: Rc::new(Cell::new(false)),
         search_moving: Rc::new(Cell::new(false)),
@@ -986,6 +989,9 @@ fn wire_responsive(ui: &Rc<App>) {
                 if !ui.files.borrow().is_empty() {
                     refresh_queue(&ui);
                 }
+                // The Quick Access rows give up their columns at the same
+                // width the queue rows do.
+                refresh_nearby(&ui);
             }
         })
     };
@@ -1159,6 +1165,11 @@ fn build_nearby_panel() -> NearbyPanel {
     let expander = adw::ExpanderRow::builder()
         .title("Quick Access")
         .expanded(false)
+        // One line each. Wrapped, the count of files and the places they came
+        // from grew the header downwards as the window narrowed, which is the
+        // one row on the page that should not move.
+        .title_lines(1)
+        .subtitle_lines(1)
         .build();
     expander.add_prefix(&gtk::Image::from_icon_name("folder-open-symbolic"));
 
@@ -2483,7 +2494,7 @@ fn refresh_nearby(ui: &Rc<App>) {
         } else {
             format!("Nothing to convert in {}", on.join(", "))
         };
-        ui.nearby_expander.set_subtitle(&said);
+        say_nearby(ui, &said);
         *ui.nearby_subtitle.borrow_mut() = said;
 
         // An empty list that only says "empty" leaves the user to work out
@@ -2537,7 +2548,7 @@ fn refresh_nearby(ui: &Rc<App>) {
         n => format!("{n} files"),
     };
     let said = format!("{count} in {}", places.join(", "));
-    ui.nearby_expander.set_subtitle(&said);
+    say_nearby(ui, &said);
     *ui.nearby_subtitle.borrow_mut() = said;
 
     // Searching is offered whenever there is something to search, and the
@@ -2550,8 +2561,12 @@ fn refresh_nearby(ui: &Rc<App>) {
     // One size group per column, so the four facts about a file start in the
     // same place down the list instead of each row setting its own margins.
     // Only built when they are going to be used.
+    // Narrow, a row is the name and when it arrived. The format, the size and
+    // the folder are all things you can find out by opening the file, and the
+    // name is the thing being chosen between.
+    let narrow = ui.compact.get();
     let in_columns = ui.settings.borrow().quick_access_columns;
-    let columns: Vec<gtk::SizeGroup> = (0..if in_columns { 4 } else { 0 })
+    let columns: Vec<gtk::SizeGroup> = (0..if in_columns && !narrow { 4 } else { 1 })
         .map(|_| gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal))
         .collect();
 
@@ -2566,12 +2581,18 @@ fn refresh_nearby(ui: &Rc<App>) {
             .modified
             .map(render::human_age)
             .unwrap_or_else(|| "date unknown".to_string());
-        let facts = [
-            item.format.clone(),
-            render::human_bytes(item.size),
-            item.source.clone(),
-            age,
-        ];
+        let facts: Vec<String> = if narrow {
+            vec![render::short_age(
+                item.modified.unwrap_or(std::time::UNIX_EPOCH),
+            )]
+        } else {
+            vec![
+                item.format.clone(),
+                render::human_bytes(item.size),
+                item.source.clone(),
+                age,
+            ]
+        };
         keys.push(format!("{name} {}", facts.join(" ")).to_lowercase());
 
         let row = if in_columns {
@@ -2586,6 +2607,8 @@ fn refresh_nearby(ui: &Rc<App>) {
             adw::ActionRow::builder()
                 .title(&name)
                 .subtitle(facts.join("  \u{b7}  "))
+                .title_lines(1)
+                .subtitle_lines(1)
                 .activatable(true)
                 .build()
         };
@@ -2600,7 +2623,7 @@ fn refresh_nearby(ui: &Rc<App>) {
                 cell.add_css_class("cz-dim");
                 // Sizes read as numbers, so they are set against the right
                 // edge of their column; the words against the left of theirs.
-                cell.set_xalign(if i == 1 { 1.0 } else { 0.0 });
+                cell.set_xalign(if !narrow && i == 1 { 1.0 } else { 0.0 });
                 cell.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 columns[i].add_widget(&cell);
                 meta.append(&cell);
@@ -2758,6 +2781,8 @@ const SEARCH_HINT_MIN: i32 = 96;
 /// And what it grows to. A number rather than the field's own natural width,
 /// which is nothing now that it has no character width to claim one from.
 const SEARCH_WIDTH: i32 = 190;
+/// And what it grows to when the window has no width to spare.
+const SEARCH_WIDTH_NARROW: i32 = 104;
 
 /// Open or shut the search field.
 ///
@@ -2774,10 +2799,17 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
     // so it is never mapped at the moment it is asked to open, and checking
     // for it meant every opening snapped instead of animating. Being in a
     // window at all is the real question.
+    ui.search_full.set(if ui.compact.get() {
+        SEARCH_WIDTH_NARROW
+    } else {
+        SEARCH_WIDTH
+    });
+    let full = ui.search_full.get();
+
     let snap = !ui.settings.borrow().animations || entry.root().is_none();
     if snap {
         ui.search_t.set(if open { 1.0 } else { 0.0 });
-        entry.set_size_request(if open { SEARCH_WIDTH } else { SEARCH_SEED }, -1);
+        entry.set_size_request(if open { full } else { SEARCH_SEED }, -1);
         entry.set_opacity(1.0);
         entry.set_visible(open);
         return;
@@ -2796,6 +2828,7 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
     let t = ui.search_t.clone();
     let want = ui.search_open.clone();
     let moving = ui.search_moving.clone();
+    let full = ui.search_full.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
@@ -2820,7 +2853,7 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
         } else {
             grown.powi(3)
         };
-        let wide = SEARCH_SEED + ((SEARCH_WIDTH - SEARCH_SEED) as f64 * eased).round() as i32;
+        let wide = SEARCH_SEED + ((full.get() - SEARCH_SEED) as f64 * eased).round() as i32;
         entry.set_size_request(wide, -1);
         // On the way out the word goes first and stays gone, so the whole
         // shrink is the glass travelling rather than a letter being squeezed
@@ -2844,6 +2877,18 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// What the header says under "Quick Access", or nothing when the window is
+/// too narrow to say it.
+///
+/// Narrow, the title and the three controls beside it are the whole of the
+/// room there is. The count and the places are the first thing to go: they are
+/// a convenience for reading the list without opening it, and opening it says
+/// the same thing better.
+fn say_nearby(ui: &Rc<App>, text: &str) {
+    ui.nearby_expander
+        .set_subtitle(if ui.compact.get() { "" } else { text });
 }
 
 /// Show only the rows matching what has been typed, and say so.
@@ -2883,7 +2928,7 @@ fn apply_nearby_filter(ui: &Rc<App>) {
     } else {
         format!("{hits} of {total} match \u{201c}{typed}\u{201d}")
     };
-    ui.nearby_expander.set_subtitle(&said);
+    say_nearby(ui, &said);
 }
 
 /// Hold the list at one height, whatever its contents now measure.
