@@ -152,8 +152,6 @@ struct App {
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::Entry,
-    /// The magnifying glass. Always there once searching is on offer.
-    nearby_search_btn: gtk::Button,
     /// How far open the field is, where it is heading, and whether a tick
     /// callback is walking it there.
     search_t: Rc<Cell<f64>>,
@@ -182,6 +180,12 @@ struct App {
     /// Lowercased name and facts for each row, in the same order, so the
     /// search can match what the row shows in columns rather than as text.
     nearby_keys: RefCell<Vec<String>>,
+    /// The rows the filter is currently letting through.
+    ///
+    /// Kept rather than asked for, because a widget reports itself invisible
+    /// when any ancestor is - and the whole list is hidden while it is shut,
+    /// which made every row look filtered out and the list measure as nothing.
+    nearby_shown: RefCell<Vec<adw::ActionRow>>,
     /// Held so the volume-monitor signal handlers outlive `wire`.
     volume_monitor: RefCell<Option<gio::VolumeMonitor>>,
     queue_panel: gtk::Box,
@@ -546,7 +550,6 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_head_list: nearby.head_list,
         nearby_rows_list: nearby.rows_list,
         nearby_search: nearby.search,
-        nearby_search_btn: nearby.search_btn,
         search_t: Rc::new(Cell::new(0.0)),
         search_open: Rc::new(Cell::new(false)),
         search_moving: Rc::new(Cell::new(false)),
@@ -561,6 +564,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_sources: nearby.sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
         nearby_keys: RefCell::new(Vec::new()),
+        nearby_shown: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
         queue_panel,
         queue_list,
@@ -1178,11 +1182,7 @@ fn build_nearby_panel() -> NearbyPanel {
     search.set_valign(gtk::Align::Center);
     search.set_visible(false);
 
-    let search_btn = shell::icon_button("system-search-symbolic", "Search the files listed here");
-    search_btn.set_valign(gtk::Align::Center);
-
     expander.add_suffix(&search);
-    expander.add_suffix(&search_btn);
 
     head_list.append(&expander);
     clip.set_child(Some(&list));
@@ -1197,7 +1197,6 @@ fn build_nearby_panel() -> NearbyPanel {
         head_list,
         rows_list: list,
         search,
-        search_btn,
     }
 }
 
@@ -1210,8 +1209,6 @@ struct NearbyPanel {
     head_list: gtk::ListBox,
     rows_list: gtk::ListBox,
     search: gtk::Entry,
-    /// The glass. Sits beside the field once it is open, as its icon.
-    search_btn: gtk::Button,
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -1785,27 +1782,24 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     // Choosing where the suggestions come from, at the point they are shown
     // rather than buried in Settings.
     {
-        // The glass is the way in: it opens the list and puts the cursor in
-        // the box, which is the whole of what someone pressing it wants.
         let ui2 = ui.clone();
-        ui.nearby_search_btn.connect_clicked(move |_| {
-            if !ui2.nearby_expander.is_expanded() {
-                ui2.nearby_expander.set_expanded(true);
-            } else if !ui2.nearby_search.text().is_empty() {
-                // Open with something typed: the glass is now the field's
-                // icon, and the useful thing an icon on a full field does is
-                // empty it.
-                ui2.nearby_search.set_text("");
-            }
-            ui2.nearby_search.grab_focus();
-        });
-    }
-    {
-        let ui2 = ui.clone();
-        ui.nearby_search.connect_changed(move |_| {
+        ui.nearby_search.connect_changed(move |e| {
+            // The only icon the field carries, and only when it would do
+            // something: an always-present one is decoration.
+            e.set_secondary_icon_name(if e.text().is_empty() {
+                None
+            } else {
+                Some("edit-clear-symbolic")
+            });
             apply_nearby_filter(&ui2);
             animate_nearby_height(&ui2, ui2.nearby_clip.height());
         });
+    }
+
+    {
+        let ui2 = ui.clone();
+        ui.nearby_search
+            .connect_icon_release(move |_, _| ui2.nearby_search.set_text(""));
     }
 
     build_sources_menu(ui, &ui.nearby_sources.clone());
@@ -2629,11 +2623,10 @@ fn nearby_rest(ui: &Rc<App>, for_width: i32) -> (i32, i32) {
     if !ui.nearby_expander.is_expanded() {
         return (0, 0);
     }
-    let rows = ui.nearby_rows.borrow();
+    let on = ui.nearby_shown.borrow();
     let limit = ui.settings.borrow().quick_access_visible as usize;
-    // Only the rows actually on screen. A search that hides four of seven
-    // files should shrink the list, not leave it holding room for them.
-    let on: Vec<&adw::ActionRow> = rows.iter().filter(|r| r.is_visible()).collect();
+    // Only the rows the filter is letting through. A search that hides four of
+    // seven files should shrink the list, not hold room for them.
     let height: i32 = on
         .iter()
         .take(limit)
@@ -2656,9 +2649,6 @@ fn show_nearby_search(ui: &Rc<App>, offer: bool) {
     if !offer {
         ui.nearby_search.set_text("");
     }
-    // Visible in both states. Shut it is the button; open it is the field's
-    // icon, in the same place, doing the same job.
-    ui.nearby_search_btn.set_visible(offer);
     open_nearby_search(ui, offer && ui.nearby_expander.is_expanded());
 }
 
@@ -2755,7 +2745,7 @@ fn apply_nearby_filter(ui: &Rc<App>) {
     let rows = ui.nearby_rows.borrow();
     let keys = ui.nearby_keys.borrow();
     let total = rows.len();
-    let mut hits = 0;
+    let mut shown: Vec<adw::ActionRow> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         // Matched against the name and all four facts, because the format or
         // the drive a file came from is a perfectly good way to say what you
@@ -2766,9 +2756,11 @@ fn apply_nearby_filter(ui: &Rc<App>) {
             || row.title().to_lowercase().contains(&needle);
         row.set_visible(hit);
         if hit {
-            hits += 1;
+            shown.push(row.clone());
         }
     }
+    let hits = shown.len();
+    *ui.nearby_shown.borrow_mut() = shown;
     drop(keys);
     drop(rows);
 
@@ -2805,6 +2797,9 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let for_width = if width > 0 { width } else { -1 };
     let (to, cap) = nearby_rest(ui, for_width);
     ui.nearby_cap.set(cap);
+    if to > 0 {
+        ui.nearby_rows_list.set_visible(true);
+    }
 
     if ui.nearby_moving.get() {
         // Already walking. Aim it somewhere else from wherever it has got to,
@@ -2816,10 +2811,15 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         }
         return;
     }
-    if from <= 0 || from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
+    // Note `from` is not tested for zero. Opening from nothing is what every
+    // opening looks like now that the list is not inside the expander's own
+    // revealer, and treating it as "not laid out yet" made every opening
+    // teleport to full height.
+    if from == to || !clip.is_mapped() || !ui.settings.borrow().animations {
         settle_nearby(&clip, cap);
         if to == 0 {
             ui.nearby_head_list.remove_css_class("cz-qa-open");
+            ui.nearby_rows_list.set_visible(false);
         }
         return;
     }
@@ -2827,6 +2827,7 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         settle_nearby(&clip, cap);
         if to == 0 {
             ui.nearby_head_list.remove_css_class("cz-qa-open");
+            ui.nearby_rows_list.set_visible(false);
         }
         return;
     };
@@ -2846,6 +2847,7 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
     let moving = ui.nearby_moving.clone();
     let rest = ui.nearby_cap.clone();
     let head = ui.nearby_head_list.clone();
+    let body = ui.nearby_rows_list.clone();
     let last = Cell::new(None::<i64>);
     root.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
@@ -2867,8 +2869,12 @@ fn animate_nearby_height(ui: &Rc<App>, from: i32) {
         if t >= 1.0 {
             settle_nearby(&clip, rest.get());
             if target.get() <= 0.0 {
-                // Fully shut at last: the header may have its corners back.
+                // Fully shut at last: the header may have its corners back,
+                // and the list stops being drawn entirely. At zero height it
+                // still painted its own border, which read as a stripe of a
+                // slightly different grey tucked under the header.
                 head.remove_css_class("cz-qa-open");
+                body.set_visible(false);
             }
             moving.set(false);
             return glib::ControlFlow::Break;

@@ -142,18 +142,23 @@ fn sheet(p: &Palette) -> String {
    seam invisible: the header loses its bottom corners while the list is open,
    and the list loses its top corners and its top border, so the two read as
    one card with a single line across it. */
-.cz-qa-head {{
+.cz-qa-head, .cz-qa-head > row {{
   transition: border-radius 200ms ease;
 }}
-.cz-qa-head.cz-qa-open {{
+/* The row, not just the list: a boxed list draws its rounded corners on its
+   first and last rows, so squaring off the list alone changed nothing that
+   could be seen. */
+.cz-qa-head.cz-qa-open,
+.cz-qa-head.cz-qa-open > row {{
   border-bottom-left-radius: 0;
   border-bottom-right-radius: 0;
 }}
-.cz-qa-body {{
+.cz-qa-body,
+.cz-qa-body > row:first-child {{
   border-top-left-radius: 0;
   border-top-right-radius: 0;
-  border-top: none;
 }}
+.cz-qa-body {{ border-top: none; }}
 
 /* ---- queue ---- */
 .cz-queue > row {{
