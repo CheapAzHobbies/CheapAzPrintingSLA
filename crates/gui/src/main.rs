@@ -1183,6 +1183,12 @@ fn build_nearby_panel() -> NearbyPanel {
     // driven entirely by the request instead.
     search.set_width_chars(0);
     search.set_max_width_chars(0);
+    // Back inside the box, where a search field's glass belongs. It was a
+    // button beside the field before, which is a different thing wearing the
+    // same icon; there is nothing outside the field to press now.
+    search.set_primary_icon_name(Some("system-search-symbolic"));
+    search.set_primary_icon_activatable(false);
+    search.set_primary_icon_sensitive(false);
     search.set_valign(gtk::Align::Center);
     search.set_visible(false);
 

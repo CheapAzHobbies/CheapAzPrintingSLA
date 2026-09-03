@@ -150,6 +150,34 @@ fn sheet(p: &Palette) -> String {
 .cz-qa-head, .cz-qa-head > row {{
   transition: border-radius 200ms linear;
 }}
+/* The header was exactly the shade of the files under it, so open, the two
+   read as one undifferentiated slab and the seam between them was doing all
+   the work. Lifting it a step separates the control strip from the contents
+   without turning it into a second colour in the window. The row carries it
+   Painted once, by the list, with the row left transparent on top of it. Both
+   draw a corner and both transition it, so if each carried its own tint the
+   rounding would show one shade over the other - and two tints stacked came
+   out twice as strong as intended anyway.
+
+   A tint laid over the background rather than a colour replacing it: the card
+   shade comes from the platform stylesheet and is not ours to name, and the
+   first attempt at naming it landed a shade darker than the rows instead of
+   lighter. */
+.cz-qa-head {{
+  background-image: linear-gradient(alpha(@cz_text, 0.05), alpha(@cz_text, 0.05));
+}}
+/* Every row inside, not just the outer one. An expander row keeps a header
+   row of its own further in, and that one paints a background while it is
+   expanded and not while it is shut - so the header came out two different
+   shades depending on whether the list was open. */
+.cz-qa-head row {{
+  background-color: transparent;
+  background-image: none;
+}}
+/* Put the hover back, which the rule above would otherwise take with it. */
+.cz-qa-head row:hover {{
+  background-image: linear-gradient(alpha(@cz_text, 0.05), alpha(@cz_text, 0.05));
+}}
 /* The row, not just the list: a boxed list draws its rounded corners on its
    first and last rows, so squaring off the list alone changed nothing that
    could be seen. */
