@@ -242,9 +242,14 @@ fn sheet(p: &Palette) -> String {
 .cz-refresh:hover image {{
   -gtk-icon-transform: rotate(90deg);
 }}
+/* Starts where the hover left it. The pointer is on the button at the moment
+   it is clicked, so the arrow is already a quarter turn round; a rotation
+   starting from zero would snap it backwards before setting off. Ending a full
+   turn later puts it back on the quarter, which is where the hover wants it
+   anyway - so stopping is as seamless as starting. */
 @keyframes cz-turn {{
-  from {{ -gtk-icon-transform: rotate(0deg); }}
-  to {{ -gtk-icon-transform: rotate(360deg); }}
+  from {{ -gtk-icon-transform: rotate(90deg); }}
+  to {{ -gtk-icon-transform: rotate(450deg); }}
 }}
 /* No transition while it is turning: a 180ms ease fighting a 900ms rotation
    drags the arrow backwards every time the keyframe wraps. */

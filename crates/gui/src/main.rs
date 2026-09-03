@@ -2017,23 +2017,54 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         // what "convert it back" means in practice.
         let swap = ui.swap_btn.clone();
         let ui = ui.clone();
+        // A real exchange, both ways round. It used to set the output to the
+        // input's format and stop there, which left the two boxes reading the
+        // same thing and the input still saying it was detecting - a swap that
+        // had visibly only done half of itself.
+        //
+        // Swapping pins the input, necessarily: detection would read the file
+        // and put the old answer straight back, so the new one has to be told.
+        // That is also the honest cost of the button - the input format is a
+        // fact about the file on disk, not a preference, so asking to read an
+        // SL1 as a GOO can fail. It says so when it does, and the input menu's
+        // "Detect Automatically" puts it back.
         swap.connect_clicked(move |_| {
             let input = ui
                 .files
                 .borrow()
                 .get(*ui.selected.borrow())
-                .map(|f| f.format.clone());
-            if let Some(id) = input {
-                if registry::by_id(&id).map(|h| h.info().capabilities.writes) == Some(true) {
-                    ui.output_picker.set_selected(&id);
-                    suggest_name(&ui);
-                    revalidate(&ui);
-                } else {
-                    ui.toasts.add_toast(adw::Toast::new(
-                        "That format cannot be written yet, so there is nothing to swap to",
-                    ));
-                }
+                .map(|f| f.format.clone())
+                .filter(|id| !id.is_empty());
+            let Some(input) = input else {
+                ui.toasts.add_toast(adw::Toast::new(
+                    "Nothing to swap yet - the file is still being read",
+                ));
+                return;
+            };
+            let Some(output) = ui.output_picker.selected() else {
+                return;
+            };
+            if input == output {
+                ui.toasts
+                    .add_toast(adw::Toast::new("Both sides are already the same format"));
+                return;
             }
+            if registry::by_id(&input).map(|h| h.info().capabilities.writes) != Some(true) {
+                ui.toasts.add_toast(adw::Toast::new(
+                    "That format cannot be written yet, so there is nothing to swap to",
+                ));
+                return;
+            }
+            if registry::by_id(output).map(|h| h.info().capabilities.reads) != Some(true) {
+                ui.toasts.add_toast(adw::Toast::new(
+                    "That format cannot be read yet, so there is nothing to swap from",
+                ));
+                return;
+            }
+            ui.output_picker.set_selected(&input);
+            force_input_format(&ui, Some(output.to_string()));
+            suggest_name(&ui);
+            revalidate(&ui);
         });
     }
 
@@ -2557,6 +2588,7 @@ fn refresh_nearby(ui: &Rc<App>) {
     // window, and long enough that a spinning arrow is worth having.
     let sources = nearby::sources(open_dir.as_deref(), &extra, &off, &hidden, &drives_on);
     let queued: Vec<PathBuf> = ui.files.borrow().iter().map(|f| f.path.clone()).collect();
+    let limit = ui.settings.borrow().quick_access_limit as usize;
 
     let generation = ui.scan_gen.get().wrapping_add(1);
     ui.scan_gen.set(generation);
@@ -2566,7 +2598,7 @@ fn refresh_nearby(ui: &Rc<App>) {
     let (tx, rx) = async_channel::bounded(1);
     let looking = sources.clone();
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(nearby::scan(&looking, &queued));
+        let _ = tx.send_blocking(nearby::scan(&looking, &queued, limit));
     });
 
     let ui = ui.clone();
@@ -5769,6 +5801,31 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     opening.add_row(&visible_row);
+
+    let limit_row = adw::SpinRow::builder()
+        .title("Files offered")
+        .subtitle("The newest this many, counted across every folder and drive")
+        .adjustment(&gtk::Adjustment::new(
+            current.quick_access_limit as f64,
+            1.0,
+            200.0,
+            1.0,
+            10.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        limit_row.connect_value_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.quick_access_limit = r.value() as u32;
+                let _ = s.save();
+            }
+            refresh_nearby(&ui);
+        });
+    }
+    opening.add_row(&limit_row);
 
     let layout_row = adw::ComboRow::builder()
         .title("File details")

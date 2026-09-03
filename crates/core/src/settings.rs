@@ -100,6 +100,12 @@ pub struct Settings {
     /// How many files the Quick Access list shows before it starts scrolling
     /// inside itself, rather than growing the page.
     pub quick_access_visible: u32,
+    /// How many files Quick Access offers at all, newest first.
+    ///
+    /// A folder of a thousand prints is a real thing to have, and offering all
+    /// of them means reading all of them before anything appears. Ten is
+    /// plenty for "the file I just sliced" - which is what this list is for.
+    pub quick_access_limit: u32,
     /// Set each file's format, size, folder and age in columns to the right of
     /// its name, rather than as a line of text underneath it.
     ///
@@ -156,6 +162,7 @@ impl Default for Settings {
             quick_access_hidden: Vec::new(),
             quick_access_drives_on: Vec::new(),
             quick_access_visible: 5,
+            quick_access_limit: 10,
             quick_access_columns: true,
             never_eject: Vec::new(),
         }
@@ -282,6 +289,11 @@ impl Settings {
                 s.quick_access_visible = n.clamp(1, 40);
             }
         }
+        if let Some(v) = map.get("quick_access_limit") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.quick_access_limit = n.clamp(1, 200);
+            }
+        }
         if let Some(v) = map.get("quick_access_columns") {
             s.quick_access_columns = v == "true";
         }
@@ -353,6 +365,7 @@ impl Settings {
              quick_access_drives_on = {}\n\
              quick_access_visible = {}\n\
              quick_access_columns = {}\n\
+             quick_access_limit = {}\n\
              follow_drive = {}\n\
              recent_output_shown = {}\n\
              hidden_input_formats = {}\n\
@@ -393,6 +406,7 @@ impl Settings {
             self.quick_access_drives_on.join("\x1f"),
             self.quick_access_visible,
             self.quick_access_columns,
+            self.quick_access_limit,
             self.follow_drive,
             self.recent_output_shown,
             self.hidden_input_formats.join("\x1f"),

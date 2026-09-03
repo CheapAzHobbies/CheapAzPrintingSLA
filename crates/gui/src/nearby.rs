@@ -50,10 +50,10 @@ pub struct Source {
     pub opt_in: bool,
 }
 
-/// Directories are scanned one level deep only.
-const MAX_PER_DIR: usize = 25;
-/// Total across every directory, so a full drive cannot flood the list.
-const MAX_TOTAL: usize = 40;
+/// A ceiling on how many convertible files are considered in one directory,
+/// so a folder with a pathological number of them cannot stall a scan. Well
+/// above any limit worth offering, because this is a guard and not a policy.
+const MAX_PER_DIR: usize = 500;
 
 /// Everywhere Quick Access could look, in the order it will look.
 ///
@@ -134,20 +134,23 @@ pub fn sources(
     out
 }
 
-/// Files worth offering, newest first, from the sources that are switched on.
+/// The newest `limit` files worth offering, from the sources switched on.
 ///
 /// `exclude` is normally whatever is already queued: re-offering a file that
 /// is on screen is noise.
-pub fn scan(sources: &[Source], exclude: &[PathBuf]) -> Vec<Found> {
+///
+/// Only the extension is looked at before a file is measured, so a folder of
+/// a thousand photographs costs a directory listing and nothing else.
+pub fn scan(sources: &[Source], exclude: &[PathBuf], limit: usize) -> Vec<Found> {
     let mut out: Vec<Found> = Vec::new();
     for source in sources.iter().filter(|s| s.enabled) {
         out.extend(scan_one(&source.path, &source.label, exclude));
-        if out.len() >= MAX_TOTAL {
-            break;
-        }
     }
+    // Every source is read before anything is thrown away. Stopping early
+    // would mean the answer depended on which folder was listed first, and
+    // "the newest ten" has to be the newest ten of all of them.
     out.sort_by_key(|f| std::cmp::Reverse(f.modified));
-    out.truncate(MAX_TOTAL);
+    out.truncate(limit);
     out
 }
 
@@ -273,7 +276,7 @@ mod tests {
         // .sl1 and .goo are readable; the rest are not print files at all and
         // must not be suggested for conversion.
         let d = Dir::new("formats", &["a.sl1", "b.goo", "notes.txt", "photo.png"]);
-        let mut got = names(&scan(&[d.source(true)], &[]));
+        let mut got = names(&scan(&[d.source(true)], &[], 40));
         got.sort();
         assert_eq!(got, vec!["a.sl1", "b.goo"]);
     }
@@ -281,14 +284,14 @@ mod tests {
     #[test]
     fn a_source_that_is_switched_off_is_not_read() {
         let d = Dir::new("off", &["a.sl1"]);
-        assert!(scan(&[d.source(false)], &[]).is_empty());
+        assert!(scan(&[d.source(false)], &[], 40).is_empty());
     }
 
     #[test]
     fn files_already_queued_are_not_offered_again() {
         let d = Dir::new("exclude", &["a.sl1", "b.sl1"]);
         let queued = vec![d.0.join("a.sl1")];
-        assert_eq!(names(&scan(&[d.source(true)], &queued)), vec!["b.sl1"]);
+        assert_eq!(names(&scan(&[d.source(true)], &queued, 40)), vec!["b.sl1"]);
     }
 
     #[test]
@@ -304,7 +307,10 @@ mod tests {
             opt_in: false,
         };
         let d = Dir::new("missing", &["a.sl1"]);
-        assert_eq!(names(&scan(&[missing, d.source(true)], &[])), vec!["a.sl1"]);
+        assert_eq!(
+            names(&scan(&[missing, d.source(true)], &[], 40)),
+            vec!["a.sl1"]
+        );
     }
 
     #[test]
@@ -321,7 +327,7 @@ mod tests {
         f.set_modified(old).unwrap();
         fs::write(d.0.join("new.sl1"), b"x").unwrap();
         assert_eq!(
-            names(&scan(&[d.source(true)], &[])),
+            names(&scan(&[d.source(true)], &[], 40)),
             vec!["new.sl1", "old.sl1"]
         );
     }
@@ -329,7 +335,7 @@ mod tests {
     #[test]
     fn each_file_says_where_it_came_from() {
         let d = Dir::new("origin", &["a.sl1"]);
-        let found = scan(&[d.source(true)], &[]);
+        let found = scan(&[d.source(true)], &[], 40);
         assert_eq!(found[0].source, "Scratch");
         // The handler's display name, not the extension: this is what the row
         // shows, and "PrusaSlicer SL1" is more use than "SL1" when the point
