@@ -2066,10 +2066,20 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 ));
                 return;
             }
+            let reading = registry::by_id(output)
+                .map(|h| h.info().name)
+                .unwrap_or(output);
             ui.output_picker.set_selected(&input);
             force_input_format(&ui, Some(output.to_string()));
             suggest_name(&ui);
             revalidate(&ui);
+            // Said once, at the moment of the swap, because the failure that
+            // follows a swap onto the wrong format is a correct answer that
+            // reads exactly like a broken button.
+            ui.toasts.add_toast(adw::Toast::new(&format!(
+                "Now reading as {reading}. If it will not open, set Input back to \
+                 Detect Automatically."
+            )));
         });
     }
 
@@ -3479,13 +3489,16 @@ type ReadFailure = (String, Vec<Suggestion>);
 fn refresh_input_label(ui: &Rc<App>) {
     let files = ui.files.borrow();
     let text = match files.get(*ui.selected.borrow()) {
+        // What it has been set to, ahead of what was last read successfully.
+        // A forced format that the file turns out not to be leaves the old
+        // detected one sitting in `format`, and showing that made the control
+        // look like it had ignored the instruction - the swap button appeared
+        // to leave the input untouched when it had in fact changed it.
+        Some(f) if f.forced_format.is_some() => {
+            f.forced_format.clone().unwrap_or_default().to_uppercase()
+        }
         Some(f) if !f.format.is_empty() => {
-            let name = f.format.to_uppercase();
-            if f.forced_format.is_some() {
-                name
-            } else {
-                format!("{name} (Detect Automatically)")
-            }
+            format!("{} (Detect Automatically)", f.format.to_uppercase())
         }
         // A file that has not been read yet, or could not be. It still has a
         // setting, and "—" alone said nothing about what that setting was -
@@ -5665,12 +5678,12 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     let page = adw::PreferencesPage::new();
 
     let (conversion_group, conversion) =
-        settings_section("Conversion", "What CheapAzSLA checks before writing a file");
+        settings_section("Converting", "Checks to run before a file is written");
     let current = ui.settings.borrow().clone();
 
     let warn = adw::SwitchRow::builder()
-        .title("Warn before dropping information")
-        .subtitle("Ask first when the output format cannot hold everything the source has")
+        .title("Warn if something will be lost")
+        .subtitle("Some formats cannot store everything. Ask me before dropping anything.")
         .active(current.warn_on_information_loss)
         .build();
     {
@@ -5684,8 +5697,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     conversion.add_row(&warn);
 
     let overwrite = adw::SwitchRow::builder()
-        .title("Confirm before replacing a file")
-        .subtitle("Ask when a file of the same name is already there")
+        .title("Ask before overwriting")
+        .subtitle("Check with me when a file of that name is already there")
         .active(current.confirm_overwrite)
         .build();
     {
@@ -5699,10 +5712,11 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     conversion.add_row(&overwrite);
     page.add(&conversion_group);
 
-    let (appearance_group, appearance) = settings_section("Appearance", "How the window moves");
+    let (appearance_group, appearance) =
+        settings_section("Appearance", "How the window looks and moves");
     let animate = adw::SwitchRow::builder()
-        .title("Animate the interface")
-        .subtitle("The sidebar folding and pages changing. Off, they happen at once")
+        .title("Animations")
+        .subtitle("Menus and pages slide. Turn off and they change instantly.")
         .active(current.animations)
         .build();
     {
@@ -5779,10 +5793,10 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add_row(&open_row);
 
     let nearby_row = adw::SwitchRow::builder()
-        .title("Quick Access list")
+        .title("Show Quick Access")
         .subtitle(
-            "Offer convertible files from your chosen folders on the Convert page. \
-             Drives are listed there but only read once you switch them on.",
+            "Lists files from your folders on the Convert page, so you can pick one \
+             without browsing. Drives are listed but not read until you switch them on.",
         )
         .active(current.show_nearby_files)
         .build();
@@ -5800,8 +5814,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add_row(&nearby_row);
 
     let visible_row = adw::SpinRow::builder()
-        .title("Files shown at once")
-        .subtitle("Longer lists scroll inside the panel instead of stretching the page")
+        .title("Rows before it scrolls")
+        .subtitle("How tall Quick Access gets before you scroll inside it instead")
         .adjustment(&gtk::Adjustment::new(
             current.quick_access_visible as f64,
             1.0,
@@ -5825,8 +5839,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add_row(&visible_row);
 
     let limit_row = adw::SpinRow::builder()
-        .title("Files offered")
-        .subtitle("The newest this many, counted across every folder and drive")
+        .title("How many files to find")
+        .subtitle("Quick Access lists the newest this many, across all your folders")
         .adjustment(&gtk::Adjustment::new(
             current.quick_access_limit as f64,
             1.0,
@@ -5850,8 +5864,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     opening.add_row(&limit_row);
 
     let layout_row = adw::ComboRow::builder()
-        .title("File details")
-        .subtitle("Where each file's format, size, folder and age are shown")
+        .title("Where file details go")
+        .subtitle("The format, size, folder and age of each file")
         .model(&gtk::StringList::new(&[
             "In columns beside the name",
             "On a line under the name",
@@ -5879,7 +5893,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     if !current.quick_access_hidden.is_empty() {
         let removed = current.quick_access_hidden.len();
         let row = adw::ActionRow::builder()
-            .title("Removed places")
+            .title("Folders you removed")
             .subtitle(match removed {
                 1 => "One folder or drive is no longer offered".to_string(),
                 n => format!("{n} folders and drives are no longer offered"),
@@ -5910,8 +5924,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         "What the Save to menu offers, and in what order",
     );
     let recents_row = adw::SpinRow::builder()
-        .title("Recent folders offered")
-        .subtitle("Beyond the drive and beside the original, which are always there")
+        .title("Recent folders to list")
+        .subtitle("Extra places in the Save to menu, on top of the two always there")
         .adjustment(&gtk::Adjustment::new(
             current.recent_output_shown as f64,
             0.0,
@@ -5932,10 +5946,10 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     saving.add_row(&recents_row);
 
     let pin_row = adw::SwitchRow::builder()
-        .title("Always start with these")
+        .title("Always start here")
         .subtitle(
-            "Open with the destination and output format set now. \
-             Off, the window carries on where it left off.",
+            "Every launch uses the Save to and output format you have set right now. \
+             Turn off and it carries on from wherever you left it.",
         )
         .active(current.startup_pinned)
         .build();
@@ -5969,23 +5983,22 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     let formats_group = adw::PreferencesGroup::builder()
         .title("Formats")
         .description(
-            "Turn off the ones you never use and they stop appearing in the menus. \
-             Nothing is lost - a file in a format you have switched off still opens \
-             if you choose it by hand.",
+            "Turn off the ones you never use to keep the menus short. Nothing is lost: \
+             a file in a format you switched off still opens if you pick it yourself.",
         )
         .build();
 
     for (title, subtitle, listed, hidden_now, writing) in [
         (
             "Opens",
-            "Formats offered when reading a file",
+            "Which formats show up when picking a file to read",
             registry::readable(),
             current.hidden_input_formats.clone(),
             false,
         ),
         (
             "Saves as",
-            "Formats offered in the output menu",
+            "Which formats show up in the output menu",
             registry::writable(),
             current.hidden_output_formats.clone(),
             true,
@@ -6032,11 +6045,16 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
 
     let (drives_group, drives) = settings_section(
         "Drives",
-        "Pinned drives appear in the Save to menu, remembered by name",
+        "USB drives and SD cards, and where files go on them",
     );
     let sub_row = adw::EntryRow::builder()
-        .title("Subfolder on pinned drives")
+        .title("Folder to save into on a drive")
         .build();
+    // An entry row has no room for a second line, and the title alone does not
+    // say what an empty box means.
+    sub_row.set_tooltip_text(Some(
+        "Made on the drive if it is not there. Leave empty to save to the top level.",
+    ));
     sub_row.set_text(&current.pinned_subfolder);
     {
         let ui = ui.clone();
@@ -6049,8 +6067,8 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     drives.add_row(&sub_row);
 
     let follow_row = adw::SwitchRow::builder()
-        .title("Follow new drives")
-        .subtitle("Point the output at a removable drive as soon as it is plugged in")
+        .title("Switch to a drive when I plug it in")
+        .subtitle("Sets Save to that drive the moment it appears")
         .active(current.auto_lock_new_drives)
         .build();
     {
@@ -6190,11 +6208,11 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     // other one and nobody should meet it on the way to something else.
     let reset_group = adw::PreferencesGroup::builder()
         .title("Start over")
-        .description("Puts every setting on this page back to how it arrived")
+        .description("Put everything on this page back to how it came")
         .build();
     let reset_row = adw::ActionRow::builder()
         .title("Reset all settings")
-        .subtitle("Your files, history and drives are not touched")
+        .subtitle("Only settings. Your files, history and drives are untouched.")
         .build();
     let reset_btn = gtk::Button::with_label("Reset");
     reset_btn.add_css_class("destructive-action");
@@ -6254,7 +6272,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     reset_group.add(&reset_row);
 
     let (about_group, about) =
-        settings_section("About", "Version, formats and where to find the source");
+        settings_section("About", "Version, formats, and where the code lives");
     about.add_row(
         &adw::ActionRow::builder()
             .title("CheapAzSLA")
