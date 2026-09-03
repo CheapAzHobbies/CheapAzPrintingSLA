@@ -307,6 +307,8 @@ struct App {
     watchdog_folder: adw::ActionRow,
     watchdog_drive: adw::ActionRow,
     watchdog_more: adw::ActionRow,
+    watchdog_folder_btn: gtk::Button,
+    watchdog_drive_btn: gtk::MenuButton,
     /// The Settings switch, kept in step with the eye. The page is built once,
     /// so it cannot find out on its own that the eye has been pressed.
     auto_switch: RefCell<Option<adw::SwitchRow>>,
@@ -484,7 +486,6 @@ fn build(app: &adw::Application) -> Rc<App> {
         .build();
     let choose_folder = gtk::Button::with_label("Choose…");
     choose_folder.set_valign(gtk::Align::Center);
-    choose_folder.set_widget_name("watchdog-folder");
     watchdog_folder.add_suffix(&choose_folder);
     watchdog_row.add_row(&watchdog_folder);
 
@@ -493,10 +494,15 @@ fn build(app: &adw::Application) -> Rc<App> {
         .subtitle("Not chosen")
         .subtitle_lines(1)
         .build();
-    let choose_drive = gtk::Button::with_label("Use This");
-    choose_drive.set_valign(gtk::Align::Center);
-    choose_drive.set_widget_name("watchdog-drive");
-    choose_drive.set_tooltip_text(Some("Records the drive that is plugged in now"));
+    // A menu of the drives that are actually plugged in, rather than a button
+    // that silently takes the first one it finds. With two sticks attached
+    // there was no way to say which, and with one there was no way to see that
+    // it had understood which.
+    let choose_drive = gtk::MenuButton::builder()
+        .label("Choose…")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Pick which drive WatchDog copies to")
+        .build();
     watchdog_drive.add_suffix(&choose_drive);
     watchdog_row.add_row(&watchdog_drive);
 
@@ -821,6 +827,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_folder: watchdog_folder.clone(),
         watchdog_drive: watchdog_drive.clone(),
         watchdog_more: watchdog_more.clone(),
+        watchdog_folder_btn: choose_folder.clone(),
+        watchdog_drive_btn: choose_drive.clone(),
         auto_switch: RefCell::new(None),
         auto_settling: RefCell::new(Vec::new()),
         auto_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -2182,14 +2190,12 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         ui.watchdog_more
             .connect_activated(move |_| ui2.shell.show(Section::Settings));
     }
-    if let Some(b) = find_named(&ui.page_faces, "watchdog-folder") {
+    {
         let ui2 = ui.clone();
-        b.connect_clicked(move |_| choose_watch_folder(&ui2));
+        ui.watchdog_folder_btn
+            .connect_clicked(move |_| choose_watch_folder(&ui2));
     }
-    if let Some(b) = find_named(&ui.page_faces, "watchdog-drive") {
-        let ui2 = ui.clone();
-        b.connect_clicked(move |_| use_current_drive(&ui2));
-    }
+    build_watchdog_drive_menu(ui);
 
     build_sources_menu(ui, &ui.nearby_sources.clone());
 
@@ -2878,34 +2884,78 @@ fn choose_watch_folder(ui: &Rc<App>) {
     );
 }
 
-/// Remember the drive that is plugged in now, by its filesystem rather than
-/// by its name.
-fn use_current_drive(ui: &Rc<App>) {
-    let picked = ui
-        .out_dir
-        .borrow()
-        .as_deref()
-        .and_then(drives::containing)
-        .filter(|d| d.removable)
-        .or_else(|| drives::mounted().into_iter().find(|d| d.removable));
-    let Some(drive) = picked else {
-        ui.toasts
-            .add_toast(adw::Toast::new("Plug the drive in first"));
-        return;
-    };
-    let Some(uuid) = drives::uuid_of(&drive.path) else {
-        ui.toasts.add_toast(adw::Toast::new(
-            "That drive has no filesystem UUID, so it cannot be told apart from another",
-        ));
-        return;
-    };
-    {
-        let mut s = ui.settings.borrow_mut();
-        s.auto_target_uuid = Some(uuid);
-        s.auto_target_label = Some(drive.name.clone());
-        let _ = s.save();
-    }
-    rearm_auto(ui);
+/// The menu of drives WatchDog could copy to.
+///
+/// Rebuilt every time it opens, because drives come and go while the window is
+/// up. Only removable ones, and only ones with a filesystem UUID - a drive
+/// that cannot be told apart from another is not a drive this may write to
+/// unattended.
+fn build_watchdog_drive_menu(ui: &Rc<App>) {
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("cz-menu");
+    let popover = gtk::Popover::builder().child(&list).build();
+    popover.add_css_class("menu");
+    ui.watchdog_drive_btn.set_popover(Some(&popover));
+
+    let ui = ui.clone();
+    let pop = popover.clone();
+    popover.connect_show(move |_| {
+        while let Some(row) = list.first_child() {
+            list.remove(&row);
+        }
+        let usable: Vec<(drives::Drive, String)> = drives::mounted()
+            .into_iter()
+            .filter(|d| d.removable && !drives::is_system_mount(&d.path))
+            .filter_map(|d| drives::uuid_of(&d.path).map(|u| (d, u)))
+            .collect();
+
+        if usable.is_empty() {
+            let empty = gtk::Label::new(Some("No drive is plugged in"));
+            empty.add_css_class("cz-dim");
+            empty.set_margin_top(theme::SPACE_3);
+            empty.set_margin_bottom(theme::SPACE_3);
+            empty.set_margin_start(theme::SPACE_3);
+            empty.set_margin_end(theme::SPACE_3);
+            list.append(
+                &gtk::ListBoxRow::builder()
+                    .child(&empty)
+                    .activatable(false)
+                    .build(),
+            );
+            return;
+        }
+
+        for (drive, uuid) in usable {
+            let row = adw::ActionRow::builder()
+                .title(&drive.name)
+                // The path, because two unlabelled sticks are both called
+                // "4.0 GB Volume" and the only thing telling them apart on
+                // screen is where they are mounted.
+                .subtitle(drive.path.display().to_string())
+                .activatable(true)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(
+                "drive-removable-media-symbolic",
+            ));
+            let ui2 = ui.clone();
+            let pop2 = pop.clone();
+            let name = drive.name.clone();
+            row.connect_activated(move |_| {
+                {
+                    let mut s = ui2.settings.borrow_mut();
+                    s.auto_target_uuid = Some(uuid.clone());
+                    s.auto_target_label = Some(name.clone());
+                    let _ = s.save();
+                }
+                pop2.popdown();
+                rearm_auto(&ui2);
+                ui2.toasts
+                    .add_toast(adw::Toast::new(&format!("WatchDog will copy to {name}")));
+            });
+            list.append(&row);
+        }
+    });
 }
 
 /// Say what is missing, rather than walking off to another page to show it.
