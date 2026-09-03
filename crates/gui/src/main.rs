@@ -2050,16 +2050,27 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
             // it is how it leaves. A folder is there because of something the
             // user did, and switching it off is not the same as being done
             // with it: off still leaves it sitting in the list.
+            //
+            // Removal is on the secondary click rather than a button in the
+            // row. A button had to sit somewhere, and the only place for it
+            // pushed the switch off the edge it lines up on - the row read as
+            // cluttered for the sake of something used once. The tooltip is
+            // what makes it findable, since a right-click nobody knows about
+            // is the same as no right-click.
             if source.removable_entry {
-                let drop = shell::icon_button("window-close-symbolic", "Remove from the list");
-                drop.set_valign(gtk::Align::Center);
+                row.set_tooltip_text(Some("Right-click to remove from the list"));
+                let menu = gtk::GestureClick::new();
+                menu.set_button(gdk::BUTTON_SECONDARY);
+                // Capture, so the switch does not swallow the press first.
+                menu.set_propagation_phase(gtk::PropagationPhase::Capture);
                 let ui2 = ui.clone();
                 let path = source.path.clone();
                 let key = source.key.clone();
-                // Weak, because the row owns the button which owns this
+                let label = source.label.clone();
+                // Weak, because the row owns the gesture which owns this
                 // closure: a strong handle back to the row is a cycle.
                 let gone = row.downgrade();
-                drop.connect_clicked(move |_| {
+                menu.connect_pressed(move |_, _, _, _| {
                     {
                         let mut s = ui2.settings.borrow_mut();
                         // Dropped as an added folder and recorded as hidden.
@@ -2083,8 +2094,14 @@ fn build_sources_menu(ui: &Rc<App>, button: &gtk::MenuButton) {
                             list.remove(&row);
                         }
                     }
+                    // Said out loud, because a right-click that silently makes
+                    // a row disappear is indistinguishable from a misclick -
+                    // and the way back is not obvious enough to leave unsaid.
+                    ui2.toasts.add_toast(adw::Toast::new(&format!(
+                        "{label} removed. Add Folder puts it back."
+                    )));
                 });
-                row.add_suffix(&drop);
+                row.add_controller(menu);
             }
             list.append(&row);
         }
