@@ -66,6 +66,22 @@ const OK: &str = "#4caf7d";
 const WARN: &str = "#d9a441";
 const ERROR: &str = "#e05a5a";
 
+/// The error colour as components, for the few places that draw rather than
+/// style - a cross struck through an icon has to be the same red as the words
+/// that explain it.
+pub fn error_rgb() -> (f64, f64, f64) {
+    hex_rgb(ERROR)
+}
+
+fn hex_rgb(hex: &str) -> (f64, f64, f64) {
+    let h = hex.trim_start_matches('#');
+    let at = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0) as f64 / 255.0;
+    if h.len() < 6 {
+        return (1.0, 0.0, 0.0);
+    }
+    (at(0), at(2), at(4))
+}
+
 fn sheet(p: &Palette) -> String {
     format!(
         r#"
@@ -273,13 +289,44 @@ fn sheet(p: &Palette) -> String {
 
 /* ---- WatchDog's milestones ---- */
 .cz-steps {{ margin-top: {space_3}px; }}
-.cz-step-link {{ min-height: 4px; }}
-/* Waiting is dim but present: not this step's turn is not the same as
-   something being wrong with it. */
-.cz-step-waiting {{ color: @cz_dim; opacity: 0.55; }}
-.cz-step-working {{ color: @cz_accent; }}
-.cz-step-done {{ color: @cz_text; }}
-.cz-step-missing {{ color: {error}; }}
+.cz-step-link, .cz-step-link trough, .cz-step-link progress {{
+  min-height: 4px;
+  /* The stock theme gives a progress bar a wide minimum, which would make the
+     connectors set the width of the whole chain. Ours are as long as they are
+     asked to be, so the chain can be narrowed to fit a tiled window. */
+  min-width: 0;
+}}
+.cz-step-eta {{ color: @cz_dim; font-size: 0.78rem; }}
+.cz-step-footer {{ color: @cz_dim; }}
+
+/* Grey is not done. White is done. Breathing is live. Nothing else, so the
+   three can be told apart across the room without reading any of them. */
+.cz-step-idle {{ color: @cz_dim; opacity: 0.5; }}
+.cz-step-done {{ color: @cz_text; opacity: 1; }}
+/* Green appears once, at the end, and only when a file has actually landed. */
+.cz-step-landed {{ color: {ok}; opacity: 1; }}
+/* Dull under the cross: the stop is not the thing to look at, the cross is. */
+.cz-step-missing {{ color: @cz_dim; opacity: 0.45; }}
+.cz-step-cross {{ color: {error}; opacity: 0.95; }}
+
+@keyframes cz-breathe {{
+  0%   {{ color: @cz_dim; opacity: 0.45; }}
+  50%  {{ color: @cz_text; opacity: 1; }}
+  100% {{ color: @cz_dim; opacity: 0.45; }}
+}}
+.cz-step-live {{
+  color: @cz_text;
+  animation: cz-breathe 1400ms ease-in-out infinite;
+}}
+
+/* A stop is a button only where there is something to press. The inert ones
+   are left unhoverable in code, so this styles the pressable ones alone. */
+.cz-step-button {{
+  padding: {space_2}px {space_1}px;
+  border-radius: 8px;
+  transition: background-color 140ms ease;
+}}
+.cz-step-button:hover {{ background-color: {hover}; }}
 
 /* ---- queue ---- */
 .cz-queue > row {{
@@ -385,6 +432,8 @@ button.cz-destructive {{ color: {error}; }}
         accent = ACCENT,
         space_6 = SPACE_6,
         space_3 = SPACE_3,
+        space_2 = SPACE_2,
+        space_1 = SPACE_1,
         accent_hover = ACCENT_HOVER,
         ok = OK,
         warn = WARN,
