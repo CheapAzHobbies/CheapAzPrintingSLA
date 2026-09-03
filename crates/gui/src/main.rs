@@ -2990,7 +2990,11 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     let watching = dir.as_deref().filter(|d| d.is_dir());
     match (&dir, &watching) {
         (None, _) => {
-            chain.set_state(0, State::Idle);
+            // Breathing, not grey. A stop waiting on the user is not a stop
+            // waiting its turn: nothing happens at all until this one is
+            // answered, so it is the thing on the page that should catch the
+            // eye rather than the thing that sits quietest.
+            chain.set_state(0, State::Live);
             chain.set_note(0, Some("click to choose"));
         }
         (Some(_), None) => {
@@ -3062,7 +3066,8 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     let sending = ui.watchdog_sending.get();
     match (&target, &here) {
         (None, _) => {
-            chain.set_state(3, State::Idle);
+            // Same reasoning as the folder: unset is not idle, it is blocking.
+            chain.set_state(3, State::Live);
             chain.set_note(3, Some("click to choose"));
         }
         (Some(_), None) => {
