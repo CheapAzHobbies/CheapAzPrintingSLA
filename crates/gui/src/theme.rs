@@ -136,6 +136,22 @@ fn sheet(p: &Palette) -> String {
   background-color: alpha(@cz_accent, 0.08);
 }}
 
+/* ---- quick access ----
+   The header and the file list are two boxed lists rather than one, because
+   the header has to stay put while the files scroll under it. These make the
+   seam invisible: the header loses its bottom corners while the list is open,
+   and the list loses its top corners and its top border, so the two read as
+   one card with a single line across it. */
+.cz-qa-open {{
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}}
+.cz-qa-body {{
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  border-top: none;
+}}
+
 /* ---- queue ---- */
 .cz-queue > row {{
   border-bottom: 1px solid @cz_border;

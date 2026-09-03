@@ -145,9 +145,13 @@ struct App {
     nearby_sources: gtk::MenuButton,
     /// Holds the list at whatever height the animation is currently on.
     nearby_clip: gtk::ScrolledWindow,
+    /// The header, outside the scroller so it stays put under the files.
+    nearby_head_list: gtk::ListBox,
+    /// The file rows, inside it.
+    nearby_rows_list: gtk::ListBox,
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
-    nearby_search: gtk::SearchEntry,
+    nearby_search: gtk::Entry,
     /// The magnifying glass shown in place of the box while the list is shut.
     nearby_search_btn: gtk::Button,
     nearby_search_reveal: gtk::Revealer,
@@ -159,10 +163,6 @@ struct App {
     nearby_subtitle: RefCell<String>,
     /// Where that height is now, where it is heading, and whether a tick
     /// callback is already walking it there.
-    /// Height of the expander's own row, remembered while the list is shut so
-    /// the open height can be worked out from parts rather than measured
-    /// mid-animation.
-    nearby_head: Cell<i32>,
     /// The height to come to rest at, and whether that height is a cap that
     /// should scroll. Held in a cell because the tick callback settles the
     /// list and deliberately holds no handle back to `App`.
@@ -539,12 +539,13 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_panel: nearby_panel.clone(),
         nearby_expander: nearby.expander,
         nearby_clip: nearby.clip,
+        nearby_head_list: nearby.head_list,
+        nearby_rows_list: nearby.rows_list,
         nearby_search: nearby.search,
         nearby_search_btn: nearby.search_btn,
         nearby_search_reveal: nearby.search_reveal,
         nearby_search_shown: Cell::new(false),
         nearby_subtitle: RefCell::new(String::new()),
-        nearby_head: Cell::new(0),
         nearby_cap: Rc::new(Cell::new(-1)),
         nearby_h: Rc::new(Cell::new(0.0)),
         nearby_from: Rc::new(Cell::new(0.0)),
@@ -1101,19 +1102,27 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
 /// it costs one row of height rather than a list. That matters at the small
 /// window sizes this layout was fought into fitting.
 fn build_nearby_panel() -> NearbyPanel {
-    let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
+    // No spacing: the header and the file list are two boxed lists drawn to
+    // look like one card, and a gap between them would give that away.
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     panel.set_visible(false);
+
+    // The header is its own list, outside the scrolled window, so it stays
+    // put while the files move under it. Keeping it inside meant scrolling to
+    // five files scrolled the search box and the buttons off the top as well.
+    let head_list = gtk::ListBox::new();
+    head_list.add_css_class("boxed-list");
+    head_list.set_selection_mode(gtk::SelectionMode::None);
 
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
+    list.add_css_class("cz-qa-body");
     list.set_selection_mode(gtk::SelectionMode::None);
 
-    // The list sits in a scrolled window that never scrolls. It is here for
-    // its one other property: a scrolled window is allowed to be a different
-    // height than the thing inside it, and a box is not. That is what lets
-    // `animate_nearby_height` hold the panel at a height the rebuilt list has
-    // already left behind, and walk it to the new one over a few frames
-    // instead of cutting.
+    // The file list sits in a scrolled window for two reasons: it is allowed
+    // to be a height its contents are not, which is what lets the panel be
+    // walked between two heights instead of cutting to the new one, and it is
+    // what caps a long list at a few rows and scrolls the rest.
     let clip = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Never)
@@ -1143,11 +1152,15 @@ fn build_nearby_panel() -> NearbyPanel {
 
     // Search lives in the header rather than in a row of its own, because a
     // row of its own is a row of the list spent on something that is not a
-    // file. Shut, it is a magnifying glass alongside the other two buttons;
-    // open, it becomes the box itself. The revealer slides horizontally, so
-    // the header's height never depends on which of the two is showing and
-    // the measurement the row cap is built on stays true.
-    let search = gtk::SearchEntry::new();
+    // file.
+    //
+    // The magnifying glass never goes anywhere. It is the button while the
+    // list is shut, and it stays exactly where it is while the field opens
+    // out beside it, ending up where a search field's icon belongs anyway -
+    // so nothing pops out of existence where something else appears. That is
+    // also why this is a plain entry rather than a search entry: a search
+    // entry brings its own glass, and two of them was the whole problem.
+    let search = gtk::Entry::new();
     search.set_width_chars(16);
     search.set_max_width_chars(22);
     search.set_valign(gtk::Align::Center);
@@ -1165,8 +1178,9 @@ fn build_nearby_panel() -> NearbyPanel {
     expander.add_suffix(&search_reveal);
     expander.add_suffix(&search_btn);
 
-    list.append(&expander);
+    head_list.append(&expander);
     clip.set_child(Some(&list));
+    panel.append(&head_list);
     panel.append(&clip);
 
     NearbyPanel {
@@ -1174,6 +1188,8 @@ fn build_nearby_panel() -> NearbyPanel {
         expander,
         sources: folder,
         clip,
+        head_list,
+        rows_list: list,
         search,
         search_btn,
         search_reveal,
@@ -1186,8 +1202,10 @@ struct NearbyPanel {
     expander: adw::ExpanderRow,
     sources: gtk::MenuButton,
     clip: gtk::ScrolledWindow,
-    search: gtk::SearchEntry,
-    /// Shown while the list is shut, in place of the box.
+    head_list: gtk::ListBox,
+    rows_list: gtk::ListBox,
+    search: gtk::Entry,
+    /// The glass. Sits beside the field once it is open, as its icon.
     search_btn: gtk::Button,
     search_reveal: gtk::Revealer,
 }
@@ -1767,13 +1785,20 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         // the box, which is the whole of what someone pressing it wants.
         let ui2 = ui.clone();
         ui.nearby_search_btn.connect_clicked(move |_| {
-            ui2.nearby_expander.set_expanded(true);
+            if !ui2.nearby_expander.is_expanded() {
+                ui2.nearby_expander.set_expanded(true);
+            } else if !ui2.nearby_search.text().is_empty() {
+                // Open with something typed: the glass is now the field's
+                // icon, and the useful thing an icon on a full field does is
+                // empty it.
+                ui2.nearby_search.set_text("");
+            }
             ui2.nearby_search.grab_focus();
         });
     }
     {
         let ui2 = ui.clone();
-        ui.nearby_search.connect_search_changed(move |_| {
+        ui.nearby_search.connect_changed(move |_| {
             apply_nearby_filter(&ui2);
             animate_nearby_height(&ui2, ui2.nearby_clip.height());
         });
@@ -1789,14 +1814,20 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     // over the top of it.
     {
         let ui2 = ui.clone();
-        ui.nearby_expander.connect_expanded_notify(move |_| {
+        ui.nearby_expander.connect_expanded_notify(move |e| {
+            // Shut, the header is a card in its own right and keeps its
+            // corners. Open, it is the top of one and gives up the bottom two
+            // so the seam with the file list underneath does not show.
+            if e.is_expanded() {
+                ui2.nearby_head_list.add_css_class("cz-qa-open");
+            } else {
+                ui2.nearby_head_list.remove_css_class("cz-qa-open");
+            }
             // Glass while shut, box while open.
             show_nearby_search(&ui2, ui2.nearby_search_shown.get());
-            let capped = ui2.nearby_rows.borrow().len()
-                > ui2.settings.borrow().quick_access_visible as usize;
-            if capped || ui2.nearby_cap.get() > 0 {
-                animate_nearby_height(&ui2, ui2.nearby_clip.height());
-            }
+            // The expander holds no rows any more, so its own reveal animates
+            // nothing. Opening and shutting the list is this, entirely.
+            animate_nearby_height(&ui2, ui2.nearby_clip.height());
         });
     }
 
@@ -2326,23 +2357,8 @@ fn refresh_nearby(ui: &Rc<App>) {
     // where the panel actually is instead of snapping back.
     let was = ui.nearby_clip.height();
 
-    // The header's height, taken while the list is shut and settled, which is
-    // the only moment it can be measured on its own. Everything the cap needs
-    // is worked out from it plus the rows.
-    if !ui.nearby_expander.is_expanded() && !ui.nearby_moving.get() {
-        if let Some(child) = ui.nearby_clip.child() {
-            let w = ui.nearby_clip.width();
-            let h = child
-                .measure(gtk::Orientation::Vertical, if w > 0 { w } else { -1 })
-                .1;
-            if h > 0 {
-                ui.nearby_head.set(h);
-            }
-        }
-    }
-
     for row in ui.nearby_rows.borrow_mut().drain(..) {
-        ui.nearby_expander.remove(&row);
+        ui.nearby_rows_list.remove(&row);
     }
 
     if !ui.settings.borrow().show_nearby_files {
@@ -2406,7 +2422,7 @@ fn refresh_nearby(ui: &Rc<App>) {
             row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
             row
         };
-        ui.nearby_expander.add_row(&row);
+        ui.nearby_rows_list.append(&row);
         ui.nearby_rows.borrow_mut().push(row);
         show_nearby_search(ui, false);
         // Deliberately not collapsed. A refresh happens while the user is
@@ -2446,8 +2462,9 @@ fn refresh_nearby(ui: &Rc<App>) {
 
     // One size group per column, so the four facts about a file start in the
     // same place down the list instead of each row setting its own margins.
-    // Under the subtitle they ran together and nothing lined up with anything.
-    let columns: Vec<gtk::SizeGroup> = (0..4)
+    // Only built when they are going to be used.
+    let in_columns = ui.settings.borrow().quick_access_columns;
+    let columns: Vec<gtk::SizeGroup> = (0..if in_columns { 4 } else { 0 })
         .map(|_| gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal))
         .collect();
 
@@ -2470,29 +2487,39 @@ fn refresh_nearby(ui: &Rc<App>) {
         ];
         keys.push(format!("{name} {}", facts.join(" ")).to_lowercase());
 
-        let row = adw::ActionRow::builder()
-            .title(&name)
-            // One line: the name shares the row with the columns now, and a
-            // long one wrapping would shove them around.
-            .title_lines(1)
-            .activatable(true)
-            .build();
+        let row = if in_columns {
+            adw::ActionRow::builder()
+                .title(&name)
+                // One line: the name shares the row with the columns, and a
+                // long one wrapping would shove them around.
+                .title_lines(1)
+                .activatable(true)
+                .build()
+        } else {
+            adw::ActionRow::builder()
+                .title(&name)
+                .subtitle(facts.join("  \u{b7}  "))
+                .activatable(true)
+                .build()
+        };
         row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
 
-        let meta = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
-        meta.set_valign(gtk::Align::Center);
-        for (i, fact) in facts.iter().enumerate() {
-            let cell = gtk::Label::new(Some(fact));
-            cell.add_css_class("caption");
-            cell.add_css_class("cz-dim");
-            // Sizes read as numbers, so they are set against the right edge of
-            // their column; the words are set against the left of theirs.
-            cell.set_xalign(if i == 1 { 1.0 } else { 0.0 });
-            cell.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            columns[i].add_widget(&cell);
-            meta.append(&cell);
+        if in_columns {
+            let meta = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
+            meta.set_valign(gtk::Align::Center);
+            for (i, fact) in facts.iter().enumerate() {
+                let cell = gtk::Label::new(Some(fact));
+                cell.add_css_class("caption");
+                cell.add_css_class("cz-dim");
+                // Sizes read as numbers, so they are set against the right
+                // edge of their column; the words against the left of theirs.
+                cell.set_xalign(if i == 1 { 1.0 } else { 0.0 });
+                cell.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                columns[i].add_widget(&cell);
+                meta.append(&cell);
+            }
+            row.add_suffix(&meta);
         }
-        row.add_suffix(&meta);
         let ui2 = ui.clone();
         let path = item.path.clone();
         row.connect_activated(move |r| {
@@ -2518,7 +2545,7 @@ fn refresh_nearby(ui: &Rc<App>) {
                 move || add_files(&ui3, vec![queued]),
             );
         });
-        ui.nearby_expander.add_row(&row);
+        ui.nearby_rows_list.append(&row);
         ui.nearby_rows.borrow_mut().push(row);
     }
     *ui.nearby_keys.borrow_mut() = keys;
@@ -2561,49 +2588,27 @@ fn settle_nearby(clip: &gtk::ScrolledWindow, cap: i32) {
     }
 }
 
-/// Where the list should come to rest: its height, and the cap if it has one.
+/// Where the file list should come to rest: its height, and the cap if any.
 ///
-/// Worked out from the header plus as many rows as are allowed to show, never
-/// from the child's own natural height. That measurement is only truthful when
-/// nothing is moving, and the two moments this is wanted - a source being
-/// switched, and the expander opening - are both moments when something is.
+/// Only the rows are measured now. The header sits outside the scrolled
+/// window so it can stay put while the files move under it, which also means
+/// it is no longer part of the height being animated - and the awkward part
+/// of the old version, deriving the header's height while it was in the
+/// middle of an animation, went with it.
 fn nearby_rest(ui: &Rc<App>, for_width: i32) -> (i32, i32) {
-    let rows = ui.nearby_rows.borrow();
-    let child = ui.nearby_clip.child();
-    let natural = child
-        .as_ref()
-        .map(|c| c.measure(gtk::Orientation::Vertical, for_width).1)
-        .unwrap_or(0);
-
     if !ui.nearby_expander.is_expanded() {
-        // The remembered header rather than what is measured now: this is also
-        // reached the instant the list is shut, when the rows are still on
-        // their way out and the measurement is of the open list.
-        return (
-            if ui.nearby_head.get() > 0 {
-                ui.nearby_head.get()
-            } else {
-                natural
-            },
-            -1,
-        );
+        return (0, 0);
     }
-
-    let head = if ui.nearby_head.get() > 0 {
-        ui.nearby_head.get()
-    } else {
-        return (natural, -1);
-    };
+    let rows = ui.nearby_rows.borrow();
     let limit = ui.settings.borrow().quick_access_visible as usize;
     // Only the rows actually on screen. A search that hides four of seven
     // files should shrink the list, not leave it holding room for them.
     let on: Vec<&adw::ActionRow> = rows.iter().filter(|r| r.is_visible()).collect();
-    let shown: i32 = on
+    let height: i32 = on
         .iter()
         .take(limit)
         .map(|r| r.measure(gtk::Orientation::Vertical, for_width).1)
         .sum();
-    let height = head + shown;
     if on.len() > limit {
         (height, height)
     } else {
@@ -2623,7 +2628,9 @@ fn show_nearby_search(ui: &Rc<App>, offer: bool) {
     }
     let open = offer && ui.nearby_expander.is_expanded();
     ui.nearby_search_reveal.set_reveal_child(open);
-    ui.nearby_search_btn.set_visible(offer && !open);
+    // Visible in both states. Shut it is the button; open it is the field's
+    // icon, in the same place, doing the same job.
+    ui.nearby_search_btn.set_visible(offer);
 }
 
 /// Show only the rows matching what has been typed, and say so.
@@ -4905,6 +4912,28 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
         });
     }
     opening.add(&visible_row);
+
+    let layout_row = adw::ComboRow::builder()
+        .title("File details")
+        .subtitle("Where each file's format, size, folder and age are shown")
+        .model(&gtk::StringList::new(&[
+            "In columns beside the name",
+            "On a line under the name",
+        ]))
+        .selected(if current.quick_access_columns { 0 } else { 1 })
+        .build();
+    {
+        let ui = ui.clone();
+        layout_row.connect_selected_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.quick_access_columns = r.selected() == 0;
+                let _ = s.save();
+            }
+            refresh_nearby(&ui);
+        });
+    }
+    opening.add(&layout_row);
     page.add(&opening);
 
     let drives_group = adw::PreferencesGroup::builder()

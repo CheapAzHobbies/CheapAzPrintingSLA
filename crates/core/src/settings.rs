@@ -73,6 +73,14 @@ pub struct Settings {
     /// How many files the Quick Access list shows before it starts scrolling
     /// inside itself, rather than growing the page.
     pub quick_access_visible: u32,
+    /// Set each file's format, size, folder and age in columns to the right of
+    /// its name, rather than as a line of text underneath it.
+    ///
+    /// Columns line up down the list and are quicker to compare; the line
+    /// underneath reads as a sentence and gives the name the whole row. Which
+    /// is better depends on whether you are looking for a particular file or
+    /// looking across them, so it is a choice rather than a default.
+    pub quick_access_columns: bool,
     /// Sources taken off the "Look in" list altogether, by the same key.
     ///
     /// Distinct from `quick_access_off`, which is a source the user still
@@ -111,6 +119,7 @@ impl Default for Settings {
             quick_access_hidden: Vec::new(),
             quick_access_drives_on: Vec::new(),
             quick_access_visible: 5,
+            quick_access_columns: true,
             never_eject: Vec::new(),
         }
     }
@@ -202,6 +211,9 @@ impl Settings {
                 s.quick_access_visible = n.clamp(1, 40);
             }
         }
+        if let Some(v) = map.get("quick_access_columns") {
+            s.quick_access_columns = v == "true";
+        }
         if let Some(v) = map.get("quick_access_hidden") {
             s.quick_access_hidden = v
                 .split('\x1f')
@@ -268,7 +280,8 @@ impl Settings {
              quick_access_off = {}\n\
              quick_access_hidden = {}\n\
              quick_access_drives_on = {}\n\
-             quick_access_visible = {}\n",
+             quick_access_visible = {}\n\
+             quick_access_columns = {}\n",
             self.warn_on_information_loss,
             self.confirm_overwrite,
             self.animations,
@@ -300,6 +313,7 @@ impl Settings {
             self.quick_access_hidden.join("\x1f"),
             self.quick_access_drives_on.join("\x1f"),
             self.quick_access_visible,
+            self.quick_access_columns,
         );
         std::fs::write(path, body)
     }
