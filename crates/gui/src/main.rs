@@ -148,9 +148,11 @@ struct App {
     /// Filters the rows already on screen. Never triggers a rescan: it is for
     /// finding a file among the ones offered, not for looking harder.
     nearby_search: gtk::SearchEntry,
-    /// The strip the search box sits in, held so it can be taken out of the
-    /// expander again when there are too few files to be worth searching.
-    nearby_search_row: gtk::Box,
+    /// The magnifying glass shown in place of the box while the list is shut.
+    nearby_search_btn: gtk::Button,
+    nearby_search_reveal: gtk::Revealer,
+    /// Whether searching is being offered at all, which it is not when there
+    /// are no files to search.
     nearby_search_shown: Cell<bool>,
     /// What the expander says when nothing is being searched for, so the count
     /// can be put back when the box is cleared.
@@ -173,6 +175,9 @@ struct App {
     /// The rows currently inside the expander, so a refresh can take them out
     /// again without rebuilding the row and losing whether it was open.
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
+    /// Lowercased name and facts for each row, in the same order, so the
+    /// search can match what the row shows in columns rather than as text.
+    nearby_keys: RefCell<Vec<String>>,
     /// Held so the volume-monitor signal handlers outlive `wire`.
     volume_monitor: RefCell<Option<gio::VolumeMonitor>>,
     queue_panel: gtk::Box,
@@ -327,14 +332,8 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     // --- convert page -----------------------------------------------------
     let (dropzone, dropzone_title) = build_dropzone();
-    let (
-        nearby_panel,
-        nearby_expander,
-        nearby_sources,
-        nearby_clip,
-        nearby_search,
-        nearby_search_row,
-    ) = build_nearby_panel();
+    let nearby = build_nearby_panel();
+    let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
     queue_list.set_selection_mode(gtk::SelectionMode::Single);
     queue_list.add_css_class("cz-queue");
@@ -538,10 +537,11 @@ fn build(app: &adw::Application) -> Rc<App> {
         dropzone,
         dropzone_title,
         nearby_panel: nearby_panel.clone(),
-        nearby_expander,
-        nearby_clip,
-        nearby_search,
-        nearby_search_row,
+        nearby_expander: nearby.expander,
+        nearby_clip: nearby.clip,
+        nearby_search: nearby.search,
+        nearby_search_btn: nearby.search_btn,
+        nearby_search_reveal: nearby.search_reveal,
         nearby_search_shown: Cell::new(false),
         nearby_subtitle: RefCell::new(String::new()),
         nearby_head: Cell::new(0),
@@ -551,8 +551,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_target: Rc::new(Cell::new(0.0)),
         nearby_elapsed: Rc::new(Cell::new(0.0)),
         nearby_moving: Rc::new(Cell::new(false)),
-        nearby_sources: nearby_sources.clone(),
+        nearby_sources: nearby.sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
+        nearby_keys: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
         queue_panel,
         queue_list,
@@ -1099,14 +1100,7 @@ fn labelled_icon(icon: &str, text: &str) -> gtk::Box {
 /// Collapsed by default, and hidden entirely when the scan finds nothing, so
 /// it costs one row of height rather than a list. That matters at the small
 /// window sizes this layout was fought into fitting.
-fn build_nearby_panel() -> (
-    gtk::Box,
-    adw::ExpanderRow,
-    gtk::MenuButton,
-    gtk::ScrolledWindow,
-    gtk::SearchEntry,
-    gtk::Box,
-) {
+fn build_nearby_panel() -> NearbyPanel {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
     panel.set_visible(false);
 
@@ -1147,23 +1141,55 @@ fn build_nearby_panel() -> (
     refresh.set_valign(gtk::Align::Center);
     expander.add_suffix(&refresh);
 
+    // Search lives in the header rather than in a row of its own, because a
+    // row of its own is a row of the list spent on something that is not a
+    // file. Shut, it is a magnifying glass alongside the other two buttons;
+    // open, it becomes the box itself. The revealer slides horizontally, so
+    // the header's height never depends on which of the two is showing and
+    // the measurement the row cap is built on stays true.
+    let search = gtk::SearchEntry::new();
+    search.set_width_chars(16);
+    search.set_max_width_chars(22);
+    search.set_valign(gtk::Align::Center);
+    let search_reveal = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideLeft)
+        .transition_duration(EXPANDER_MS as u32)
+        .reveal_child(false)
+        .child(&search)
+        .build();
+    search_reveal.set_valign(gtk::Align::Center);
+
+    let search_btn = shell::icon_button("system-search-symbolic", "Search the files listed here");
+    search_btn.set_valign(gtk::Align::Center);
+
+    expander.add_suffix(&search_reveal);
+    expander.add_suffix(&search_btn);
+
     list.append(&expander);
     clip.set_child(Some(&list));
     panel.append(&clip);
 
-    // Offered only once the list is long enough to scroll, and added to the
-    // expander then. A search box above four files is furniture.
-    let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search these files"));
-    search.set_hexpand(true);
-    let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    search_row.set_margin_top(theme::SPACE_2);
-    search_row.set_margin_bottom(theme::SPACE_2);
-    search_row.set_margin_start(theme::SPACE_2);
-    search_row.set_margin_end(theme::SPACE_2);
-    search_row.append(&search);
+    NearbyPanel {
+        panel,
+        expander,
+        sources: folder,
+        clip,
+        search,
+        search_btn,
+        search_reveal,
+    }
+}
 
-    (panel, expander, folder, clip, search, search_row)
+/// The pieces of the Quick Access panel that have to be wired up afterwards.
+struct NearbyPanel {
+    panel: gtk::Box,
+    expander: adw::ExpanderRow,
+    sources: gtk::MenuButton,
+    clip: gtk::ScrolledWindow,
+    search: gtk::SearchEntry,
+    /// Shown while the list is shut, in place of the box.
+    search_btn: gtk::Button,
+    search_reveal: gtk::Revealer,
 }
 
 fn build_dropzone() -> (gtk::Box, gtk::Label) {
@@ -1737,6 +1763,15 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     // Choosing where the suggestions come from, at the point they are shown
     // rather than buried in Settings.
     {
+        // The glass is the way in: it opens the list and puts the cursor in
+        // the box, which is the whole of what someone pressing it wants.
+        let ui2 = ui.clone();
+        ui.nearby_search_btn.connect_clicked(move |_| {
+            ui2.nearby_expander.set_expanded(true);
+            ui2.nearby_search.grab_focus();
+        });
+    }
+    {
         let ui2 = ui.clone();
         ui.nearby_search.connect_search_changed(move |_| {
             apply_nearby_filter(&ui2);
@@ -1755,6 +1790,8 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     {
         let ui2 = ui.clone();
         ui.nearby_expander.connect_expanded_notify(move |_| {
+            // Glass while shut, box while open.
+            show_nearby_search(&ui2, ui2.nearby_search_shown.get());
             let capped = ui2.nearby_rows.borrow().len()
                 > ui2.settings.borrow().quick_access_visible as usize;
             if capped || ui2.nearby_cap.get() > 0 {
@@ -2307,9 +2344,6 @@ fn refresh_nearby(ui: &Rc<App>) {
     for row in ui.nearby_rows.borrow_mut().drain(..) {
         ui.nearby_expander.remove(&row);
     }
-    if ui.nearby_search_shown.replace(false) {
-        ui.nearby_expander.remove(&ui.nearby_search_row);
-    }
 
     if !ui.settings.borrow().show_nearby_files {
         ui.nearby_panel.set_visible(false);
@@ -2374,6 +2408,7 @@ fn refresh_nearby(ui: &Rc<App>) {
         };
         ui.nearby_expander.add_row(&row);
         ui.nearby_rows.borrow_mut().push(row);
+        show_nearby_search(ui, false);
         // Deliberately not collapsed. A refresh happens while the user is
         // working the "Look in" switches, and folding the list under them -
         // then leaving it folded when they switch a source back on - makes
@@ -2401,36 +2436,63 @@ fn refresh_nearby(ui: &Rc<App>) {
     ui.nearby_expander.set_subtitle(&said);
     *ui.nearby_subtitle.borrow_mut() = said;
 
-    // Added before the files so it sits above them, and only once there are
-    // more of them than fit: below that the whole list is already on screen
-    // and a search box is furniture.
-    if found.len() > ui.settings.borrow().quick_access_visible as usize {
-        ui.nearby_expander.add_row(&ui.nearby_search_row);
-        ui.nearby_search_shown.set(true);
-    } else {
-        ui.nearby_search.set_text("");
-    }
+    // Searching is offered whenever there is something to search, and the
+    // placeholder names the places rather than saying "these files": the one
+    // question a search box in a list of found files raises is which folders
+    // it is looking through, and it may as well answer it.
+    show_nearby_search(ui, true);
+    ui.nearby_search
+        .set_placeholder_text(Some(&format!("Search {}", places.join(", "))));
 
+    // One size group per column, so the four facts about a file start in the
+    // same place down the list instead of each row setting its own margins.
+    // Under the subtitle they ran together and nothing lined up with anything.
+    let columns: Vec<gtk::SizeGroup> = (0..4)
+        .map(|_| gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal))
+        .collect();
+
+    let mut keys: Vec<String> = Vec::new();
     for item in found {
+        let name = item
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| item.path.display().to_string());
+        let age = item
+            .modified
+            .map(render::human_age)
+            .unwrap_or_else(|| "date unknown".to_string());
+        let facts = [
+            item.format.clone(),
+            render::human_bytes(item.size),
+            item.source.clone(),
+            age,
+        ];
+        keys.push(format!("{name} {}", facts.join(" ")).to_lowercase());
+
         let row = adw::ActionRow::builder()
-            .title(
-                item.path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| item.path.display().to_string()),
-            )
-            .subtitle(format!(
-                "{}  ·  {}  ·  {}  ·  {}",
-                item.format,
-                render::human_bytes(item.size),
-                item.source,
-                item.modified
-                    .map(render::human_age)
-                    .unwrap_or_else(|| "date unknown".to_string()),
-            ))
+            .title(&name)
+            // One line: the name shares the row with the columns now, and a
+            // long one wrapping would shove them around.
+            .title_lines(1)
             .activatable(true)
             .build();
         row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
+
+        let meta = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
+        meta.set_valign(gtk::Align::Center);
+        for (i, fact) in facts.iter().enumerate() {
+            let cell = gtk::Label::new(Some(fact));
+            cell.add_css_class("caption");
+            cell.add_css_class("cz-dim");
+            // Sizes read as numbers, so they are set against the right edge of
+            // their column; the words are set against the left of theirs.
+            cell.set_xalign(if i == 1 { 1.0 } else { 0.0 });
+            cell.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            columns[i].add_widget(&cell);
+            meta.append(&cell);
+        }
+        row.add_suffix(&meta);
         let ui2 = ui.clone();
         let path = item.path.clone();
         row.connect_activated(move |r| {
@@ -2459,6 +2521,7 @@ fn refresh_nearby(ui: &Rc<App>) {
         ui.nearby_expander.add_row(&row);
         ui.nearby_rows.borrow_mut().push(row);
     }
+    *ui.nearby_keys.borrow_mut() = keys;
     ui.nearby_panel.set_visible(true);
     // A rebuild makes every row visible again; whatever is in the search box
     // still applies to them.
@@ -2540,23 +2603,27 @@ fn nearby_rest(ui: &Rc<App>, for_width: i32) -> (i32, i32) {
         .take(limit)
         .map(|r| r.measure(gtk::Orientation::Vertical, for_width).1)
         .sum();
-    // The search strip is measured through its list row, which carries the
-    // padding the strip itself knows nothing about.
-    let search = if ui.nearby_search_shown.get() {
-        let w = ui
-            .nearby_search_row
-            .parent()
-            .unwrap_or_else(|| ui.nearby_search_row.clone().upcast());
-        w.measure(gtk::Orientation::Vertical, for_width).1
-    } else {
-        0
-    };
-    let height = head + search + shown;
+    let height = head + shown;
     if on.len() > limit {
         (height, height)
     } else {
         (height, -1)
     }
+}
+
+/// Offer searching, or take it away.
+///
+/// Shut, it is the magnifying glass; open, the box itself. Taking it away
+/// clears whatever was typed, so a list that comes back later comes back
+/// whole rather than still filtered by something invisible.
+fn show_nearby_search(ui: &Rc<App>, offer: bool) {
+    ui.nearby_search_shown.set(offer);
+    if !offer {
+        ui.nearby_search.set_text("");
+    }
+    let open = offer && ui.nearby_expander.is_expanded();
+    ui.nearby_search_reveal.set_reveal_child(open);
+    ui.nearby_search_btn.set_visible(offer && !open);
 }
 
 /// Show only the rows matching what has been typed, and say so.
@@ -2568,21 +2635,23 @@ fn apply_nearby_filter(ui: &Rc<App>) {
     let typed = ui.nearby_search.text().trim().to_string();
     let needle = typed.to_lowercase();
     let rows = ui.nearby_rows.borrow();
+    let keys = ui.nearby_keys.borrow();
     let total = rows.len();
     let mut hits = 0;
-    for row in rows.iter() {
-        // The subtitle counts too: it carries the format and the drive the
-        // file came from, which is how you would say what you are after.
+    for (i, row) in rows.iter().enumerate() {
+        // Matched against the name and all four facts, because the format or
+        // the drive a file came from is a perfectly good way to say what you
+        // are after. They are no longer text on the row, so they are kept
+        // beside it for exactly this.
         let hit = needle.is_empty()
-            || row.title().to_lowercase().contains(&needle)
-            || row
-                .subtitle()
-                .is_some_and(|t| t.to_lowercase().contains(&needle));
+            || keys.get(i).is_some_and(|k| k.contains(&needle))
+            || row.title().to_lowercase().contains(&needle);
         row.set_visible(hit);
         if hit {
             hits += 1;
         }
     }
+    drop(keys);
     drop(rows);
 
     let said = if typed.is_empty() {
