@@ -162,6 +162,7 @@ struct App {
     // convert page
     dropzone: gtk::Box,
     dropzone_title: gtk::Label,
+    dropzone_sub: gtk::Label,
     /// The list of readable formats under the drop zone. First thing out when
     /// the window is squeezed: it is a reference, not an instruction, and the
     /// instruction above it still stands without it.
@@ -296,8 +297,12 @@ struct App {
     watchdog_eye: gtk::ToggleButton,
     /// And its row on the Convert page, which says the whole sentence the eye
     /// can only hint at.
-    watchdog_row: adw::ActionRow,
+    watchdog_row: adw::ExpanderRow,
     watchdog_switch: gtk::Switch,
+    /// The two things it has to be told, on the page where it is switched on.
+    watchdog_folder: adw::ActionRow,
+    watchdog_drive: adw::ActionRow,
+    watchdog_more: adw::ActionRow,
     /// The Settings switch, kept in step with the eye. The page is built once,
     /// so it cannot find out on its own that the eye has been pressed.
     auto_switch: RefCell<Option<adw::SwitchRow>>,
@@ -450,9 +455,16 @@ fn build(app: &adw::Application) -> Rc<App> {
     // beside the window controls is where nobody looks for a feature they do
     // not know exists yet. This is a row on the page the feature is about,
     // saying its name and what it would do.
-    let watchdog_row = adw::ActionRow::builder()
+    // An expander, so the two things it needs to know are behind the row that
+    // needs them rather than on another page. The switch is a suffix rather
+    // than the expander's own enable switch, because the folder and the drive
+    // have to be settable before it is turned on, and the enable switch
+    // disables everything under it.
+    let watchdog_row = adw::ExpanderRow::builder()
         .title("WatchDog")
         .subtitle("Off")
+        .title_lines(1)
+        .subtitle_lines(1)
         .build();
     watchdog_row.add_prefix(&gtk::Image::from_icon_name(WATCHDOG_ICON));
     let watchdog_switch = gtk::Switch::builder()
@@ -460,13 +472,45 @@ fn build(app: &adw::Application) -> Rc<App> {
         .tooltip_text("Watch a folder and convert what your slicer leaves there")
         .build();
     watchdog_row.add_suffix(&watchdog_switch);
-    watchdog_row.set_activatable_widget(Some(&watchdog_switch));
+
+    let watchdog_folder = adw::ActionRow::builder()
+        .title("Folder to watch")
+        .subtitle("Not chosen")
+        .subtitle_lines(1)
+        .build();
+    let choose_folder = gtk::Button::with_label("Choose…");
+    choose_folder.set_valign(gtk::Align::Center);
+    choose_folder.set_widget_name("watchdog-folder");
+    watchdog_folder.add_suffix(&choose_folder);
+    watchdog_row.add_row(&watchdog_folder);
+
+    let watchdog_drive = adw::ActionRow::builder()
+        .title("Drive to copy to")
+        .subtitle("Not chosen")
+        .subtitle_lines(1)
+        .build();
+    let choose_drive = gtk::Button::with_label("Use This");
+    choose_drive.set_valign(gtk::Align::Center);
+    choose_drive.set_widget_name("watchdog-drive");
+    choose_drive.set_tooltip_text(Some("Records the drive that is plugged in now"));
+    watchdog_drive.add_suffix(&choose_drive);
+    watchdog_row.add_row(&watchdog_drive);
+
+    let watchdog_more = adw::ActionRow::builder()
+        .title("Everything else")
+        .subtitle("Where files wait, and how much they may use")
+        .subtitle_lines(1)
+        .activatable(true)
+        .build();
+    watchdog_more.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    watchdog_row.add_row(&watchdog_more);
+
     let watchdog_panel = gtk::ListBox::new();
     watchdog_panel.add_css_class("boxed-list");
     watchdog_panel.set_selection_mode(gtk::SelectionMode::None);
     watchdog_panel.append(&watchdog_row);
 
-    let (dropzone, dropzone_title, dropzone_formats) = build_dropzone();
+    let (dropzone, dropzone_title, dropzone_sub, dropzone_formats) = build_dropzone();
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
@@ -692,6 +736,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         toasts,
         dropzone,
         dropzone_title,
+        dropzone_sub,
         dropzone_formats,
         nearby_panel: nearby_panel.clone(),
         nearby_expander: nearby.expander,
@@ -762,6 +807,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_eye: watchdog_eye.clone(),
         watchdog_row: watchdog_row.clone(),
         watchdog_switch: watchdog_switch.clone(),
+        watchdog_folder: watchdog_folder.clone(),
+        watchdog_drive: watchdog_drive.clone(),
+        watchdog_more: watchdog_more.clone(),
         auto_switch: RefCell::new(None),
         auto_settling: RefCell::new(Vec::new()),
         auto_queue: RefCell::new(std::collections::VecDeque::new()),
@@ -1425,7 +1473,7 @@ struct NearbyPanel {
     search: gtk::Entry,
 }
 
-fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Box) {
+fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Label, gtk::Box) {
     let zone = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     zone.add_css_class("cz-dropzone");
     zone.set_valign(gtk::Align::Center);
@@ -1508,7 +1556,7 @@ fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Box) {
     zone.append(&sub);
     zone.append(&browse);
     zone.append(&formats);
-    (zone, title, formats)
+    (zone, title, sub, formats)
 }
 
 fn build_problem_bar() -> (gtk::Box, gtk::Label) {
@@ -1923,7 +1971,17 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     // Browse, from either entry point.
     if let Some(browse) = find_named(&ui.dropzone, "dropzone-browse") {
         let ui = ui.clone();
-        browse.connect_clicked(move |_| choose_files(&ui));
+        browse.connect_clicked(move |_| {
+            let needs_folder = {
+                let s = ui.settings.borrow();
+                s.auto_convert && s.auto_watch_dir.is_none()
+            };
+            if needs_folder {
+                choose_watch_folder(&ui);
+            } else {
+                choose_files(&ui);
+            }
+        });
     }
     {
         let ui = ui.clone();
@@ -2106,6 +2164,20 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
             rearm_auto(&ui2);
             watchdog_needs_setup(&ui2, on);
         });
+    }
+
+    {
+        let ui2 = ui.clone();
+        ui.watchdog_more
+            .connect_activated(move |_| ui2.shell.show(Section::Settings));
+    }
+    if let Some(b) = find_named(&ui.page_faces, "watchdog-folder") {
+        let ui2 = ui.clone();
+        b.connect_clicked(move |_| choose_watch_folder(&ui2));
+    }
+    if let Some(b) = find_named(&ui.page_faces, "watchdog-drive") {
+        let ui2 = ui.clone();
+        b.connect_clicked(move |_| use_current_drive(&ui2));
     }
 
     build_sources_menu(ui, &ui.nearby_sources.clone());
@@ -2293,7 +2365,38 @@ fn find_named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Button> {
 
 fn reset_dropzone(ui: &Rc<App>) {
     ui.dropzone.remove_css_class("active");
-    ui.dropzone_title.set_text("Drop files here");
+    refresh_dropzone_text(ui);
+}
+
+/// What the empty page invites you to do.
+///
+/// Normally: drop a file. But WatchDog switched on with nowhere to watch is a
+/// half-finished thing, and the largest, emptiest target on the page is a
+/// better place to say so than a line of text further down. It goes back to
+/// inviting files the moment a folder is chosen, because converting one file
+/// by hand is still worth being able to do while WatchDog is running.
+fn refresh_dropzone_text(ui: &Rc<App>) {
+    let needs_folder = {
+        let s = ui.settings.borrow();
+        s.auto_convert && s.auto_watch_dir.is_none()
+    };
+    if needs_folder {
+        ui.dropzone_title.set_text("Choose a folder to watch");
+        ui.dropzone_sub
+            .set_text("WatchDog will convert whatever your slicer leaves there");
+    } else {
+        ui.dropzone_title.set_text("Drop files here");
+        ui.dropzone_sub.set_text("or browse your computer");
+    }
+    if let Some(browse) = find_named(&ui.dropzone, "dropzone-browse") {
+        if let Some(label) = browse.child().and_downcast::<gtk::Label>() {
+            label.set_text(if needs_folder {
+                "Choose Folder"
+            } else {
+                "Browse Files"
+            });
+        }
+    }
 }
 
 fn wire_preview_nav(ui: &Rc<App>) {
@@ -2714,6 +2817,59 @@ fn choose_scan_folder(ui: &Rc<App>) {
     );
 }
 
+/// Ask for the folder WatchDog should watch.
+fn choose_watch_folder(ui: &Rc<App>) {
+    let dialog = gtk::FileDialog::builder().title("Folder to watch").build();
+    if let Some(start) = ui.settings.borrow().auto_watch_dir.clone() {
+        dialog.set_initial_folder(Some(&gio::File::for_path(start)));
+    }
+    let ui = ui.clone();
+    dialog.select_folder(
+        Some(&ui.window.clone()),
+        gio::Cancellable::NONE,
+        move |res| {
+            let Ok(folder) = res else { return };
+            let Some(path) = folder.path() else { return };
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.auto_watch_dir = Some(path);
+                let _ = s.save();
+            }
+            rearm_auto(&ui);
+        },
+    );
+}
+
+/// Remember the drive that is plugged in now, by its filesystem rather than
+/// by its name.
+fn use_current_drive(ui: &Rc<App>) {
+    let picked = ui
+        .out_dir
+        .borrow()
+        .as_deref()
+        .and_then(drives::containing)
+        .filter(|d| d.removable)
+        .or_else(|| drives::mounted().into_iter().find(|d| d.removable));
+    let Some(drive) = picked else {
+        ui.toasts
+            .add_toast(adw::Toast::new("Plug the drive in first"));
+        return;
+    };
+    let Some(uuid) = drives::uuid_of(&drive.path) else {
+        ui.toasts.add_toast(adw::Toast::new(
+            "That drive has no filesystem UUID, so it cannot be told apart from another",
+        ));
+        return;
+    };
+    {
+        let mut s = ui.settings.borrow_mut();
+        s.auto_target_uuid = Some(uuid);
+        s.auto_target_label = Some(drive.name.clone());
+        let _ = s.save();
+    }
+    rearm_auto(ui);
+}
+
 /// Say what is missing, rather than walking off to another page to show it.
 ///
 /// Switching this on used to jump straight to Settings, which is a page change
@@ -2776,30 +2932,36 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
     if ui.watchdog_switch.is_active() != on {
         ui.watchdog_switch.set_active(on);
     }
+    // Short enough to take in without reading. The row is a status line, not
+    // an explanation - "Downloads to GOO to SATURN" says the whole of it, and
+    // the long version was a sentence nobody finishes.
+    let where_ = dir
+        .as_ref()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
+    refresh_dropzone_text(ui);
+    ui.watchdog_folder.set_subtitle(&match &dir {
+        Some(d) => d.display().to_string(),
+        None => "Not chosen".into(),
+    });
+    ui.watchdog_drive.set_subtitle(match &target {
+        Some(label) => label.as_str(),
+        None => "Not chosen",
+    });
+
     if !on {
-        ui.watchdog_row
-            .set_subtitle("Off. Turn on to convert new files from a folder by itself.");
-        ui.watchdog_eye.set_tooltip_text(Some(
-            "WatchDog is off. Press to have it watch a folder for you.",
-        ));
+        ui.watchdog_row.set_subtitle("Off");
+        ui.watchdog_eye.set_tooltip_text(Some("WatchDog is off"));
         return;
     }
 
-    let where_ = dir
-        .as_ref()
-        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "a folder you have not chosen yet".into());
-    let format = registry::by_id(&to)
-        .map(|h| h.info().name.to_string())
-        .unwrap_or_else(|| to.to_uppercase());
-    let onto = match &target {
-        Some(label) => format!("for {label}"),
-        None => "but no drive is chosen, so they will wait".into(),
+    let said = match (&where_, &target) {
+        (None, _) => "On - choose a folder to watch".to_string(),
+        (Some(w), None) => format!("{w} to {} - no drive chosen", to.to_uppercase()),
+        (Some(w), Some(t)) => format!("{w} to {} to {t}", to.to_uppercase()),
     };
-    let said = format!("Watching {where_}. New files become {format} {onto}.");
     ui.watchdog_row.set_subtitle(&said);
     ui.watchdog_eye
-        .set_tooltip_text(Some(&format!("WatchDog is watching. {said}")));
+        .set_tooltip_text(Some(&format!("WatchDog: {said}")));
 }
 
 /// Start or stop watching the folder that automatic mode reads.
@@ -6867,97 +7029,20 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     automatic.add_row(&auto_on);
     *ui.auto_switch.borrow_mut() = Some(auto_on.clone());
 
-    let watch_row = adw::ActionRow::builder()
-        .title("Folder to watch")
-        .subtitle(
-            current
-                .auto_watch_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "Not chosen yet".into()),
-        )
+    // The folder and the drive are set on the Convert page, in the row that
+    // switches WatchDog on. Two places to set one thing is two places to look
+    // and two things to keep in step, and the one beside the switch wins.
+    let where_row = adw::ActionRow::builder()
+        .title("Folder and drive")
+        .subtitle("Set on the Convert page, under WatchDog")
+        .activatable(true)
         .build();
-    let pick = gtk::Button::with_label("Choose…");
-    pick.set_valign(gtk::Align::Center);
+    where_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     {
         let ui = ui.clone();
-        let row = watch_row.clone();
-        pick.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder().title("Folder to watch").build();
-            let ui = ui.clone();
-            let row = row.clone();
-            dialog.select_folder(
-                Some(&ui.window.clone()),
-                gio::Cancellable::NONE,
-                move |res| {
-                    if let Ok(folder) = res {
-                        if let Some(path) = folder.path() {
-                            row.set_subtitle(&path.display().to_string());
-                            {
-                                let mut s = ui.settings.borrow_mut();
-                                s.auto_watch_dir = Some(path);
-                                let _ = s.save();
-                            }
-                            rearm_auto(&ui);
-                        }
-                    }
-                },
-            );
-        });
+        where_row.connect_activated(move |_| ui.shell.show(Section::Convert));
     }
-    watch_row.add_suffix(&pick);
-    automatic.add_row(&watch_row);
-
-    let target_row = adw::ActionRow::builder()
-        .title("Drive to copy to")
-        .subtitle(
-            match (&current.auto_target_label, &current.auto_target_uuid) {
-                (Some(label), Some(_)) => {
-                    format!("{label} - remembered by its filesystem, not its name")
-                }
-                _ => "Not chosen yet. Plug the drive in and press Use This.".to_string(),
-            },
-        )
-        .build();
-    let use_this = gtk::Button::with_label("Use This");
-    use_this.set_valign(gtk::Align::Center);
-    {
-        let ui = ui.clone();
-        let row = target_row.clone();
-        use_this.connect_clicked(move |_| {
-            // The drive the output is pointed at, which is the one in front of
-            // them. Asking them to identify a drive twice over would be asking
-            // them to make the same decision twice.
-            let picked = ui
-                .out_dir
-                .borrow()
-                .as_deref()
-                .and_then(drives::containing)
-                .filter(|d| d.removable)
-                .or_else(|| drives::mounted().into_iter().find(|d| d.removable));
-            let Some(drive) = picked else {
-                ui.toasts
-                    .add_toast(adw::Toast::new("Plug the drive in first"));
-                return;
-            };
-            let Some(uuid) = drives::uuid_of(&drive.path) else {
-                ui.toasts.add_toast(adw::Toast::new(
-                    "That drive has no filesystem UUID, so it cannot be told apart from another",
-                ));
-                return;
-            };
-            row.set_subtitle(&format!(
-                "{} - remembered by its filesystem, not its name",
-                drive.name
-            ));
-            let mut s = ui.settings.borrow_mut();
-            s.auto_target_uuid = Some(uuid);
-            s.auto_target_label = Some(drive.name.clone());
-            let _ = s.save();
-        });
-    }
-    target_row.add_suffix(&use_this);
-    automatic.add_row(&target_row);
+    automatic.add_row(&where_row);
 
     let staging_row = adw::ComboRow::builder()
         .title("Where files wait")
@@ -7078,8 +7163,7 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     // The rows above only describe a thing that is running.
     {
         let rows: Vec<gtk::Widget> = vec![
-            watch_row.clone().upcast(),
-            target_row.clone().upcast(),
+            where_row.clone().upcast(),
             staging_row.clone().upcast(),
             ram_row.clone().upcast(),
             cap_row.clone().upcast(),
