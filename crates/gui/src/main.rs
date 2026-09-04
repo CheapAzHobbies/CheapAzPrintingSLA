@@ -1662,6 +1662,8 @@ struct Fold {
     /// starts a second animation before the first has finished, and the newer
     /// one has to win rather than fight.
     generation: Rc<Cell<u32>>,
+    /// How tall this panel was the last time it could be measured properly.
+    full: Rc<Cell<i32>>,
 }
 
 impl Fold {
@@ -1679,21 +1681,41 @@ impl Fold {
             inner: inner.clone().upcast(),
             at: Rc::new(Cell::new(-1)),
             generation: Rc::new(Cell::new(0)),
+            full: Rc::new(Cell::new(-1)),
         }
     }
 
     fn set(&self, open: bool, animate: bool) {
-        let full = self.inner.measure(gtk::Orientation::Vertical, -1).1.max(1);
+        // Shown before it is measured, not after. A widget inside a hidden
+        // container measures as nothing, so opening a panel that had been
+        // folded shut asked how tall it wanted to be while it was still
+        // hidden, got zero, and opened to a single pixel. It then measured
+        // correctly on the next try, which is why it took a shrink and a
+        // widen to come back.
+        //
+        // A folded-shut panel is hidden outright at the end regardless, so it
+        // does not leave its parent's spacing behind as a gap with nothing in
+        // it.
+        if open {
+            self.clip.set_visible(true);
+        }
+        let measured = self.inner.measure(gtk::Orientation::Vertical, -1).1;
+        // And a remembered height as a second line of defence, for the moments
+        // when a measurement is taken before layout has caught up. A panel
+        // that has ever been open knows how tall it was.
+        let full = match (measured, self.full.get()) {
+            (m, _) if m > 1 => {
+                self.full.set(m);
+                m
+            }
+            (_, remembered) if remembered > 1 => remembered,
+            (m, _) => m.max(1),
+        };
         let target = if open { full } else { 0 };
         let from = match self.at.get() {
             n if n < 0 => full,
             n => n,
         };
-        // A folded-shut panel is hidden outright at the end, so it does not
-        // leave its parent's spacing behind as a gap with nothing in it.
-        if open {
-            self.clip.set_visible(true);
-        }
         if from == target || !animate {
             self.land(target);
             return;
