@@ -116,6 +116,8 @@ type SectionHandler = Box<dyn Fn(Section)>;
 pub struct Shell {
     pub widget: gtk::Box,
     pub stack: gtk::Stack,
+    /// Where transient messages appear: over the page, not over the rail.
+    pub toasts: adw::ToastOverlay,
     items: RefCell<Vec<NavItem>>,
     current: RefCell<Section>,
     on_change: RefCell<Option<SectionHandler>>,
@@ -236,6 +238,7 @@ impl Shell {
         let shell = Rc::new(Self {
             widget: gtk::Box::new(gtk::Orientation::Horizontal, 0),
             stack: stack.clone(),
+            toasts: adw::ToastOverlay::new(),
             items: RefCell::new(Vec::new()),
             current: RefCell::new(Section::Convert),
             on_change: RefCell::new(None),
@@ -268,7 +271,14 @@ impl Shell {
         *shell.about.borrow_mut() = Some(about);
 
         shell.widget.append(&sidebar);
-        shell.widget.append(&stack);
+        // Toasts belong over the content, not over the whole window. Centred
+        // on the window they sit to one side of the area anybody is actually
+        // looking at, because the rail takes a fixed slice off the left and
+        // the middle of the window is not the middle of the page. Wrapping
+        // the stack rather than the shell puts them where the eye already is,
+        // and keeps them off the rail.
+        shell.toasts.set_child(Some(&stack));
+        shell.widget.append(&shell.toasts);
         shell.select_visual(Section::Convert);
         shell
     }

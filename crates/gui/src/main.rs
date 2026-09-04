@@ -329,11 +329,17 @@ struct App {
     /// The two things it has to be told, on the page where it is switched on.
     watchdog_folder: adw::ActionRow,
     watchdog_drive: adw::ActionRow,
-    watchdog_more: adw::ActionRow,
+
     watchdog_folder_btn: gtk::Button,
     /// The row saying what it converts into, and the button that changes it.
     watchdog_format: adw::ActionRow,
     watchdog_format_btn: gtk::MenuButton,
+    /// Eject, shown only when the destination is a drive that is actually here.
+    watchdog_eject: gtk::Button,
+    /// Empties WatchDog's own entries from history.
+    watchdog_clear: gtk::Button,
+    /// Where the extra numbers live on WatchDog's own page.
+    watchdog_more: adw::ExpanderRow,
     /// The list of what WatchDog has done on its own.
     watchdog_recent: gtk::ListBox,
     watchdog_drive_btn: gtk::MenuButton,
@@ -462,8 +468,9 @@ fn build(app: &adw::Application) -> Rc<App> {
     window.add_css_class("cheapazsla");
 
     let shell = shell::Shell::new();
-    let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&shell.widget));
+    // The overlay lives inside the shell, wrapping the page stack, so a toast
+    // is centred on the page rather than on the window.
+    let toasts = shell.toasts.clone();
 
     // Without this the window has no titlebar, and therefore no minimise,
     // maximise or close. A window that can only be shut with a keyboard
@@ -543,17 +550,27 @@ fn build(app: &adw::Application) -> Rc<App> {
         .valign(gtk::Align::Center)
         .tooltip_text("Pick the drive or folder WatchDog saves into")
         .build();
+    // Ejecting belongs next to the drive it would eject. WatchDog writes to
+    // that stick without being asked, so the moment you want to take it to the
+    // printer is the moment you need to be sure the writing has finished - and
+    // that is this page, not a different one.
+    let watchdog_eject = shell::icon_button("media-eject-symbolic", "Finish writing and eject");
+    watchdog_eject.set_visible(false);
+    watchdog_drive.add_suffix(&watchdog_eject);
     watchdog_drive.add_suffix(&choose_drive);
 
     let watchdog_widths = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
-    let watchdog_more = adw::ActionRow::builder()
+    // Opens where it is rather than sending you to Settings. Being thrown to
+    // another page to change a number, and then having to find your way back
+    // to the thing the number was about, is two navigations to answer one
+    // question. The same rows exist in Settings for anyone who looks there
+    // first; both write the same values.
+    let watchdog_more = adw::ExpanderRow::builder()
         .title("Everything else")
         .subtitle("Where files wait, and how much they may use")
         .subtitle_lines(1)
-        .activatable(true)
         .build();
-    watchdog_more.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
 
     let (dropzone, dropzone_title, dropzone_sub, dropzone_formats) = build_dropzone();
 
@@ -743,6 +760,12 @@ fn build(app: &adw::Application) -> Rc<App> {
         .title("Recently, automatically")
         .description("What WatchDog has converted without being asked")
         .build();
+    // Clears WatchDog's own entries, not the whole history.
+    let clear_recent = gtk::Button::with_label("Clear");
+    clear_recent.add_css_class("flat");
+    clear_recent.set_valign(gtk::Align::Center);
+    clear_recent.set_tooltip_text(Some("Forget what WatchDog converted on its own"));
+    watchdog_recent_group.set_header_suffix(Some(&clear_recent));
     watchdog_recent_group.add(&watchdog_recent);
     let watchdog_page = build_watchdog_page(
         &watchdog_row,
@@ -805,7 +828,7 @@ fn build(app: &adw::Application) -> Rc<App> {
 
     let root = adw::ToolbarView::new();
     root.add_top_bar(&header);
-    root.set_content(Some(&toasts));
+    root.set_content(Some(&shell.widget));
     window.set_content(Some(&root));
 
     let ui = Rc::new(App {
@@ -899,6 +922,8 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_folder_btn: choose_folder.clone(),
         watchdog_format: watchdog_format.clone(),
         watchdog_format_btn: choose_format.clone(),
+        watchdog_eject: watchdog_eject.clone(),
+        watchdog_clear: clear_recent.clone(),
         watchdog_recent: watchdog_recent.clone(),
         watchdog_drive_btn: choose_drive.clone(),
         watchdog_widths: watchdog_widths.clone(),
@@ -1568,6 +1593,139 @@ struct NearbyPanel {
     search: gtk::Entry,
 }
 
+/// WatchDog's numbers: where files wait, how much room they may take, and how
+/// long they may take it for.
+///
+/// Built on demand rather than once, because they appear in two places - the
+/// expander on WatchDog's own page, and the section in Settings - and a widget
+/// has one parent. Both sets write the same settings and tell the rest of the
+/// interface to catch up, so whichever you reach for, the other agrees.
+fn watchdog_detail_rows(ui: &Rc<App>) -> Vec<adw::PreferencesRow> {
+    let current = ui.settings.borrow().clone();
+
+    let staging_row = adw::ComboRow::builder()
+        .title("Where files wait")
+        .subtitle("Until the drive is plugged in")
+        .model(&gtk::StringList::new(&[
+            "On disk",
+            "In memory",
+            "Do not convert until the drive is in",
+        ]))
+        .selected(match auto::Staging::from_id(&current.auto_staging) {
+            auto::Staging::Disk => 0,
+            auto::Staging::Ram => 1,
+            auto::Staging::OnDemand => 2,
+        })
+        .build();
+    {
+        let ui = ui.clone();
+        staging_row.connect_selected_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.auto_staging = match r.selected() {
+                    1 => auto::Staging::Ram,
+                    2 => auto::Staging::OnDemand,
+                    _ => auto::Staging::Disk,
+                }
+                .id()
+                .to_string();
+                let _ = s.save();
+            }
+            refresh_auto_indicator(&ui);
+        });
+    }
+
+    let ram_row = adw::SpinRow::builder()
+        .title("Memory it may use for waiting files")
+        .subtitle(match auto::available_ram_mb() {
+            Some(free) => format!("This machine has about {free} MB free right now"),
+            None => "In megabytes".to_string(),
+        })
+        .adjustment(&gtk::Adjustment::new(
+            current.ram_budget_mb as f64,
+            64.0,
+            8192.0,
+            64.0,
+            256.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        ram_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.ram_budget_mb = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+
+    let cap_row = adw::SpinRow::builder()
+        .title("Most it will keep waiting")
+        .subtitle("In megabytes. Past this it stops converting rather than filling the disk.")
+        .adjustment(&gtk::Adjustment::new(
+            current.auto_cap_mb as f64,
+            64.0,
+            50_000.0,
+            64.0,
+            512.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        cap_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.auto_cap_mb = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+
+    let keep_row = adw::SpinRow::builder()
+        .title("How long a file waits")
+        .subtitle("In days. One nobody collected in that time is dropped.")
+        .adjustment(&gtk::Adjustment::new(
+            current.auto_keep_days as f64,
+            1.0,
+            365.0,
+            1.0,
+            7.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        keep_row.connect_value_notify(move |r| {
+            let mut s = ui.settings.borrow_mut();
+            s.auto_keep_days = r.value() as u32;
+            let _ = s.save();
+        });
+    }
+
+    // What is actually sitting there, because a queue nobody can see is how
+    // somebody loses forty gigabytes without knowing where it went.
+    let held = auto::staging_dir(auto::Staging::from_id(&current.auto_staging))
+        .map(|d| auto::waiting(&d))
+        .unwrap_or(auto::Waiting {
+            files: Vec::new(),
+            bytes: 0,
+        });
+    let waiting_row = adw::ActionRow::builder()
+        .title("Waiting to be copied")
+        .subtitle(match held.files.len() {
+            0 => "Nothing".to_string(),
+            n => format!("{n} files, {}", render::human_bytes(held.bytes)),
+        })
+        .build();
+
+    vec![
+        staging_row.upcast(),
+        ram_row.upcast(),
+        cap_row.upcast(),
+        keep_row.upcast(),
+        waiting_row.upcast(),
+    ]
+}
+
 /// WatchDog's own page: what it is doing, and the three things it needs.
 ///
 /// Laid out in the order the questions are asked. What is happening, at the
@@ -1583,7 +1741,7 @@ fn build_watchdog_page(
     folder: &adw::ActionRow,
     format: &adw::ActionRow,
     into: &adw::ActionRow,
-    more: &adw::ActionRow,
+    more: &adw::ExpanderRow,
     recent: &adw::PreferencesGroup,
 ) -> gtk::Widget {
     let page = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_5);
@@ -1601,13 +1759,23 @@ fn build_watchdog_page(
     // switch above is worth touching. Plain enough to be read once and not
     // needed again - which is the standard the settings wording is held to,
     // and there is no reason this should be held to a lower one.
-    let what = gtk::Label::builder()
-        .label(
-            "Leave this on and you can forget about it. WatchDog keeps an eye on one folder.              When your slicer saves a new file there, it converts it to your printer's format              and puts the result where you say - a USB stick, or any folder on this computer.              Nothing to open, nothing to press.",
-        )
-        .xalign(0.0)
-        .wrap(true)
-        .build();
+    // Built by joining separate lines rather than as one wrapped literal. The
+    // literal was written with backslash continuations, the formatter joined
+    // them keeping the indentation, and the paragraph reached the screen with
+    // fourteen spaces between every sentence.
+    let what = [
+        "Leave this on and you can forget about it.",
+        "WatchDog watches one folder.",
+        "When your slicer saves a new file there, it converts the file to your printer's format",
+        "and puts the result where you say - a USB stick, or any folder on this computer.",
+        "Nothing to open, nothing to press.",
+    ]
+    .join(" ");
+    let what = gtk::Label::builder().label(&what).xalign(0.0).build();
+    what.set_wrap(true);
+    what.set_wrap_mode(gtk::pango::WrapMode::Word);
+    what.set_justify(gtk::Justification::Left);
+    what.set_max_width_chars(66);
     what.add_css_class("caption");
     what.add_css_class("cz-dim");
     what.set_margin_start(theme::SPACE_2);
@@ -1741,6 +1909,26 @@ impl Fold {
             }
             glib::ControlFlow::Continue
         });
+    }
+
+    /// Take the panel's height again, for content that grew or shrank while it
+    /// was already open.
+    ///
+    /// A fold pins a height. Anything the panel gains afterwards is simply cut
+    /// off - which is what happened to the line under WatchDog's chain: the
+    /// height was taken while that line was empty and hidden, so when it later
+    /// had something to say there was no room left to say it in.
+    fn refit(&self) {
+        if self.at.get() <= 0 || !self.clip.is_visible() {
+            return;
+        }
+        let measured = self.inner.measure(gtk::Orientation::Vertical, -1).1;
+        if measured <= 1 || measured == self.at.get() {
+            return;
+        }
+        self.full.set(measured);
+        self.at.set(measured);
+        self.clip.set_size_request(-1, measured);
     }
 
     fn land(&self, target: i32) {
@@ -2452,10 +2640,60 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
         });
     }
 
+    for row in watchdog_detail_rows(ui) {
+        ui.watchdog_more.add_row(&row);
+    }
     {
+        // Only what WatchDog did. Somebody tidying away a run of automatic
+        // conversions is not asking to lose the record of everything they
+        // converted by hand, and the two are in the same file.
         let ui2 = ui.clone();
-        ui.watchdog_more
-            .connect_activated(move |_| ui2.shell.show(Section::Settings));
+        ui.watchdog_clear.connect_clicked(move |_| {
+            let gone = {
+                let mut hist = ui2.history.borrow_mut();
+                let before = hist.entries.len();
+                hist.entries.retain(|e| !e.automatic);
+                let _ = hist.save();
+                before - hist.entries.len()
+            };
+            refresh_watchdog_recent(&ui2);
+            refresh_history(&ui2);
+            ui2.toasts.add_toast(adw::Toast::new(&match gone {
+                0 => "There was nothing to clear".to_string(),
+                1 => "Forgot 1 automatic conversion".to_string(),
+                n => format!("Forgot {n} automatic conversions"),
+            }));
+        });
+    }
+    {
+        // Finish writing before the stick is pulled. WatchDog copies without
+        // being asked, so "is it safe to unplug" is a question this page owes
+        // an answer to.
+        let ui2 = ui.clone();
+        ui.watchdog_eject.connect_clicked(move |b| {
+            let Some(drive) = ui2
+                .settings
+                .borrow()
+                .auto_target_uuid
+                .as_deref()
+                .and_then(drives::by_uuid)
+            else {
+                return;
+            };
+            b.set_sensitive(false);
+            let name = drive.name.clone();
+            let sort = ui2.settings.borrow().sort_drive_on_eject;
+            let ui3 = ui2.clone();
+            drives::eject(&drive, sort, move |res| {
+                ui3.watchdog_eject.set_sensitive(true);
+                ui3.toasts.add_toast(adw::Toast::new(&match &res {
+                    Ok(()) => format!("{name} is safe to unplug"),
+                    Err(why) => format!("Could not eject {name}: {why}"),
+                }));
+                refresh_auto_indicator(&ui3);
+                refresh_watchdog_steps(&ui3);
+            });
+        });
     }
     // The same width, whichever is holding the longer name. Two controls that
     // do the same kind of thing, one above the other, should not read as two
@@ -3406,6 +3644,10 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
         (None, Some(last)) => chain.set_footer(Some(last)),
         (None, None) => chain.set_footer(None),
     }
+
+    // The line above may have just appeared or gone. The fold holding the
+    // chain was measured before it did, so it is measured again now.
+    ui.watchdog_fold.refit();
 }
 
 /// How long is left, in the words a person would use.
@@ -3946,6 +4188,18 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
         &registry::by_id(&to)
             .map(|h| h.info().name.to_string())
             .unwrap_or_else(|| to.to_uppercase()),
+    );
+    // Only for a real, present, removable drive: a folder cannot be ejected,
+    // and an unplugged stick is already out.
+    ui.watchdog_eject.set_visible(
+        to_folder.is_none()
+            && ui
+                .settings
+                .borrow()
+                .auto_target_uuid
+                .as_deref()
+                .and_then(drives::by_uuid)
+                .is_some_and(|d| d.removable),
     );
     ui.watchdog_format_btn.set_label(&shorten(
         &registry::by_id(&to)
@@ -8256,147 +8510,30 @@ fn build_settings_page(ui: &Rc<App>, container: &gtk::Box) {
     automatic.add_row(&auto_on);
     *ui.auto_switch.borrow_mut() = Some(auto_on.clone());
 
-    // The folder and the drive are set on the Convert page, in the row that
-    // switches WatchDog on. Two places to set one thing is two places to look
-    // and two things to keep in step, and the one beside the switch wins.
+    // Which folder, which format, which destination - the three that need a
+    // picker rather than a number, and that belong beside the chain that shows
+    // what they are doing.
     let where_row = adw::ActionRow::builder()
-        .title("Folder and drive")
-        .subtitle("Set on the Convert page, under WatchDog")
+        .title("Folder, format and destination")
+        .subtitle("Set on WatchDog's own page, beside what it is doing")
         .activatable(true)
         .build();
     where_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     {
         let ui = ui.clone();
-        where_row.connect_activated(move |_| ui.shell.show(Section::Convert));
+        where_row.connect_activated(move |_| ui.shell.show(Section::WatchDog));
     }
     automatic.add_row(&where_row);
 
-    let staging_row = adw::ComboRow::builder()
-        .title("Where files wait")
-        .subtitle("Until the drive is plugged in")
-        .model(&gtk::StringList::new(&[
-            "On disk",
-            "In memory",
-            "Do not convert until the drive is in",
-        ]))
-        .selected(match auto::Staging::from_id(&current.auto_staging) {
-            auto::Staging::Disk => 0,
-            auto::Staging::Ram => 1,
-            auto::Staging::OnDemand => 2,
-        })
-        .build();
-    {
-        let ui = ui.clone();
-        staging_row.connect_selected_notify(move |r| {
-            let mut s = ui.settings.borrow_mut();
-            s.auto_staging = match r.selected() {
-                1 => auto::Staging::Ram,
-                2 => auto::Staging::OnDemand,
-                _ => auto::Staging::Disk,
-            }
-            .id()
-            .to_string();
-            let _ = s.save();
-        });
+    let detail = watchdog_detail_rows(ui);
+    for row in &detail {
+        automatic.add_row(row);
     }
-    automatic.add_row(&staging_row);
-
-    let ram_row = adw::SpinRow::builder()
-        .title("Memory it may use for waiting files")
-        .subtitle(match auto::available_ram_mb() {
-            Some(free) => format!("This machine has about {free} MB free right now"),
-            None => "In megabytes".to_string(),
-        })
-        .adjustment(&gtk::Adjustment::new(
-            current.ram_budget_mb as f64,
-            64.0,
-            8192.0,
-            64.0,
-            256.0,
-            0.0,
-        ))
-        .build();
-    {
-        let ui = ui.clone();
-        ram_row.connect_value_notify(move |r| {
-            let mut s = ui.settings.borrow_mut();
-            s.ram_budget_mb = r.value() as u32;
-            let _ = s.save();
-        });
-    }
-    automatic.add_row(&ram_row);
-
-    let cap_row = adw::SpinRow::builder()
-        .title("Most it will keep waiting")
-        .subtitle("In megabytes. Past this it stops converting rather than filling the disk.")
-        .adjustment(&gtk::Adjustment::new(
-            current.auto_cap_mb as f64,
-            64.0,
-            50_000.0,
-            64.0,
-            512.0,
-            0.0,
-        ))
-        .build();
-    {
-        let ui = ui.clone();
-        cap_row.connect_value_notify(move |r| {
-            let mut s = ui.settings.borrow_mut();
-            s.auto_cap_mb = r.value() as u32;
-            let _ = s.save();
-        });
-    }
-    automatic.add_row(&cap_row);
-
-    let keep_row = adw::SpinRow::builder()
-        .title("How long a file waits")
-        .subtitle("In days. One nobody collected in that time is dropped.")
-        .adjustment(&gtk::Adjustment::new(
-            current.auto_keep_days as f64,
-            1.0,
-            365.0,
-            1.0,
-            7.0,
-            0.0,
-        ))
-        .build();
-    {
-        let ui = ui.clone();
-        keep_row.connect_value_notify(move |r| {
-            let mut s = ui.settings.borrow_mut();
-            s.auto_keep_days = r.value() as u32;
-            let _ = s.save();
-        });
-    }
-    automatic.add_row(&keep_row);
-
-    // What is actually sitting there, because a queue nobody can see is how
-    // somebody loses forty gigabytes without knowing where it went.
-    let held = auto::staging_dir(auto::Staging::from_id(&current.auto_staging))
-        .map(|d| auto::waiting(&d))
-        .unwrap_or(auto::Waiting {
-            files: Vec::new(),
-            bytes: 0,
-        });
-    let waiting_row = adw::ActionRow::builder()
-        .title("Waiting to be copied")
-        .subtitle(match held.files.len() {
-            0 => "Nothing".to_string(),
-            n => format!("{n} files, {}", render::human_bytes(held.bytes)),
-        })
-        .build();
-    automatic.add_row(&waiting_row);
 
     // The rows above only describe a thing that is running.
     {
-        let rows: Vec<gtk::Widget> = vec![
-            where_row.clone().upcast(),
-            staging_row.clone().upcast(),
-            ram_row.clone().upcast(),
-            cap_row.clone().upcast(),
-            keep_row.clone().upcast(),
-            waiting_row.clone().upcast(),
-        ];
+        let mut rows: Vec<gtk::Widget> = vec![where_row.clone().upcast()];
+        rows.extend(detail.iter().map(|r| r.clone().upcast::<gtk::Widget>()));
         let show = move |on: bool| {
             for r in &rows {
                 r.set_visible(on);
