@@ -301,37 +301,20 @@ fn sheet(p: &Palette) -> String {
 
 /* Grey is not done. White is done. Breathing is live. Nothing else, so the
    three can be told apart across the room without reading any of them. */
-.cz-step-idle {{ color: @cz_dim; opacity: 0.5; }}
-.cz-step-done {{ color: @cz_text; opacity: 1; }}
+.cz-step-idle {{ color: @cz_dim; }}
+.cz-step-done {{ color: @cz_text; }}
 /* Green appears once, at the end, and only when a file has actually landed. */
-.cz-step-landed {{ color: {ok}; opacity: 1; }}
+.cz-step-landed {{ color: {ok}; }}
 /* Dull under the cross: the stop is not the thing to look at, the cross is. */
-.cz-step-missing {{ color: @cz_dim; opacity: 0.45; }}
+.cz-step-missing {{ color: @cz_dim; }}
 .cz-step-cross {{ color: {error}; opacity: 0.95; }}
 
-@keyframes cz-breathe {{
-  0%   {{ color: @cz_dim; opacity: 0.45; }}
-  50%  {{ color: @cz_text; opacity: 1; }}
-  100% {{ color: @cz_dim; opacity: 0.45; }}
-}}
-.cz-step-live {{
-  color: @cz_text;
-  animation: cz-breathe 1400ms ease-in-out infinite;
-}}
-
-/* Waiting on the user, which is not the same as working and must not look the
-   same. The accent colour is what the rest of the program uses for the thing
-   to press, and a different colour is what stops two pulsing stops reading as
-   one event happening twice. */
-@keyframes cz-calling {{
-  0%   {{ color: @cz_dim; opacity: 0.5; }}
-  50%  {{ color: @cz_accent; opacity: 1; }}
-  100% {{ color: @cz_dim; opacity: 0.5; }}
-}}
-.cz-step-calling {{
-  color: @cz_accent;
-  animation: cz-calling 1200ms ease-in-out infinite;
-}}
+/* The breathing itself is driven from one clock in code, not from a keyframe
+   here: a CSS animation starts when its class is applied, so four stops that
+   light up at four different moments pulse out of phase and the row reads as
+   a string of fairy lights. These only say what colour a live stop is. */
+.cz-step-live {{ color: @cz_text; }}
+.cz-step-calling {{ color: @cz_accent; }}
 
 /* A stop is a button only where there is something to press. The inert ones
    are left unhoverable in code, so this styles the pressable ones alone. */

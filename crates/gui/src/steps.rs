@@ -76,6 +76,8 @@ const NOTE_GAP: i32 = 28;
 
 struct Step {
     button: gtk::Button,
+    /// Everything the stop is made of, so one opacity drives the lot.
+    column: gtk::Box,
     icon: gtk::Image,
     cross: gtk::DrawingArea,
     label: gtk::Label,
@@ -162,15 +164,17 @@ impl Note {
     fn new(room: Rc<Cell<i32>>, allowed: Rc<Cell<bool>>, slides: bool) -> Self {
         let first = gtk::Label::builder().label("").build();
         let second = gtk::Label::builder().label("").build();
-        // Ellipsised even where the text slides. Ellipsising sets how small a
-        // label may be squeezed, not how large it may be drawn - so without it
-        // a label's full text becomes its column's minimum width, and the
-        // whole chain spreads sideways the moment a longer name appears. The
-        // scrolled window still hands the label its full natural width, so the
-        // sliding one slides exactly as before.
-        for l in [&first, &second] {
-            l.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            l.set_width_chars(0);
+        // Cut short where the line does not slide, and left whole where it
+        // does. An ellipsised label inside the marquee gets squeezed to share
+        // the view with its second copy, and two four-character stubs is not a
+        // name being read - it is a name being destroyed twice. The column
+        // cannot grow either way: the scrolled window's content width is
+        // pinned at both ends below.
+        if !slides {
+            for l in [&first, &second] {
+                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                l.set_width_chars(0);
+            }
         }
         for l in [&first, &second] {
             l.add_css_class("caption");
@@ -314,6 +318,13 @@ pub struct Steps {
     /// Where each connector's width is heading, so a glide already under way
     /// is not fought by a second one.
     gliding: Cell<bool>,
+    /// Which stops are breathing. They are driven together from one clock
+    /// rather than each from its own CSS animation, because animations start
+    /// when their class is applied and stops light up at different moments -
+    /// which leaves four things pulsing out of phase, and a row of lights
+    /// blinking independently reads as decoration rather than as one state.
+    breathing: RefCell<Vec<usize>>,
+    beating: Cell<bool>,
 }
 
 impl Steps {
@@ -397,6 +408,7 @@ impl Steps {
             row.append(&button);
             steps.push(Step {
                 button,
+                column,
                 icon,
                 cross,
                 label,
@@ -445,6 +457,8 @@ impl Steps {
             notes_allowed,
             level: Cell::new(0),
             gliding: Cell::new(false),
+            breathing: RefCell::new(Vec::new()),
+            beating: Cell::new(false),
         })
     }
 
@@ -544,10 +558,26 @@ impl Steps {
         }
     }
 
-    pub fn set_state(&self, at: usize, state: State) {
+    pub fn set_state(self: &Rc<Self>, at: usize, state: State) {
         let Some(step) = self.steps.get(at) else {
             return;
         };
+        // Which stops are alive, so the shared beat knows what to drive. Held
+        // still at a fixed opacity when they are not.
+        {
+            let mut breathing = self.breathing.borrow_mut();
+            breathing.retain(|i| *i != at);
+            if matches!(state, State::Live | State::Calling) {
+                breathing.push(at);
+            }
+        }
+        step.column.set_opacity(match state {
+            State::Idle => 0.5,
+            State::Missing => 0.55,
+            State::Done | State::Landed => 1.0,
+            // Left to the beat, which is about to set it.
+            State::Live | State::Calling => step.column.opacity(),
+        });
         for class in CLASSES {
             step.icon.remove_css_class(class);
             step.label.remove_css_class(class);
@@ -577,6 +607,42 @@ impl Steps {
             l.add_css_class(words);
         }
         step.cross.set_visible(state == State::Missing);
+        self.beat();
+    }
+
+    /// One clock for every breathing stop, so they rise and fall together.
+    ///
+    /// Stops the moment nothing is breathing, and picks up again from the
+    /// phase it left off, so a stop joining an existing beat falls into step
+    /// with it rather than starting its own.
+    fn beat(self: &Rc<Self>) {
+        if self.breathing.borrow().is_empty() || self.beating.replace(true) {
+            return;
+        }
+        let steps = self.clone();
+        let started = std::time::Instant::now();
+        const PERIOD: f64 = 1.4;
+        glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+            let which = steps.breathing.borrow().clone();
+            if which.is_empty() {
+                steps.beating.set(false);
+                for step in &steps.steps {
+                    step.column.set_opacity(1.0);
+                }
+                return glib::ControlFlow::Break;
+            }
+            let phase = (started.elapsed().as_secs_f64() / PERIOD).fract();
+            // A cosine rather than a triangle: it lingers at the ends, which
+            // is what makes it read as breathing rather than as blinking.
+            let swell = 0.5 - 0.5 * (phase * std::f64::consts::TAU).cos();
+            let opacity = 0.35 + 0.65 * swell;
+            for i in which {
+                if let Some(step) = steps.steps.get(i) {
+                    step.column.set_opacity(opacity);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// A second line under a milestone: which folder, which drive, which file.
@@ -708,6 +774,7 @@ impl Steps {
 
     /// Stop everything moving, for when the chain is put away.
     pub fn rest(&self) {
+        self.breathing.borrow_mut().clear();
         self.bouncing.borrow_mut().clear();
         self.filling.borrow_mut().clear();
         for link in &self.links {

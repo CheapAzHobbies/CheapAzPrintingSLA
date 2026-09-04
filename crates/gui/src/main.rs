@@ -179,6 +179,10 @@ struct App {
     /// so the leg into "New file" is filled once when one turns up rather than
     /// restarted on every redraw.
     watchdog_found: Cell<bool>,
+    /// A file that turned up and could not be converted, and why. Kept until
+    /// the next one arrives or it is dismissed, because a failure that clears
+    /// itself in a second is a failure nobody reads.
+    watchdog_trouble: RefCell<Option<(String, String)>>,
     /// Whether a file has actually reached the drive. The one thing that
     /// turns the last stop green, and it is cleared the moment the next file
     /// starts - a chain that stays green is a chain reporting an old success.
@@ -788,6 +792,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_sending: Cell::new(false),
         watchdog_ready: RefCell::new(None),
         watchdog_found: Cell::new(false),
+        watchdog_trouble: RefCell::new(None),
         watchdog_landed: Cell::new(false),
         dropzone_formats,
         nearby_panel: nearby_panel.clone(),
@@ -2920,12 +2925,19 @@ fn wire_watchdog_steps(ui: &Rc<App>) {
         });
     }
 
-    // The folder itself, in whatever file manager the desktop uses. Answers
-    // "where am I supposed to put the files", which is the question this stop
-    // raises and the one nothing else on the page answers.
+    // Three jobs, in the order the stop is likely to be in when pressed: put
+    // the failure away, put the waiting file away, or go and look at the
+    // folder. Each is what "get this off my screen" means at that moment.
     {
         let ui2 = ui.clone();
         chain.on_click(1, "Open the watched folder", move || {
+            if ui2.watchdog_trouble.borrow_mut().take().is_some() {
+                refresh_watchdog_steps(&ui2);
+                return;
+            }
+            if watchdog_skip(&ui2) {
+                return;
+            }
             let Some(dir) = ui2.settings.borrow().auto_watch_dir.clone() else {
                 choose_watch_folder(&ui2);
                 return;
@@ -2939,13 +2951,16 @@ fn wire_watchdog_steps(ui: &Rc<App>) {
         });
     }
 
-    // Everything about how it converts - the format, the staging, the limits -
-    // lives in Settings, and there is too much of it to fit in a popover.
+    // What it converts to. The stop is called Convert, so the question it
+    // raises is "into what" - and answering that by walking off to another
+    // page was a page change nobody asked for.
     {
-        let ui2 = ui.clone();
-        chain.on_click(2, "WatchDog settings", move || {
-            ui2.shell.show(Section::Settings)
-        });
+        let menu = watchdog_format_menu(ui);
+        if let Some(anchor) = chain.anchor(2) {
+            menu.set_parent(&anchor);
+            menu.set_position(gtk::PositionType::Bottom);
+            chain.on_click(2, "Choose what to convert to", move || menu.popup());
+        }
     }
 
     // Parented to the stop rather than shown as a dialog, so it opens where it
@@ -3030,19 +3045,39 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     let waiting_on = ui.auto_settling.borrow().len() + ui.auto_queue.borrow().len();
     let doing = ui.watchdog_doing.borrow().clone();
     let holding = waiting_on > 0 || doing.is_some();
-    if watching.is_none() {
+    let trouble = ui.watchdog_trouble.borrow().clone();
+    // Which file, by name. "A file was found" is not news to anybody watching
+    // a folder they put a file in; which one it was is.
+    let found_name = doing.clone().or_else(|| {
+        let named = |p: &Path| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        ui.auto_queue
+            .borrow()
+            .front()
+            .map(|p| named(p))
+            .or_else(|| ui.auto_settling.borrow().first().map(|s| named(&s.path)))
+    });
+    if let Some((name, why)) = &trouble {
+        // The stop that found it is the stop that crosses out. Nothing further
+        // along was reached, so nothing further along should claim anything.
+        chain.set_state(1, State::Missing);
+        chain.set_note(1, Some(why));
+        chain.set_hint(1, &format!("{name}: {why} - click to dismiss"));
+    } else if watching.is_none() {
         // Nothing is being looked in, so nothing is being looked for.
         chain.set_state(1, State::Idle);
         chain.set_note(1, Some("no folder"));
-    } else if let Some(name) = &doing {
-        chain.set_state(1, State::Done);
-        chain.set_note(1, Some(name));
     } else if holding {
         chain.set_state(1, State::Done);
-        chain.set_note(1, Some("file found"));
+        chain.set_note(1, found_name.as_deref().or(Some("file found")));
+        chain.set_hint(1, "Click to skip this file");
     } else {
         chain.set_state(1, State::Live);
         chain.set_note(1, Some("looking"));
+        chain.set_hint(1, "Open the watched folder");
     }
 
     // 3: the conversion. Done stays white until the next file arrives, so the
@@ -3052,7 +3087,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     // here: a file found and then nothing happening, with no reason given, is
     // the exact thing this chain exists to prevent.
     let landed = ui.watchdog_landed.get();
-    let held = target.is_none();
+    let held = target.is_none() && trouble.is_none();
     match (&doing, ui.watchdog_ready.borrow().is_some()) {
         (Some(_), _) => {
             chain.set_state(2, State::Live);
@@ -3076,8 +3111,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
                 },
             );
             chain.set_note(2, (held && holding).then_some("needs a drive"));
-            chain.set_link(2, 0.0);
-            chain.set_link_note(2, None);
+            chain.set_link_note(3, None);
         }
     }
 
@@ -3123,29 +3157,30 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     let mut bounce = Vec::new();
     let was_holding = ui.watchdog_found.replace(holding);
     if holding {
-        // Run it across rather than snapping it full. The file arriving is the
-        // one moment in the chain where something really did travel that leg,
-        // and showing it travel is the difference between a chain that reports
-        // states and one that shows a file moving through them. Started only
+        // Run the file across the two legs it has actually travelled, one
+        // after the other, rather than snapping them full. Nothing is measured
+        // here - a file being found has no percentage - but it did move, and
+        // showing it move is the difference between a chain that reports
+        // states and one that shows a file passing through them. Started only
         // on the change, so a redraw part-way through does not restart it.
         if !was_holding {
-            chain.clone().fill_link(1, 0.45, || {});
+            let chain2 = chain.clone();
+            chain.clone().fill_link(1, 0.4, move || {
+                chain2.clone().fill_link(2, 0.4, || {});
+            });
         }
-    } else if watching.is_some() {
+    } else if watching.is_some() && trouble.is_none() {
         bounce.push(1);
     } else {
         chain.set_link(1, 0.0);
+        chain.set_link(2, 0.0);
     }
-    // Link 2 is left alone while converting: the layer counter owns it, and it
-    // is the one place in the chain with a real number to report. Held for
-    // want of a drive it stays empty - a bouncing bar would say something is
-    // under way when the whole point is that nothing is.
-    if doing.is_none() && holding && !held {
-        bounce.push(2);
-    }
+    // Link 3 carries the conversion: it is the leg with a real number to
+    // report, and the one that ends where the file is meant to end up. Left
+    // alone while converting, because the layer counter owns it then.
     if sending {
         bounce.push(3);
-    } else if !landed && ui.watchdog_ready.borrow().is_none() {
+    } else if doing.is_none() && !landed && ui.watchdog_ready.borrow().is_none() {
         chain.set_link(3, 0.0);
     }
     chain.bounce(bounce);
@@ -3153,6 +3188,10 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     // And the line underneath: what it finished, and that it is round again.
     let ready = ui.watchdog_ready.borrow().clone();
     match (&doing, &ready) {
+        _ if trouble.is_some() => {
+            let (name, why) = trouble.as_ref().expect("just checked");
+            chain.set_footer(Some(&format!("{name} could not be converted - {why}")))
+        }
         (Some(name), _) => chain.set_footer(Some(&format!("Converting {name}\u{2026}"))),
         _ if held && holding => chain.set_footer(Some(
             "Found a file, but no drive has been chosen to copy it to",
@@ -3213,6 +3252,85 @@ fn choose_watch_folder(ui: &Rc<App>) {
             rearm_auto(&ui);
         },
     );
+}
+
+/// Drop whatever WatchDog is holding, without converting it.
+///
+/// A file dropped into the folder by accident, or one waiting on a drive that
+/// is not coming, otherwise sits at the head of the queue for the rest of the
+/// session. Recorded as done so the folder monitor does not offer it straight
+/// back, which would make the button look broken.
+fn watchdog_skip(ui: &Rc<App>) -> bool {
+    let skipped = ui.auto_queue.borrow_mut().pop_front().or_else(|| {
+        let mut settling = ui.auto_settling.borrow_mut();
+        (!settling.is_empty()).then(|| settling.remove(0).path)
+    });
+    let Some(path) = skipped else {
+        return false;
+    };
+    if let Some(key) = auto_key(&path) {
+        ui.auto_done.borrow_mut().push(key);
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    refresh_watchdog_steps(ui);
+    ui.toasts
+        .add_toast(adw::Toast::new(&format!("Skipped {name}")));
+    true
+}
+
+/// The formats WatchDog could convert into.
+///
+/// Only formats that can be written, in alphabetical order, with the one in
+/// force ticked. The same list the output picker offers, asked from the stop
+/// that raises the question rather than from a page two clicks away.
+fn watchdog_format_menu(ui: &Rc<App>) -> gtk::Popover {
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("cz-menu");
+    let popover = gtk::Popover::builder().child(&list).build();
+    popover.add_css_class("menu");
+
+    let ui = ui.clone();
+    let pop = popover.clone();
+    popover.connect_show(move |_| {
+        while let Some(row) = list.first_child() {
+            list.remove(&row);
+        }
+        let now = ui.settings.borrow().auto_to_format.clone();
+        let mut formats = registry::writable();
+        formats.sort_by_key(|i| i.name);
+        for info in formats {
+            let row = adw::ActionRow::builder()
+                .title(info.name)
+                .subtitle(format!(".{}", info.extension))
+                .activatable(true)
+                .build();
+            if info.id == now {
+                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            }
+            let ui2 = ui.clone();
+            let pop2 = pop.clone();
+            let id = info.id.to_string();
+            let name = info.name.to_string();
+            row.connect_activated(move |_| {
+                {
+                    let mut s = ui2.settings.borrow_mut();
+                    s.auto_to_format = id.clone();
+                    let _ = s.save();
+                }
+                pop2.popdown();
+                refresh_auto_indicator(&ui2);
+                refresh_watchdog_steps(&ui2);
+                ui2.toasts
+                    .add_toast(adw::Toast::new(&format!("WatchDog will convert to {name}")));
+            });
+            list.append(&row);
+        }
+    });
+    popover
 }
 
 /// The menu of drives WatchDog could copy to.
@@ -3713,14 +3831,22 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
     let plan = match convert::plan(&source, &to, &dest) {
         Ok(p) => p,
         Err(e) => {
-            ui.toasts.add_toast(adw::Toast::new(&format!(
-                "{}: {e}",
-                source.file_name().unwrap_or_default().to_string_lossy()
-            )));
+            let name = source
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Held on the chain rather than only thrown at a toast. A toast
+            // is gone in five seconds; the question "why did nothing happen to
+            // my file" is asked long after that, and the chain is where it
+            // gets asked.
+            *ui.watchdog_trouble.borrow_mut() = Some((name.clone(), e.headline().to_string()));
+            ui.toasts
+                .add_toast(adw::Toast::new(&format!("{name}: {e}")));
             // Recorded, so a file that cannot be converted is not retried on
             // every touch for the rest of the session.
             ui.auto_done.borrow_mut().push(key);
             release(ui);
+            refresh_watchdog_steps(ui);
             return;
         }
     };
@@ -3753,6 +3879,7 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
     // A new file starts the chain over. Whatever finished last is no longer
     // the news, and the green at the end belonged to that one, not this one.
     *ui.watchdog_ready.borrow_mut() = None;
+    *ui.watchdog_trouble.borrow_mut() = None;
     ui.watchdog_landed.set(false);
     ui.watchdog_steps.set_link(3, 0.0);
     refresh_watchdog_steps(ui);
@@ -3768,7 +3895,7 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
                 if total == 0 {
                     continue;
                 }
-                ui.watchdog_steps.set_link(2, done as f64 / total as f64);
+                ui.watchdog_steps.set_link(3, done as f64 / total as f64);
                 let (started, from) = *began.get_or_insert((std::time::Instant::now(), done));
                 let made = done.saturating_sub(from);
                 // Nothing is said until there is enough behind us to say it
@@ -3779,9 +3906,9 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
                 }
                 let each = started.elapsed().as_secs_f64() / made as f64;
                 let left = total.saturating_sub(done) as f64 * each;
-                ui.watchdog_steps.set_link_note(2, Some(&about_left(left)));
+                ui.watchdog_steps.set_link_note(3, Some(&about_left(left)));
             }
-            ui.watchdog_steps.set_link_note(2, None);
+            ui.watchdog_steps.set_link_note(3, None);
         });
     }
     let ui = ui.clone();
