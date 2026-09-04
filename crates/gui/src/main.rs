@@ -2926,11 +2926,10 @@ fn wire_watchdog_steps(ui: &Rc<App>) {
     }
 
     // Three jobs, in the order the stop is likely to be in when pressed: put
-    // the failure away, put the waiting file away, or go and look at the
-    // folder. Each is what "get this off my screen" means at that moment.
+    // the failure away, put the waiting file away, or hand it one by hand.
     {
         let ui2 = ui.clone();
-        chain.on_click(1, "Open the watched folder", move || {
+        chain.on_click(1, "Choose a file to convert", move || {
             if ui2.watchdog_trouble.borrow_mut().take().is_some() {
                 refresh_watchdog_steps(&ui2);
                 return;
@@ -2938,16 +2937,7 @@ fn wire_watchdog_steps(ui: &Rc<App>) {
             if watchdog_skip(&ui2) {
                 return;
             }
-            let Some(dir) = ui2.settings.borrow().auto_watch_dir.clone() else {
-                choose_watch_folder(&ui2);
-                return;
-            };
-            if !dir.is_dir() {
-                choose_watch_folder(&ui2);
-                return;
-            }
-            let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&dir)));
-            launcher.launch(Some(&ui2.window), gio::Cancellable::NONE, |_| {});
+            watchdog_pick_file(&ui2);
         });
     }
 
@@ -2989,15 +2979,11 @@ fn wire_watchdog_steps(ui: &Rc<App>) {
 fn refresh_watchdog_steps(ui: &Rc<App>) {
     use steps::State;
 
-    let (armed, dir, target, label) = {
+    let (armed, dir) = {
         let s = ui.settings.borrow();
-        (
-            s.auto_convert,
-            s.auto_watch_dir.clone(),
-            s.auto_target_uuid.clone(),
-            s.auto_target_label.clone(),
-        )
+        (s.auto_convert, s.auto_watch_dir.clone())
     };
+    let (target, here) = watchdog_where(ui);
     ui.watchdog_steps.widget.set_visible(armed);
     if !armed {
         ui.watchdog_steps.rest();
@@ -3077,7 +3063,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     } else {
         chain.set_state(1, State::Live);
         chain.set_note(1, Some("looking"));
-        chain.set_hint(1, "Open the watched folder");
+        chain.set_hint(1, "Choose a file to convert");
     }
 
     // 3: the conversion. Done stays white until the next file arrives, so the
@@ -3093,11 +3079,11 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
             chain.set_state(2, State::Live);
             chain.set_note(2, None);
         }
-        (None, true) => {
+        (None, true) if landed => {
             chain.set_state(2, State::Done);
             chain.set_note(2, None);
         }
-        (None, false) => {
+        (None, _) => {
             // Held for want of a drive is not idle: the file is here and this
             // is the step that would run next. It flashes for the same reason
             // "looking" does - something is pending - and it is safe to flash
@@ -3117,19 +3103,30 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
 
     // 4: where it ends up. Chosen and absent is the commonest reason nothing
     // arrives, and the one worth a cross.
-    let here = target.as_deref().and_then(drives::by_uuid);
     let sending = ui.watchdog_sending.get();
+    // A folder and a drive are different destinations and should not wear the
+    // same icon: which one it is decides whether "not there" means unplugged
+    // or deleted, and the reader should not have to guess which.
+    let to_folder = ui.settings.borrow().auto_target_dir.is_some();
+    chain.set_icon(
+        3,
+        if to_folder {
+            "folder-symbolic"
+        } else {
+            "drive-removable-media-symbolic"
+        },
+    );
     match (&target, &here) {
         (None, _) => {
             // Same reasoning as the folder: unset is not idle, it is blocking.
             chain.set_state(3, State::Calling);
             chain.set_note(3, Some("click to choose"));
         }
-        (Some(_), None) => {
+        (Some(name), None) => {
             chain.set_state(3, State::Missing);
-            chain.set_note(3, label.as_deref().or(Some("not plugged in")));
+            chain.set_note(3, Some(name.as_str()));
         }
-        (Some(_), Some(d)) => {
+        (Some(_), Some((_, name))) => {
             chain.set_state(
                 3,
                 if landed {
@@ -3140,15 +3137,15 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
                     State::Idle
                 },
             );
-            chain.set_note(3, Some(&d.name));
+            chain.set_note(3, Some(name));
         }
     }
     chain.set_hint(
         3,
-        if here.is_some() {
-            "Copy to a different drive"
+        if target.is_some() {
+            "Send somewhere else"
         } else {
-            "Choose a drive to copy to"
+            "Choose where to send it"
         },
     );
 
@@ -3169,7 +3166,19 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
                 chain2.clone().fill_link(2, 0.4, || {});
             });
         }
+    } else if landed {
+        // The finished picture, held for a moment so the pass can be seen to
+        // have completed. A chain that emptied the instant it succeeded would
+        // never show anyone that it had.
+        chain.set_link(1, 1.0);
+        chain.set_link(2, 1.0);
     } else if watching.is_some() && trouble.is_none() {
+        // Back to looking. Everything the last file filled is emptied, because
+        // a full bar means this file crossed here - and there is no this file
+        // any more. What was done is said in words underneath, which is where
+        // a record belongs; the bars are for what is happening now.
+        chain.set_link(1, 0.0);
+        chain.set_link(2, 0.0);
         bounce.push(1);
     } else {
         chain.set_link(1, 0.0);
@@ -3180,7 +3189,9 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     // alone while converting, because the layer counter owns it then.
     if sending {
         bounce.push(3);
-    } else if doing.is_none() && !landed && ui.watchdog_ready.borrow().is_none() {
+    } else if landed {
+        chain.set_link(3, 1.0);
+    } else if doing.is_none() {
         chain.set_link(3, 0.0);
     }
     chain.bounce(bounce);
@@ -3250,6 +3261,73 @@ fn choose_watch_folder(ui: &Rc<App>) {
                 let _ = s.save();
             }
             rearm_auto(&ui);
+        },
+    );
+}
+
+/// Hand WatchDog a file by hand, rather than waiting for one to appear.
+///
+/// Opening the watched folder in a file manager was no use: it showed the
+/// files but there was nothing to do with them there, and the program was left
+/// out of it. This puts the chosen file into the same queue a dropped-in file
+/// goes to, so it is converted and delivered exactly as an automatic one is -
+/// which is the point of picking it from this stop rather than from Browse
+/// Files, where it would join the manual queue instead.
+fn watchdog_pick_file(ui: &Rc<App>) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Compatible files"));
+    for info in registry::readable() {
+        filter.add_pattern(&format!("*.{}", info.extension));
+        filter.add_pattern(&format!("*.{}", info.extension.to_uppercase()));
+        for a in info.aliases {
+            filter.add_pattern(&format!("*.{a}"));
+        }
+    }
+    let all = gtk::FileFilter::new();
+    all.set_name(Some("All files"));
+    all.add_pattern("*");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    filters.append(&all);
+
+    let dialog = gtk::FileDialog::builder()
+        .title("File for WatchDog to convert")
+        .filters(&filters)
+        .modal(true)
+        .build();
+    // The watched folder is where the answer usually is, so that is where it
+    // opens.
+    if let Some(dir) = ui.settings.borrow().auto_watch_dir.clone() {
+        if dir.is_dir() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
+        }
+    }
+
+    let ui = ui.clone();
+    dialog.open(
+        Some(&ui.window.clone()),
+        gio::Cancellable::NONE,
+        move |res| {
+            let Some(path) = res.ok().and_then(|f| f.path()) else {
+                return;
+            };
+            if !path.is_file() {
+                return;
+            }
+            // Asked for by name, so it goes whether or not it has been seen
+            // before. The record of what has been converted exists to stop the
+            // folder monitor doing the same file twice on its own; it has no
+            // business refusing a file somebody just pointed at.
+            if let Some(key) = auto_key(&path) {
+                ui.auto_done.borrow_mut().retain(|k| *k != key);
+            }
+            *ui.watchdog_trouble.borrow_mut() = None;
+            // Straight into the queue rather than through the settling watch: a
+            // file chosen from a dialog has finished being written, or it would
+            // not have been there to choose.
+            ui.auto_queue.borrow_mut().push_back(path);
+            auto_pump(&ui);
+            refresh_watchdog_steps(&ui);
         },
     );
 }
@@ -3333,6 +3411,134 @@ fn watchdog_format_menu(ui: &Rc<App>) -> gtk::Popover {
     popover
 }
 
+/// Show a completed pass for a moment, then hand the chain back to looking.
+///
+/// Left as it was, a finished pass is four full bars and a green drive that
+/// never change again - which reads as stuck, not as done, and says nothing
+/// about whether the next file would be picked up. Held briefly it reads as a
+/// result; released it reads as ready. The sentence underneath keeps the
+/// record either way, because that is where a record belongs.
+fn watchdog_take_a_bow(ui: &Rc<App>) {
+    ui.watchdog_landed.set(true);
+    refresh_watchdog_steps(ui);
+    let ui = ui.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(2600), move || {
+        // Unless another file has come along in the meantime, in which case it
+        // owns the chain now and this one's finish is old news.
+        if ui.watchdog_doing.borrow().is_some() {
+            return;
+        }
+        ui.watchdog_landed.set(false);
+        refresh_watchdog_steps(&ui);
+    });
+}
+
+/// What WatchDog was told to write to, and where that is right now.
+///
+/// Two kinds of answer. A removable drive is remembered by filesystem UUID,
+/// because its label is not unique and its mount point moves between plugs. A
+/// folder is remembered by its path, because that is all a folder is.
+///
+/// The removable-only check still guards the drive case: that path picks a
+/// destination from whatever happens to be mounted, so it has to be sure it is
+/// a stick and not somebody's root partition. A folder named by hand needs no
+/// such guard - it was not guessed at, it was chosen.
+///
+/// Returns the name it was given, and where to write if that place is here.
+fn watchdog_where(ui: &Rc<App>) -> (Option<String>, Option<(PathBuf, String)>) {
+    let (uuid, label, dir) = {
+        let s = ui.settings.borrow();
+        (
+            s.auto_target_uuid.clone(),
+            s.auto_target_label.clone(),
+            s.auto_target_dir.clone(),
+        )
+    };
+    if let Some(dir) = dir {
+        let name = label.unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string())
+        });
+        let live = dir.is_dir().then(|| (dir, name.clone()));
+        return (Some(name), live);
+    }
+    if let Some(uuid) = uuid {
+        let live = drives::by_uuid(&uuid)
+            .filter(|d| d.removable && !drives::is_system_mount(&d.path))
+            .map(|d| (d.path, d.name));
+        return (label.or_else(|| Some("a drive".into())), live);
+    }
+    (None, None)
+}
+
+/// Whether a folder is a sane place to have WatchDog write into.
+///
+/// Not a judgement about what the user wants - they picked it - only about
+/// what would break. Writing output into the folder being watched would be
+/// fine on extension grounds, but a folder that cannot be written to at all is
+/// a destination that will fail silently on every file.
+fn watchdog_dir_usable(dir: &Path) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Err("that folder does not exist".into());
+    }
+    let probe = dir.join(".cheapazsla-write-test");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(format!("cannot write there: {e}")),
+    }
+}
+
+/// Ask for a folder for WatchDog to write into.
+fn choose_watchdog_dir(ui: &Rc<App>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Folder to save into")
+        .modal(true)
+        .build();
+    if let Some(start) = ui.settings.borrow().auto_target_dir.clone() {
+        dialog.set_initial_folder(Some(&gio::File::for_path(start)));
+    }
+    let ui = ui.clone();
+    dialog.select_folder(
+        Some(&ui.window.clone()),
+        gio::Cancellable::NONE,
+        move |res| {
+            let Some(path) = res.ok().and_then(|f| f.path()) else {
+                return;
+            };
+            // Checked before it is kept, because a destination that cannot be
+            // written to fails once per file, quietly, for as long as it is set.
+            if let Err(why) = watchdog_dir_usable(&path) {
+                ui.toasts
+                    .add_toast(adw::Toast::new(&format!("Not saved - {why}")));
+                return;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            {
+                let mut s = ui.settings.borrow_mut();
+                // One or the other, never both: two destinations is a question
+                // about which one wins, and there is no good answer to it.
+                s.auto_target_dir = Some(path);
+                s.auto_target_uuid = None;
+                s.auto_target_label = Some(name.clone());
+                let _ = s.save();
+            }
+            refresh_auto_indicator(&ui);
+            refresh_watchdog_steps(&ui);
+            auto_deliver(&ui);
+            auto_pump(&ui);
+            ui.toasts
+                .add_toast(adw::Toast::new(&format!("WatchDog will save into {name}")));
+        },
+    );
+}
+
 /// The menu of drives WatchDog could copy to.
 ///
 /// Rebuilt every time it opens, because drives come and go while the window is
@@ -3375,7 +3581,6 @@ fn watchdog_drive_menu(ui: &Rc<App>) -> gtk::Popover {
                     .activatable(false)
                     .build(),
             );
-            return;
         }
 
         for (drive, uuid) in usable {
@@ -3397,6 +3602,7 @@ fn watchdog_drive_menu(ui: &Rc<App>) -> gtk::Popover {
                 {
                     let mut s = ui2.settings.borrow_mut();
                     s.auto_target_uuid = Some(uuid.clone());
+                    s.auto_target_dir = None;
                     s.auto_target_label = Some(name.clone());
                     let _ = s.save();
                 }
@@ -3414,6 +3620,23 @@ fn watchdog_drive_menu(ui: &Rc<App>) -> gtk::Popover {
             });
             list.append(&row);
         }
+
+        // Not every printer takes a stick, and not every workflow ends at one:
+        // a network share, a second disk, a folder something else is watching.
+        // The destination only has to be somewhere that can be written to.
+        let pick = adw::ActionRow::builder()
+            .title("Choose a folder\u{2026}")
+            .subtitle("Any folder, network share or disk")
+            .activatable(true)
+            .build();
+        pick.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
+        let ui3 = ui.clone();
+        let pop3 = pop.clone();
+        pick.connect_activated(move |_| {
+            pop3.popdown();
+            choose_watchdog_dir(&ui3);
+        });
+        list.append(&pick);
     });
     popover
 }
@@ -3724,7 +3947,7 @@ fn auto_pump(ui: &Rc<App>) {
     // A drive that is chosen but unplugged is a different case and keeps its
     // old behaviour: convert now, copy when it turns up. There the answer to
     // "where is this going" is known.
-    if ui.settings.borrow().auto_target_uuid.is_none() {
+    if watchdog_where(ui).0.is_none() {
         return;
     }
     let Some(next) = ui.auto_queue.borrow_mut().pop_front() else {
@@ -3757,26 +3980,17 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         return;
     }
 
-    let (to, asked, cap_mb, keep_days, uuid, budget) = {
+    let (to, asked, cap_mb, keep_days, budget) = {
         let s = ui.settings.borrow();
         (
             s.auto_to_format.clone(),
             auto::Staging::from_id(&s.auto_staging),
             s.auto_cap_mb as u64,
             s.auto_keep_days as u64,
-            s.auto_target_uuid.clone(),
             s.ram_budget_mb as u64,
         )
     };
-
-    // Removable only, and never a filesystem the system needs. Automatic mode
-    // writes without being asked each time, so the check that it is writing to
-    // a stick and not to somebody's root partition cannot be left to the
-    // configuration being sensible.
-    let drive = uuid
-        .as_deref()
-        .and_then(drives::by_uuid)
-        .filter(|d| d.removable && !drives::is_system_mount(&d.path));
+    let drive = watchdog_where(ui).1;
 
     let coming = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
     let mode = auto::resolve_staging(asked, budget, coming);
@@ -3789,8 +4003,9 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
     }
 
     let into = match (&drive, auto::usable_dir(mode)) {
-        // The drive is here, so there is nothing to stage: convert onto it.
-        (Some(d), _) => d.path.clone(),
+        // The destination is here, so there is nothing to stage: convert
+        // straight onto it.
+        (Some((path, _)), _) => path.clone(),
         (None, Some(dir)) => dir,
         (None, None) => {
             release(ui);
@@ -3913,6 +4128,13 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
     }
     let ui = ui.clone();
     let landed = drive.is_some();
+    // What the place is called, so the sentence names it. "Copied to the
+    // drive" is wrong the moment the destination is a folder, and it is a
+    // folder whenever somebody chose one.
+    let where_to = drive
+        .map(|(_, name)| name)
+        .or_else(|| ui.settings.borrow().auto_target_label.clone())
+        .unwrap_or_else(|| "the drive".into());
     glib::spawn_future_local(async move {
         let result = rx.recv().await;
         ui.auto_busy.set(false);
@@ -3924,18 +4146,18 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         match result {
             Ok(_) => {
                 *ui.watchdog_ready.borrow_mut() = Some(if landed {
-                    format!("Copied {name} to the drive - ready for the next file")
+                    format!("Copied {name} to {where_to} - ready for the next file")
                 } else {
                     // Not finished, so not offered as finished. The file is
                     // converted and sitting in the staging folder, and saying
                     // "ready for the next file" here would read as the job
                     // having ended where it has not.
-                    format!("Converted {name} - waiting for the drive")
+                    format!("Converted {name} - waiting for {where_to}")
                 });
                 ui.toasts.add_toast(adw::Toast::new(&if landed {
-                    format!("{name} converted onto the drive")
+                    format!("{name} converted into {where_to}")
                 } else {
-                    format!("{name} converted and waiting for the drive")
+                    format!("{name} converted and waiting for {where_to}")
                 }));
                 refresh_nearby(&ui);
                 if landed {
@@ -3945,10 +4167,9 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
                     // end of it: the chain is a story of where the file went,
                     // and that leg is part of the story.
                     let ui2 = ui.clone();
-                    ui.watchdog_steps.clone().fill_link(3, 0.6, move || {
-                        ui2.watchdog_landed.set(true);
-                        refresh_watchdog_steps(&ui2);
-                    });
+                    ui.watchdog_steps
+                        .clone()
+                        .fill_link(3, 0.6, move || watchdog_take_a_bow(&ui2));
                 }
             }
             Err(e) => {
@@ -3967,23 +4188,17 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
 /// the window for the whole of it - including the chain that is supposed to be
 /// showing that the copy is happening.
 fn auto_deliver(ui: &Rc<App>) {
-    let (on, mode, uuid) = {
+    let (on, mode) = {
         let s = ui.settings.borrow();
-        (
-            s.auto_convert,
-            auto::Staging::from_id(&s.auto_staging),
-            s.auto_target_uuid.clone(),
-        )
+        (s.auto_convert, auto::Staging::from_id(&s.auto_staging))
     };
     if !on || ui.watchdog_sending.get() {
         return;
     }
-    let (Some(uuid), Some(dir)) = (uuid, auto::staging_dir(mode)) else {
+    let Some(dir) = auto::staging_dir(mode) else {
         return;
     };
-    let Some(drive) =
-        drives::by_uuid(&uuid).filter(|d| d.removable && !drives::is_system_mount(&d.path))
-    else {
+    let Some((into, name)) = watchdog_where(ui).1 else {
         return;
     };
     let waiting = auto::waiting(&dir);
@@ -3997,7 +4212,6 @@ fn auto_deliver(ui: &Rc<App>) {
     ui.watchdog_steps.set_link(3, 0.0);
     refresh_watchdog_steps(ui);
 
-    let into = drive.path.clone();
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
         let mut sent = 0usize;
@@ -4015,7 +4229,6 @@ fn auto_deliver(ui: &Rc<App>) {
     });
 
     let ui = ui.clone();
-    let name = drive.name.clone();
     glib::spawn_future_local(async move {
         let got = rx.recv().await;
         ui.watchdog_sending.set(false);
@@ -4036,10 +4249,9 @@ fn auto_deliver(ui: &Rc<App>) {
             }));
             refresh_nearby(&ui);
             let ui2 = ui.clone();
-            ui.watchdog_steps.clone().fill_link(3, 0.5, move || {
-                ui2.watchdog_landed.set(true);
-                refresh_watchdog_steps(&ui2);
-            });
+            ui.watchdog_steps
+                .clone()
+                .fill_link(3, 0.5, move || watchdog_take_a_bow(&ui2));
         }
         refresh_watchdog_steps(&ui);
     });

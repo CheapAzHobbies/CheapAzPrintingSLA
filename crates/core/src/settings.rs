@@ -77,6 +77,11 @@ pub struct Settings {
     /// label - see `drives::uuid_of` for why that distinction matters here and
     /// nowhere else.
     pub auto_target_uuid: Option<String>,
+    /// Where output goes when the destination is a plain folder rather than a
+    /// removable drive. A folder is remembered by its path, because that is
+    /// all a folder is; a drive is remembered by UUID because its label is not
+    /// unique and its mount point moves. Only one of the two is ever set.
+    pub auto_target_dir: Option<PathBuf>,
     /// Its label, kept only so the interface can name it while it is unplugged.
     pub auto_target_label: Option<String>,
     /// Where converted files wait: `disk`, `ram`, or `wait` for converting
@@ -190,6 +195,7 @@ impl Default for Settings {
             auto_watch_dir: None,
             auto_to_format: "goo".into(),
             auto_target_uuid: None,
+            auto_target_dir: None,
             auto_target_label: None,
             auto_staging: "disk".into(),
             auto_cap_mb: 2048,
@@ -301,6 +307,9 @@ impl Settings {
             if !v.is_empty() {
                 s.auto_to_format = v.to_string();
             }
+        }
+        if let Some(v) = map.get("auto_target_dir") {
+            s.auto_target_dir = (!v.is_empty()).then(|| PathBuf::from(v));
         }
         if let Some(v) = map.get("auto_target_uuid") {
             s.auto_target_uuid = (!v.is_empty()).then(|| v.to_string());
@@ -456,6 +465,7 @@ impl Settings {
              auto_convert = {}\n\
              auto_watch_dir = {}\n\
              auto_to_format = {}\n\
+             auto_target_dir = {}\n\
              auto_target_uuid = {}\n\
              auto_target_label = {}\n\
              auto_staging = {}\n\
@@ -510,6 +520,10 @@ impl Settings {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             self.auto_to_format,
+            self.auto_target_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             self.auto_target_uuid.clone().unwrap_or_default(),
             self.auto_target_label.clone().unwrap_or_default(),
             self.auto_staging,

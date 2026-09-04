@@ -544,6 +544,17 @@ impl Steps {
         step.button.connect_clicked(move |_| f());
     }
 
+    /// Change what a stop is a picture of.
+    ///
+    /// The last stop is whatever the output was pointed at, and a folder and a
+    /// drive are not the same thing: which it is decides whether "not there"
+    /// means unplugged or deleted.
+    pub fn set_icon(&self, at: usize, icon: &str) {
+        if let Some(step) = self.steps.get(at) {
+            step.icon.set_icon_name(Some(icon));
+        }
+    }
+
     /// The widget to hang a popover off, for a stop whose action is a menu.
     pub fn anchor(&self, at: usize) -> Option<gtk::Widget> {
         self.steps.get(at).map(|s| s.button.clone().upcast())
