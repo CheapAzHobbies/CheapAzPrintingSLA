@@ -190,15 +190,10 @@ struct App {
     /// The list of readable formats under the drop zone. First thing out when
     /// the window is squeezed: it is a reference, not an instruction, and the
     /// instruction above it still stands without it.
-    dropzone_formats: gtk::ScrolledWindow,
-    /// The list itself, for measuring how tall it wants to be.
-    dropzone_formats_inner: gtk::Box,
-    /// The height the fold is currently at, because a widget's own height
-    /// reads stale part-way through a resize and this has to pick up from
-    /// wherever the last fold left it.
-    formats_at: Cell<i32>,
-    /// Which fold is in charge, so a fold started later wins.
-    formats_fold: Cell<u32>,
+    dropzone_formats: Fold,
+    /// WatchDog's chain, which appears and disappears with the mode and so
+    /// moves everything below it when it does.
+    watchdog_fold: Fold,
     /// "Found nearby": readable files in the open folder and on mounted
     /// drives, offered so a file can be picked without a file dialog.
     nearby_panel: gtk::Box,
@@ -556,8 +551,7 @@ fn build(app: &adw::Application) -> Rc<App> {
     watchdog_panel.set_selection_mode(gtk::SelectionMode::None);
     watchdog_panel.append(&watchdog_row);
 
-    let (dropzone, dropzone_title, dropzone_sub, dropzone_formats, dropzone_formats_inner) =
-        build_dropzone();
+    let (dropzone, dropzone_title, dropzone_sub, dropzone_formats) = build_dropzone();
 
     // The chain: where a file comes from, what happens to it, and where it
     // ends up. Shown in the drop zone because that is the empty middle of the
@@ -568,8 +562,12 @@ fn build(app: &adw::Application) -> Rc<App> {
         ("media-playlist-repeat-symbolic", "Convert"),
         ("drive-removable-media-symbolic", "Drive"),
     ]);
-    watchdog_steps.widget.set_visible(false);
-    dropzone.append(&watchdog_steps.widget);
+    // Folded rather than shown, for the same reason the format list is:
+    // switching the mode on made the chain appear in one frame and shoved
+    // every panel below it down the page.
+    let watchdog_fold = Fold::new(&watchdog_steps.widget);
+    watchdog_fold.land(0);
+    dropzone.append(&watchdog_fold.clip);
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
@@ -804,9 +802,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_trouble: RefCell::new(None),
         watchdog_landed: Cell::new(false),
         dropzone_formats,
-        dropzone_formats_inner,
-        formats_at: Cell::new(-1),
-        formats_fold: Cell::new(0),
+        watchdog_fold,
         nearby_panel: nearby_panel.clone(),
         nearby_expander: nearby.expander,
         nearby_clip: nearby.clip,
@@ -1280,7 +1276,8 @@ fn wire_responsive(ui: &Rc<App>) {
                 // The Quick Access rows give up their columns at the same
                 // width the queue rows do.
                 refresh_nearby(&ui);
-                fold_formats(&ui, !narrow);
+                let smooth = ui.settings.borrow().animations;
+                ui.dropzone_formats.set(!narrow, smooth);
             }
         })
     };
@@ -1547,66 +1544,93 @@ struct NearbyPanel {
     search: gtk::Entry,
 }
 
-/// Fold the readable-format list away, or back, over a fifth of a second.
+/// A panel that folds open and shut by having its height driven.
 ///
-/// The list going is right - at that width there is no room for it - but it
-/// took everything below it up the page in a single frame, which reads as the
-/// layout breaking rather than as it fitting. Driving the height means the
-/// panels underneath follow it rather than teleporting after it.
-fn fold_formats(ui: &Rc<App>, open: bool) {
-    let full = ui
-        .dropzone_formats_inner
-        .measure(gtk::Orientation::Vertical, -1)
-        .1
-        .max(1);
-    let target = if open { full } else { 0 };
-    let from = match ui.formats_at.get() {
-        // Never folded yet, so it is sitting at its natural height.
-        n if n < 0 => full,
-        n => n,
-    };
-    if from == target {
-        ui.dropzone_formats.set_size_request(-1, target);
-        ui.formats_at.set(target);
-        return;
-    }
-    if !ui.settings.borrow().animations {
-        ui.dropzone_formats.set_size_request(-1, target);
-        ui.formats_at.set(target);
-        return;
-    }
-
-    // A generation counter rather than a flag: a window dragged back and forth
-    // across the breakpoint starts a new fold before the last has finished,
-    // and the new one has to win rather than fight.
-    let mine = ui.formats_fold.get().wrapping_add(1);
-    ui.formats_fold.set(mine);
-
-    let started = std::time::Instant::now();
-    let ui2 = ui.clone();
-    ui.dropzone_formats.add_tick_callback(move |w, _| {
-        if ui2.formats_fold.get() != mine {
-            return glib::ControlFlow::Break;
-        }
-        let t = (started.elapsed().as_secs_f64() / FORMATS_SECONDS).clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - t) * (1.0 - t);
-        let at = from + ((target - from) as f64 * eased).round() as i32;
-        ui2.formats_at.set(at);
-        w.set_size_request(-1, at);
-        if t >= 1.0 {
-            return glib::ControlFlow::Break;
-        }
-        glib::ControlFlow::Continue
-    });
+/// Anything appearing or disappearing inside a column takes everything below
+/// it up or down the page, and doing that in one frame reads as the layout
+/// breaking rather than as it changing. A GtkRevealer is the obvious tool and
+/// did not survive being asked to animate in the middle of a resize, so the
+/// height is driven here instead: a scrolled window to allow a height below
+/// the child's own minimum, and a tick callback to walk it there.
+struct Fold {
+    clip: gtk::ScrolledWindow,
+    inner: gtk::Widget,
+    /// Where the fold currently is. A widget's own height reads stale part-way
+    /// through a resize, and this has to pick up wherever the last one left
+    /// off. Negative means it has never been folded and is at its natural
+    /// height.
+    at: Rc<Cell<i32>>,
+    /// Which fold is in charge. A panel toggled twice in quick succession
+    /// starts a second animation before the first has finished, and the newer
+    /// one has to win rather than fight.
+    generation: Rc<Cell<u32>>,
 }
 
-fn build_dropzone() -> (
-    gtk::Box,
-    gtk::Label,
-    gtk::Label,
-    gtk::ScrolledWindow,
-    gtk::Box,
-) {
+impl Fold {
+    /// Wrap a widget so its height can be driven. Nothing ever scrolls in it.
+    fn new(inner: &impl IsA<gtk::Widget>) -> Self {
+        let clip = gtk::ScrolledWindow::builder()
+            .vscrollbar_policy(gtk::PolicyType::External)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(false)
+            .child(inner)
+            .build();
+        clip.set_overflow(gtk::Overflow::Hidden);
+        Self {
+            clip,
+            inner: inner.clone().upcast(),
+            at: Rc::new(Cell::new(-1)),
+            generation: Rc::new(Cell::new(0)),
+        }
+    }
+
+    fn set(&self, open: bool, animate: bool) {
+        let full = self.inner.measure(gtk::Orientation::Vertical, -1).1.max(1);
+        let target = if open { full } else { 0 };
+        let from = match self.at.get() {
+            n if n < 0 => full,
+            n => n,
+        };
+        // A folded-shut panel is hidden outright at the end, so it does not
+        // leave its parent's spacing behind as a gap with nothing in it.
+        if open {
+            self.clip.set_visible(true);
+        }
+        if from == target || !animate {
+            self.land(target);
+            return;
+        }
+
+        let mine = self.generation.get().wrapping_add(1);
+        self.generation.set(mine);
+        let started = std::time::Instant::now();
+        let at = self.at.clone();
+        let generation = self.generation.clone();
+        self.clip.add_tick_callback(move |w, _| {
+            if generation.get() != mine {
+                return glib::ControlFlow::Break;
+            }
+            let t = (started.elapsed().as_secs_f64() / FOLD_SECONDS).clamp(0.0, 1.0);
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let now = from + ((target - from) as f64 * eased).round() as i32;
+            at.set(now);
+            w.set_size_request(-1, now);
+            if t >= 1.0 {
+                w.set_visible(target > 0);
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn land(&self, target: i32) {
+        self.at.set(target);
+        self.clip.set_size_request(-1, target);
+        self.clip.set_visible(target > 0);
+    }
+}
+
+fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Label, Fold) {
     let zone = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     zone.add_css_class("cz-dropzone");
     zone.set_valign(gtk::Align::Center);
@@ -1684,32 +1708,19 @@ fn build_dropzone() -> (
         .collect();
     zone.set_tooltip_text(Some(&format!("Opens\n{}", listed.join("\n"))));
 
-    // Clipped rather than hidden, so the list can be folded away by height and
-    // the panels underneath follow it up smoothly instead of jumping a hundred
-    // pixels in one frame. A GtkRevealer was the obvious tool and did not
-    // animate here - the change lands in the middle of a resize, when the
-    // whole page is being re-allocated anyway - so the height is driven
-    // directly. A scrolled window is what allows a height below the child's
-    // own minimum; nothing ever scrolls in it.
-    let formats_clip = gtk::ScrolledWindow::builder()
-        .vscrollbar_policy(gtk::PolicyType::External)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_height(false)
-        .child(&formats)
-        .build();
-    formats_clip.set_overflow(gtk::Overflow::Hidden);
+    let formats = Fold::new(&formats);
 
     zone.append(&icon);
     zone.append(&title);
     zone.append(&sub);
     zone.append(&browse);
-    zone.append(&formats_clip);
-    (zone, title, sub, formats_clip, formats)
+    zone.append(&formats.clip);
+    (zone, title, sub, formats)
 }
 
-/// How long the readable-format list takes to fold away as the window narrows.
-/// Long enough to read as movement, short enough not to lag the drag.
-const FORMATS_SECONDS: f64 = 0.22;
+/// How long a panel takes to fold open or shut. Long enough to read as
+/// movement, short enough not to lag a window being dragged.
+const FOLD_SECONDS: f64 = 0.22;
 
 fn build_problem_bar() -> (gtk::Box, gtk::Label) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
@@ -3097,7 +3108,8 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
         (s.auto_convert, s.auto_watch_dir.clone())
     };
     let (target, here) = watchdog_where(ui);
-    ui.watchdog_steps.widget.set_visible(armed);
+    let smooth = ui.settings.borrow().animations;
+    ui.watchdog_fold.set(armed, smooth);
     if !armed {
         ui.watchdog_steps.rest();
         return;
