@@ -64,11 +64,30 @@ const CLASSES: [&str; 6] = [
 /// each width the window is allowed to be. A fixed number rather than the
 /// allocated width, because a widget's width reads as zero until it has been
 /// laid out and this has to be right the first time it is asked.
-const NOTE_WIDTH: [i32; 3] = [92, 68, 52];
+// The connectors shed most of their width as the window narrows, and that
+// room is better spent on the stops: a connector carries no words, and the
+// second line under a stop is a folder or a file name.
+const NOTE_WIDTH: [i32; 3] = [92, 76, 62];
 /// And how long the connectors are at those widths. The chain has to fit in a
 /// tiled half-screen window, and the legs are the part of it carrying no words
 /// - so they are the part that gives up room first.
 const LINK_WIDTH: [i32; 3] = [96, 48, 22];
+/// How much room the time-left caption above a connector is given, and how
+/// many characters it may use before it is cut short.
+///
+/// Reserved rather than taken. The caption used to be an ordinary label with
+/// nothing holding its width, so the moment a time appeared the connector grew
+/// to fit it and shoved the whole chain sideways - then shoved it back when
+/// the time went away. The space is set aside now whether there is anything to
+/// say or not, so the row holds still and the figure appears in a gap that was
+/// already there.
+///
+/// At the two wider settings the gap is no wider than the bar underneath it,
+/// so reserving it costs nothing at all. Only at the narrowest does the
+/// caption need more room than the bar, and there it drops the "ETA:" and
+/// shows the figure alone - the number being the whole of what it came to say.
+const ETA_WIDTH: [i32; 3] = [64, 48, 30];
+const ETA_CHARS: [i32; 3] = [10, 6, 5];
 /// How wide the line under the chain may run before it wraps, at each width.
 const FOOTER_CHARS: [i32; 3] = [52, 40, 30];
 const NOTE_SPEED: f64 = 34.0;
@@ -298,6 +317,12 @@ impl Note {
 struct Link {
     bar: gtk::ProgressBar,
     note: gtk::Label,
+    /// The same time said two ways: a sentence for when there is room for one,
+    /// and a bare figure for when there is not. Both are kept so a window
+    /// being resized mid-conversion swaps wording without waiting for the next
+    /// progress report.
+    long: RefCell<String>,
+    short: RefCell<String>,
 }
 
 pub struct Steps {
@@ -356,8 +381,16 @@ impl Steps {
                 let note = gtk::Label::new(None);
                 note.add_css_class("caption");
                 note.add_css_class("cz-step-eta");
+                // Both bounds. The width request holds the gap open when there
+                // is nothing to say; ellipsising caps what the label will ask
+                // for when there is, so a long sentence cannot prise the
+                // connector open and move the chain.
+                note.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                note.set_max_width_chars(ETA_CHARS[0]);
+                note.set_size_request(ETA_WIDTH[0], -1);
                 let bar = gtk::ProgressBar::builder()
                     .width_request(LINK_WIDTH[0])
+                    .halign(gtk::Align::Center)
                     .build();
                 bar.add_css_class("cz-step-link");
 
@@ -367,7 +400,12 @@ impl Steps {
                 leg.append(&note);
                 leg.append(&bar);
                 row.append(&leg);
-                links.push(Link { bar, note });
+                links.push(Link {
+                    bar,
+                    note,
+                    long: RefCell::new(String::new()),
+                    short: RefCell::new(String::new()),
+                });
             }
 
             let column = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_1);
@@ -488,6 +526,10 @@ impl Steps {
             return;
         }
         self.glide_links(LINK_WIDTH[level]);
+        for link in &self.links {
+            link.note.set_max_width_chars(ETA_CHARS[level]);
+            self.show_link_note(link);
+        }
 
         self.footer.set_max_width_chars(FOOTER_CHARS[level]);
         self.room.set(NOTE_WIDTH[level]);
@@ -519,20 +561,33 @@ impl Steps {
             }
             return;
         }
+        let gap_from = self
+            .links
+            .first()
+            .map(|l| l.note.width_request())
+            .unwrap_or(ETA_WIDTH[self.level.get()]);
         let steps = self.clone();
         let started = std::time::Instant::now();
         const OVER: f64 = 0.18;
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            let target = LINK_WIDTH[steps.level.get()];
+            let level = steps.level.get();
+            let target = LINK_WIDTH[level];
+            // The reserved gap travels with the bar. Snapping it instead would
+            // put the whole chain somewhere new in one frame, which is the
+            // jump the glide exists to avoid.
+            let gap_to = ETA_WIDTH[level];
             let t = (started.elapsed().as_secs_f64() / OVER).clamp(0.0, 1.0);
             let eased = 1.0 - (1.0 - t) * (1.0 - t);
             let at = from as f64 + (target - from) as f64 * eased;
+            let gap = gap_from as f64 + (gap_to - gap_from) as f64 * eased;
             for link in &steps.links {
                 link.bar.set_width_request(at.round() as i32);
+                link.note.set_size_request(gap.round() as i32, -1);
             }
             if t >= 1.0 {
                 for link in &steps.links {
                     link.bar.set_width_request(target);
+                    link.note.set_size_request(gap_to, -1);
                 }
                 steps.gliding.set(false);
                 return glib::ControlFlow::Break;
@@ -732,12 +787,32 @@ impl Steps {
     }
 
     /// The time left, written above a link. `None` clears it.
-    pub fn set_link_note(&self, into: usize, note: Option<&str>) {
+    /// How long the leg into `into` has left, said long and said short.
+    ///
+    /// Which one is shown depends on the window's width: the sentence where
+    /// there is room for a sentence, the bare figure where there is not.
+    pub fn set_link_note(&self, into: usize, note: Option<(&str, &str)>) {
         let Some(link) = into.checked_sub(1).and_then(|i| self.links.get(i)) else {
             return;
         };
-        // Emptied rather than hidden, so the row keeps its height either way.
-        link.note.set_text(note.unwrap_or(""));
+        let (long, short) = note.unwrap_or(("", ""));
+        *link.long.borrow_mut() = long.to_string();
+        *link.short.borrow_mut() = short.to_string();
+        self.show_link_note(link);
+    }
+
+    /// Put the wording that fits the current width on screen.
+    ///
+    /// Emptied rather than hidden, so the row keeps its height either way.
+    fn show_link_note(&self, link: &Link) {
+        let said = if self.level.get() == 0 {
+            link.long.borrow()
+        } else {
+            link.short.borrow()
+        };
+        if link.note.text() != said.as_str() {
+            link.note.set_text(&said);
+        }
     }
 
     /// Run a link smoothly up to full, then call `then`.

@@ -3729,19 +3729,18 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
 /// Rounded hard on purpose. An estimate from a layer count is worth about one
 /// significant figure, and printing "1m 47s left" claims a precision the
 /// number does not have.
-fn about_left(secs: f64) -> String {
+fn about_left(secs: f64) -> (String, String) {
     let secs = secs.max(0.0);
-    if secs < 5.0 {
-        return "almost done".into();
-    }
-    if secs < 60.0 {
-        return format!("about {}s left", ((secs / 5.0).round() * 5.0) as u64);
-    }
-    let mins = (secs / 60.0).round() as u64;
-    match mins {
-        0 | 1 => "about a minute left".into(),
-        n => format!("about {n}m left"),
-    }
+    let figure = if secs < 5.0 {
+        "<5s".to_string()
+    } else if secs < 60.0 {
+        format!("{}s", ((secs / 5.0).round() * 5.0) as u64)
+    } else if secs < 3600.0 {
+        format!("{}m", (secs / 60.0).round().max(1.0) as u64)
+    } else {
+        format!("{}h", (secs / 3600.0).round().max(1.0) as u64)
+    };
+    (format!("ETA: {figure}"), figure)
 }
 
 /// A name short enough to sit on a button without pushing the row apart.
@@ -4726,7 +4725,8 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
                 }
                 let each = started.elapsed().as_secs_f64() / made as f64;
                 let left = total.saturating_sub(done) as f64 * each;
-                ui.watchdog_steps.set_link_note(3, Some(&about_left(left)));
+                let (long, short) = about_left(left);
+                ui.watchdog_steps.set_link_note(3, Some((&long, &short)));
             }
             ui.watchdog_steps.set_link_note(3, None);
         });
