@@ -615,6 +615,23 @@ pub fn info_row(label: &str, value: &str, dim: bool) -> gtk::Box {
 }
 
 /// An icon-only button with the tooltip and accessible label §6 requires.
+/// Stop a scrolled window from chasing whatever has just been focused.
+///
+/// A GtkScrolledWindow wraps a plain child in a viewport, and a viewport
+/// scrolls a newly focused widget into view. Every clip in this program is
+/// there to cut something off at a chosen size, never to be scrolled - so
+/// clicking a button inside one made the contents jump, which reads as the
+/// panel having lost its place. Nothing here has a place to lose.
+pub fn dont_chase_focus(view: &gtk::ScrolledWindow) {
+    let mut child = view.first_child();
+    while let Some(widget) = child {
+        if let Some(port) = widget.downcast_ref::<gtk::Viewport>() {
+            port.set_scroll_to_focus(false);
+        }
+        child = widget.next_sibling();
+    }
+}
+
 pub fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     let b = gtk::Button::builder().icon_name(icon).build();
     b.add_css_class("flat");

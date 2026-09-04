@@ -1832,6 +1832,10 @@ struct Fold {
     generation: Rc<Cell<u32>>,
     /// How tall this panel was the last time it could be measured properly.
     full: Rc<Cell<i32>>,
+    /// Where a walk still in flight is heading. A re-measure that agrees with
+    /// it is already being served and must not restart it from wherever it
+    /// has got to, which would stall the panel short of its target.
+    heading: Rc<Cell<i32>>,
 }
 
 impl Fold {
@@ -1844,13 +1848,37 @@ impl Fold {
             .child(inner)
             .build();
         clip.set_overflow(gtk::Overflow::Hidden);
+        // A fold cuts a panel off at a chosen height; it is not a thing to be
+        // scrolled. Without this, clicking a button inside one - a milestone
+        // in WatchDog's chain, say - focused it, and the viewport slid the
+        // panel up to bring it into view. Nothing had moved, so the movement
+        // read as the page losing its place.
+        shell::dont_chase_focus(&clip);
+        clip.vadjustment().connect_value_changed(|adj| {
+            if adj.value() != 0.0 {
+                adj.set_value(0.0);
+            }
+        });
         Self {
             clip,
             inner: inner.clone().upcast(),
             at: Rc::new(Cell::new(-1)),
             generation: Rc::new(Cell::new(0)),
             full: Rc::new(Cell::new(-1)),
+            heading: Rc::new(Cell::new(-1)),
         }
+    }
+
+    /// How tall the panel wants to be, measured against the width it actually
+    /// has.
+    ///
+    /// Asking at width -1 asks how tall it would be if nothing were wrapping,
+    /// which is a different and smaller number for anything that wraps - and
+    /// the line under WatchDog's chain is a whole sentence that does.
+    fn wanted(&self) -> i32 {
+        let width = self.clip.width();
+        let for_width = if width > 0 { width } else { -1 };
+        self.inner.measure(gtk::Orientation::Vertical, for_width).1
     }
 
     fn set(&self, open: bool, animate: bool) {
@@ -1867,7 +1895,7 @@ impl Fold {
         if open {
             self.clip.set_visible(true);
         }
-        let measured = self.inner.measure(gtk::Orientation::Vertical, -1).1;
+        let measured = self.wanted();
         // And a remembered height as a second line of defence, for the moments
         // when a measurement is taken before layout has caught up. A panel
         // that has ever been open knows how tall it was.
@@ -1888,12 +1916,44 @@ impl Fold {
             self.land(target);
             return;
         }
+        self.walk(from, target);
+    }
 
+    /// Take the panel's height again, for content that grew or shrank while it
+    /// was already open.
+    ///
+    /// A fold pins a height. Anything the panel gains afterwards is simply cut
+    /// off - which is what happened to the line under WatchDog's chain: the
+    /// height was taken while that line was empty and hidden, so when it later
+    /// had something to say there was no room left to say it in.
+    ///
+    /// The new height is walked to rather than snapped to. A line appearing
+    /// under the chain takes the whole page below it down by its own height,
+    /// and doing that in one frame is the jolt: the eye reads the page as
+    /// having broken and then re-drawn, rather than as one line having been
+    /// added. Over a fifth of a second it reads as the line making room for
+    /// itself.
+    fn refit(&self) {
+        if self.at.get() <= 0 || !self.clip.is_visible() {
+            return;
+        }
+        let measured = self.wanted();
+        if measured <= 1 || measured == self.at.get() || measured == self.heading.get() {
+            return;
+        }
+        self.full.set(measured);
+        self.walk(self.at.get(), measured);
+    }
+
+    /// Drive the height from one value to the other over `FOLD_SECONDS`.
+    fn walk(&self, from: i32, target: i32) {
         let mine = self.generation.get().wrapping_add(1);
         self.generation.set(mine);
+        self.heading.set(target);
         let started = std::time::Instant::now();
         let at = self.at.clone();
         let generation = self.generation.clone();
+        let heading = self.heading.clone();
         self.clip.add_tick_callback(move |w, _| {
             if generation.get() != mine {
                 return glib::ControlFlow::Break;
@@ -1904,6 +1964,7 @@ impl Fold {
             at.set(now);
             w.set_size_request(-1, now);
             if t >= 1.0 {
+                heading.set(-1);
                 w.set_visible(target > 0);
                 return glib::ControlFlow::Break;
             }
@@ -1911,27 +1972,9 @@ impl Fold {
         });
     }
 
-    /// Take the panel's height again, for content that grew or shrank while it
-    /// was already open.
-    ///
-    /// A fold pins a height. Anything the panel gains afterwards is simply cut
-    /// off - which is what happened to the line under WatchDog's chain: the
-    /// height was taken while that line was empty and hidden, so when it later
-    /// had something to say there was no room left to say it in.
-    fn refit(&self) {
-        if self.at.get() <= 0 || !self.clip.is_visible() {
-            return;
-        }
-        let measured = self.inner.measure(gtk::Orientation::Vertical, -1).1;
-        if measured <= 1 || measured == self.at.get() {
-            return;
-        }
-        self.full.set(measured);
-        self.at.set(measured);
-        self.clip.set_size_request(-1, measured);
-    }
-
     fn land(&self, target: i32) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.heading.set(-1);
         self.at.set(target);
         self.clip.set_size_request(-1, target);
         self.clip.set_visible(target > 0);
@@ -3504,9 +3547,9 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     // 3: the conversion. Done stays white until the next file arrives, so the
     // chain finishes reading as a completed pass rather than emptying itself.
     //
-    // With no drive named nothing converts at all, and that has to be said
-    // here: a file found and then nothing happening, with no reason given, is
-    // the exact thing this chain exists to prevent.
+    // With nowhere named to put the result, nothing converts at all, and that
+    // has to be said here: a file found and then nothing happening, with no
+    // reason given, is the exact thing this chain exists to prevent.
     let landed = ui.watchdog_landed.get();
     let held = target.is_none() && trouble.is_none();
     match (&doing, ui.watchdog_ready.borrow().is_some()) {
@@ -3531,7 +3574,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
                     State::Idle
                 },
             );
-            chain.set_note(2, (held && holding).then_some("needs a drive"));
+            chain.set_note(2, (held && holding).then_some("nowhere to put it"));
             chain.set_link_note(3, None);
         }
     }
@@ -3639,7 +3682,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
         }
         (Some(name), _) => chain.set_footer(Some(&format!("Converting {name}\u{2026}"))),
         _ if held && holding => chain.set_footer(Some(
-            "Found a file, but no drive has been chosen to copy it to",
+            "Found a file, but nowhere has been chosen to copy it to",
         )),
         (None, Some(last)) => chain.set_footer(Some(last)),
         (None, None) => chain.set_footer(None),
@@ -4112,15 +4155,20 @@ fn watchdog_needs_setup(ui: &Rc<App>, on: bool) {
 /// out the whole sentence - which folder, which format, which drive - because
 /// a light that says only "on" leaves the reader to guess at the rest.
 fn refresh_auto_indicator(ui: &Rc<App>) {
-    let (on, dir, to, target) = {
+    let (on, dir, to) = {
         let s = ui.settings.borrow();
         (
             s.auto_convert,
             s.auto_watch_dir.clone(),
             s.auto_to_format.clone(),
-            s.auto_target_label.clone(),
         )
     };
+    // Resolved the same way the chain resolves it. This read auto_target_label
+    // straight out of the settings, and that field is only ever filled in for
+    // a drive - so choosing a plain folder left the row, the button and the
+    // status line all saying nothing had been chosen while WatchDog was
+    // already copying into it.
+    let target = watchdog_where(ui).0;
     // The eye, and everything that has to agree with it. Set rather than
     // toggled, and only when it disagrees, so nothing here can start a loop
     // with the handler that brought it about.
@@ -4219,7 +4267,7 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
 
     let said = match (&where_, &target) {
         (None, _) => "On - choose a folder to watch".to_string(),
-        (Some(w), None) => format!("{w} to {} - no drive chosen", to.to_uppercase()),
+        (Some(w), None) => format!("{w} to {} - nowhere to save it", to.to_uppercase()),
         (Some(w), Some(t)) => format!("{w} to {} to {t}", to.to_uppercase()),
     };
     ui.watchdog_row.set_subtitle(&said);
@@ -4516,7 +4564,7 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
     let coming = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
     let mode = auto::resolve_staging(asked, budget, coming);
 
-    // Nowhere to put it and no drive to put it on: leave the file alone and
+    // Nowhere named to put the result: leave the file alone and
     // leave it unrecorded, so plugging the drive in and re-saving still works.
     if drive.is_none() && mode == auto::Staging::OnDemand {
         release(ui);
@@ -5132,6 +5180,7 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
         if in_columns {
             let name = marquee(&name);
             name.set_margin_start(theme::SPACE_2);
+            marquee_auto(&name);
             row.add_prefix(&name);
         } else {
             row.set_title(&name);
@@ -5800,6 +5849,8 @@ fn refresh_input_label(ui: &Rc<App>) {
 /// the end of one pass and the start of the next.
 const MARQUEE_SPEED: f64 = 46.0;
 const MARQUEE_GAP: i32 = 48;
+/// How often a name is re-asked whether it still fits.
+const MARQUEE_CHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A name that slides itself past a fixed width while the pointer is over it.
 ///
@@ -5832,23 +5883,47 @@ fn marquee(text: &str) -> gtk::ScrolledWindow {
         .child(&train)
         .build();
     view.set_overflow(gtk::Overflow::Hidden);
+    // The position here belongs to the marquee. Selecting the row would
+    // otherwise scroll the name to its end and leave it there.
+    shell::dont_chase_focus(&view);
     view
 }
 
-/// Slide the name in `view` while the pointer is anywhere in `over`, except
-/// while it is on `unless`.
+/// The pair of labels inside a marquee.
 ///
-/// The trigger is the whole row rather than the name itself, because the name
-/// is the part of the row that is too small to aim at - which is the same
-/// reason it needed sliding. The exception is the status: hovering there is
-/// for reading why a file failed, and its tooltip should not have to compete
-/// with something moving underneath it.
-fn marquee_hover(
-    view: &gtk::ScrolledWindow,
-    over: &impl IsA<gtk::Widget>,
-    unless: Option<gtk::Widget>,
-) {
-    let Some(train) = view.child().and_downcast::<gtk::Box>() else {
+/// A GtkScrolledWindow given a child that cannot scroll itself puts a viewport
+/// in between, and `child()` hands back that viewport rather than what was put
+/// in. Reaching straight for the box therefore found nothing and every marquee
+/// quietly did nothing at all - names were ellipsised and stayed that way.
+fn marquee_train(view: &gtk::ScrolledWindow) -> Option<gtk::Box> {
+    match view.child() {
+        Some(child) => match child.downcast::<gtk::Box>() {
+            Ok(train) => Some(train),
+            Err(other) => other
+                .downcast::<gtk::Viewport>()
+                .ok()
+                .and_then(|port| port.child())
+                .and_then(|inner| inner.downcast::<gtk::Box>().ok()),
+        },
+        None => None,
+    }
+}
+
+/// Slide the name in `view` whenever it is too long for the room it has.
+///
+/// Not on hover, and not only when the window is narrow. A name gets cut short
+/// at whatever width the row happens to have, the widest included, and a row
+/// that will only tell you what it says once you have found it and pointed at
+/// it has hidden the answer behind a gesture. If it does not fit, it moves.
+///
+/// Only if it does not fit: a name with room to spare sits still, because
+/// movement carrying no information is noise.
+///
+/// Whether it fits is asked a couple of times a second rather than once. A
+/// name that fits at one window width does not at another, and these rows are
+/// rebuilt when the layout changes bands, not for every pixel of a drag.
+fn marquee_auto(view: &gtk::ScrolledWindow) {
+    let Some(train) = marquee_train(view) else {
         return;
     };
     let Some(first) = train.first_child().and_downcast::<gtk::Label>() else {
@@ -5865,7 +5940,9 @@ fn marquee_hover(
         let second = second.clone();
         let running = running.clone();
         move || {
-            running.set(false);
+            if !running.replace(false) {
+                return;
+            }
             first.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
             second.set_visible(false);
             view.hadjustment().set_value(0.0);
@@ -5877,11 +5954,13 @@ fn marquee_hover(
         let second = second.clone();
         let running = running.clone();
         move || {
-            // Nothing to slide if the whole name is already on screen.
-            let wanted = first.measure(gtk::Orientation::Horizontal, -1).1;
-            if wanted <= view.width() || running.replace(true) {
+            if running.replace(true) {
                 return;
             }
+            // The ellipsis goes, a second copy appears behind the first, and
+            // the pair slides by exactly one copy's width before starting
+            // again - so the loop has no rewind in it and the name can be read
+            // round and round without waiting.
             first.set_ellipsize(gtk::pango::EllipsizeMode::None);
             second.set_visible(true);
 
@@ -5917,26 +5996,30 @@ fn marquee_hover(
         }
     };
 
-    let hover = gtk::EventControllerMotion::new();
-    {
-        let over = over.as_ref().clone();
-        let start = start.clone();
-        let stop = stop.clone();
-        hover.connect_motion(move |_, x, y| {
-            let blocked = unless.as_ref().is_some_and(|w| {
-                w.compute_bounds(&over).is_some_and(|b| {
-                    b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32))
-                })
-            });
-            if blocked {
-                stop();
-            } else {
-                start();
-            }
-        });
-    }
-    hover.connect_leave(move |_| stop());
-    over.as_ref().add_controller(hover);
+    // A weak handle, so the row being taken out of the list is what ends this
+    // rather than the timer being what keeps the row alive.
+    let weak = view.downgrade();
+    let lead = first.clone();
+    glib::timeout_add_local(MARQUEE_CHECK, move || {
+        let Some(view) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let width = view.width();
+        // Off screen, or not laid out yet. Nothing to measure against, and
+        // sliding a row nobody is looking at is work for its own sake.
+        if width == 0 || !view.is_mapped() {
+            stop();
+            return glib::ControlFlow::Continue;
+        }
+        // The natural width is the whole name; ellipsising only lowers what
+        // the label will settle for, not what it wants.
+        if lead.measure(gtk::Orientation::Horizontal, -1).1 > width {
+            start();
+        } else {
+            stop();
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// The list of formats the selected file can be read as (§21).
@@ -6212,9 +6295,7 @@ fn refresh_queue(ui: &Rc<App>) {
             _ => None,
         };
         let width = if ui.compact.get() { 0 } else { 104 };
-        // Held so the marquee knows to leave the pointer alone here: hovering
-        // the status is for reading why a file failed.
-        let status_widget: Option<gtk::Widget> = match detail {
+        match detail {
             Some(detail) => {
                 let failed = matches!(f.status, Status::Failed(_));
                 let press = gtk::Button::builder().child(&chip).build();
@@ -6222,11 +6303,10 @@ fn refresh_queue(ui: &Rc<App>) {
                 press.add_css_class("cz-chip-button");
                 press.set_valign(gtk::Align::Center);
                 press.set_width_request(width);
-                // The reason, on the status itself rather than on every widget
-                // in the row. It used to be on all of them, which meant a
-                // tooltip came up over the file's name as well - and a tooltip
-                // over the name is in the way of reading the name, which is
-                // what hovering there is now for.
+                // The reason, on the status itself rather than on every
+                // widget in the row. It used to be on all of them, which meant
+                // a tooltip came up over the file's name as well - in the way
+                // of the one thing the row is there to show.
                 //
                 // The first line only. That is the plain-words headline; the
                 // particulars behind it are what the panel is for, and for
@@ -6246,14 +6326,12 @@ fn refresh_queue(ui: &Rc<App>) {
                     show_details(&win, heading, &name, &detail, &suggestions);
                 });
                 row.append(&press);
-                Some(press.clone().upcast())
             }
             None => {
                 chip.set_width_request(width);
                 row.append(&chip);
-                None
             }
-        };
+        }
 
         let remove = shell::icon_button("window-close-symbolic", "Remove from list");
         let ui2 = ui.clone();
@@ -6261,7 +6339,7 @@ fn refresh_queue(ui: &Rc<App>) {
         remove.connect_clicked(move |_| remove_file(&ui2, &path));
         row.append(&remove);
 
-        marquee_hover(&name, &row, status_widget);
+        marquee_auto(&name);
         let list_row = gtk::ListBoxRow::builder().child(&row).build();
         ui.queue_list.append(&list_row);
         if i == selected {

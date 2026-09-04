@@ -202,6 +202,9 @@ impl Note {
             .build();
         view.set_overflow(gtk::Overflow::Hidden);
         view.set_visible(false);
+        // This one is driven by the marquee, one pixel at a time. Focus
+        // landing anywhere inside would otherwise throw it to the end.
+        crate::shell::dont_chase_focus(&view);
 
         Self {
             labels: [first.clone(), second.clone()],
@@ -389,9 +392,11 @@ impl Steps {
             label.set_max_width_chars(12);
             column.append(&label);
 
-            // The second stop is the one that names the file, and the only one
-            // whose second line is worth sliding to read in full.
-            let note = Note::new(room.clone(), notes_allowed.clone(), i == 1);
+            // Every second line slides if it has to. Which folder and which
+            // drive are names too, and a name cut short is the half of it you
+            // cannot check. Only what overflows moves - a caption that already
+            // fits stays still.
+            let note = Note::new(room.clone(), notes_allowed.clone(), true);
             column.append(&note.view);
 
             let button = gtk::Button::builder()
@@ -427,6 +432,9 @@ impl Steps {
             .propagate_natural_height(true)
             .child(&row)
             .build();
+        // Clicking a stop must not slide the row: these clips exist to cut
+        // the chain off at the window's width, not to be scrolled through.
+        crate::shell::dont_chase_focus(&clip);
         widget.append(&clip);
 
         // What just finished, and that the chain is round again. The only line
@@ -665,17 +673,49 @@ impl Steps {
     }
 
     /// The line under the chain: what it just finished.
+    ///
+    /// The panel holding the chain re-measures itself after this and walks to
+    /// the new height, so the page below makes room over a fifth of a second
+    /// rather than in one frame. The line fades up across the same moment: it
+    /// is being uncovered from the top by a shrinking clip, and text arriving
+    /// a slice at a time reads as it being cut off rather than as it arriving.
     pub fn set_footer(&self, text: Option<&str>) {
         match text.filter(|t| !t.is_empty()) {
             Some(t) => {
+                let arriving = !self.footer.is_visible();
                 self.footer.set_text(t);
                 self.footer.set_visible(true);
+                if arriving {
+                    self.fade_footer_up();
+                }
             }
             None => {
                 self.footer.set_text("");
                 self.footer.set_visible(false);
+                self.footer.set_opacity(1.0);
             }
         }
+    }
+
+    /// Walk the line under the chain from invisible to solid.
+    fn fade_footer_up(&self) {
+        self.footer.set_opacity(0.0);
+        let footer = self.footer.clone();
+        let started = std::time::Instant::now();
+        const OVER: f64 = 0.22;
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            // Anything that hid the line again owns it now.
+            if !footer.is_visible() {
+                footer.set_opacity(1.0);
+                return glib::ControlFlow::Break;
+            }
+            let t = (started.elapsed().as_secs_f64() / OVER).clamp(0.0, 1.0);
+            footer.set_opacity(t);
+            if t >= 1.0 {
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// How far across the link into a step something has got.
