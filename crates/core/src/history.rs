@@ -45,6 +45,13 @@ pub struct Entry {
     pub outcome: Outcome,
     /// Why it failed, when it did.
     pub detail: String,
+    /// True when WatchDog did this rather than the user pressing Convert.
+    ///
+    /// Worth recording because it is the one kind of entry nobody remembers
+    /// making: a file appeared, was converted, and was delivered, possibly
+    /// while nobody was looking at the program at all. Without this, history
+    /// says a conversion happened and leaves you wondering who asked for it.
+    pub automatic: bool,
 }
 
 impl Entry {
@@ -121,7 +128,7 @@ impl History {
             use std::fmt::Write;
             let _ = writeln!(
                 body,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 e.when,
                 e.outcome.as_str(),
                 e.from_format,
@@ -130,6 +137,10 @@ impl History {
                 escape(&e.source.to_string_lossy()),
                 escape(&e.destination.to_string_lossy()),
                 escape(&e.detail),
+                // Appended last, so a history written before this existed
+                // still reads: a missing field is simply "not automatic",
+                // which is what every old entry was.
+                u8::from(e.automatic),
             );
         }
         std::fs::write(path, body)
@@ -197,6 +208,7 @@ fn parse_line(line: &str) -> Option<Entry> {
         source: PathBuf::from(unescape(f[5])),
         destination: PathBuf::from(unescape(f[6])),
         detail: f.get(7).map(|s| unescape(s)).unwrap_or_default(),
+        automatic: f.get(8).is_some_and(|s| *s == "1"),
     })
 }
 
@@ -222,7 +234,43 @@ mod tests {
             layers: 42,
             outcome: Outcome::Complete,
             detail: String::new(),
+            automatic: false,
         }
+    }
+
+    #[test]
+    fn a_history_written_before_watchdog_still_reads() {
+        // The automatic flag was appended to the end of the record precisely
+        // so that an existing history file keeps working. An entry with no
+        // ninth field is one nobody automated, which is what every entry
+        // written before WatchDog existed was.
+        let old = "1700000000\tcomplete\tsl1\tgoo\t42\t/in/a.sl1\t/out/a.goo\t";
+        let e = parse_line(old).expect("old lines still parse");
+        assert!(!e.automatic);
+        assert_eq!(e.layers, 42);
+    }
+
+    #[test]
+    fn who_did_it_survives_a_round_trip() {
+        let mut e = entry("auto");
+        e.automatic = true;
+        let mut h = History::default();
+        h.entries.push(e);
+        // Rendered the way save() renders it, then read back the way load()
+        // reads it - the pair that has to agree.
+        let line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            h.entries[0].when,
+            h.entries[0].outcome.as_str(),
+            h.entries[0].from_format,
+            h.entries[0].to_format,
+            h.entries[0].layers,
+            escape(&h.entries[0].source.to_string_lossy()),
+            escape(&h.entries[0].destination.to_string_lossy()),
+            escape(&h.entries[0].detail),
+            u8::from(h.entries[0].automatic),
+        );
+        assert!(parse_line(&line).expect("round trip").automatic);
     }
 
     #[test]

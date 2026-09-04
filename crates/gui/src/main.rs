@@ -190,7 +190,7 @@ struct App {
     /// The list of readable formats under the drop zone. First thing out when
     /// the window is squeezed: it is a reference, not an instruction, and the
     /// instruction above it still stands without it.
-    dropzone_formats: gtk::Box,
+    dropzone_formats: gtk::Revealer,
     /// "Found nearby": readable files in the open folder and on mounted
     /// drives, offered so a file can be picked without a file dialog.
     nearby_panel: gtk::Box,
@@ -1268,7 +1268,7 @@ fn wire_responsive(ui: &Rc<App>) {
                 // The Quick Access rows give up their columns at the same
                 // width the queue rows do.
                 refresh_nearby(&ui);
-                ui.dropzone_formats.set_visible(!narrow);
+                ui.dropzone_formats.set_reveal_child(!narrow);
             }
         })
     };
@@ -1535,7 +1535,7 @@ struct NearbyPanel {
     search: gtk::Entry,
 }
 
-fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Label, gtk::Box) {
+fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Label, gtk::Revealer) {
     let zone = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_3);
     zone.add_css_class("cz-dropzone");
     zone.set_valign(gtk::Align::Center);
@@ -1613,13 +1613,28 @@ fn build_dropzone() -> (gtk::Box, gtk::Label, gtk::Label, gtk::Box) {
         .collect();
     zone.set_tooltip_text(Some(&format!("Opens\n{}", listed.join("\n"))));
 
+    // Revealed rather than shown, so the list slides out of the way when the
+    // window narrows instead of vanishing and dropping everything below it up
+    // a hundred pixels in one frame. The height is what is animating; the
+    // panels underneath just follow it.
+    let formats_reveal = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideUp)
+        .transition_duration(FORMATS_MS)
+        .reveal_child(true)
+        .child(&formats)
+        .build();
+
     zone.append(&icon);
     zone.append(&title);
     zone.append(&sub);
     zone.append(&browse);
-    zone.append(&formats);
-    (zone, title, sub, formats)
+    zone.append(&formats_reveal);
+    (zone, title, sub, formats_reveal)
 }
+
+/// How long the readable-format list takes to fold away as the window narrows.
+/// Long enough to read as movement, short enough not to lag the drag.
+const FORMATS_MS: u32 = 220;
 
 fn build_problem_bar() -> (gtk::Box, gtk::Label) {
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_2);
@@ -2461,20 +2476,43 @@ fn refresh_dropzone_text(ui: &Rc<App>) {
 
     refresh_watchdog_steps(ui);
 
+    // The heading walks the same setup the chain does, and stops at the first
+    // thing that is not answered. Saying "Watching for files" while there is
+    // no folder to watch is the program describing an intention rather than a
+    // state, and it leaves the one outstanding question unasked.
+    let doing = ui.watchdog_doing.borrow().clone();
+    let waiting = ui.auto_settling.borrow().len() + ui.auto_queue.borrow().len() > 0;
+    let no_target = ui.settings.borrow().auto_target_uuid.is_none()
+        && ui.settings.borrow().auto_target_dir.is_none();
     if needs_folder {
         ui.dropzone_title.set_text("Choose a folder to watch");
         ui.dropzone_sub
             .set_text("WatchDog will convert whatever your slicer leaves there");
     } else if armed {
-        // Says what it is doing, not what you could do - and then says what
-        // you could do anyway, because dropping a file by hand still works
-        // and a page that stops mentioning it looks like it stopped allowing
-        // it.
-        ui.dropzone_title.set_text("Watching for files");
-        ui.dropzone_sub.set_text(&match &watching {
-            Some(folder) => format!("in {folder} - or drop one here to convert it now"),
-            None => "or drop one here to convert it now".to_string(),
-        });
+        if let Some(name) = &doing {
+            ui.dropzone_title.set_text("Converting");
+            ui.dropzone_sub.set_text(name);
+        } else if armed && waiting && no_target {
+            // The file is here and there is nowhere to send it. That is the
+            // question now, so that is what the heading asks.
+            ui.dropzone_title.set_text("Choose where to save");
+            ui.dropzone_sub
+                .set_text("A file is waiting - pick a drive or folder for it to go to");
+        } else if no_target {
+            ui.dropzone_title.set_text("Choose where to save");
+            ui.dropzone_sub
+                .set_text("Pick the drive or folder converted files should go to");
+        } else {
+            // Says what it is doing, not what you could do - and then says what
+            // you could do anyway, because dropping a file by hand still works
+            // and a page that stops mentioning it looks like it stopped
+            // allowing it.
+            ui.dropzone_title.set_text("Watching for files");
+            ui.dropzone_sub.set_text(&match &watching {
+                Some(folder) => format!("in {folder} - or drop one here to convert it now"),
+                None => "or drop one here to convert it now".to_string(),
+            });
+        }
     } else {
         ui.dropzone_title.set_text("Drop files here");
         ui.dropzone_sub.set_text("or browse your computer");
@@ -3160,11 +3198,9 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
         // showing it move is the difference between a chain that reports
         // states and one that shows a file passing through them. Started only
         // on the change, so a redraw part-way through does not restart it.
+        chain.set_link(1, 1.0);
         if !was_holding {
-            let chain2 = chain.clone();
-            chain.clone().fill_link(1, 0.4, move || {
-                chain2.clone().fill_link(2, 0.4, || {});
-            });
+            chain.clone().fill_link(2, 0.4, || {});
         }
     } else if landed {
         // The finished picture, held for a moment so the pass can be seen to
@@ -3173,13 +3209,14 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
         chain.set_link(1, 1.0);
         chain.set_link(2, 1.0);
     } else if watching.is_some() && trouble.is_none() {
-        // Back to looking. Everything the last file filled is emptied, because
-        // a full bar means this file crossed here - and there is no this file
-        // any more. What was done is said in words underneath, which is where
-        // a record belongs; the bars are for what is happening now.
-        chain.set_link(1, 0.0);
+        // Back to looking. The first leg stays solid, because the folder is
+        // still there and that is all that leg has ever meant - it is the link
+        // to the folder, not a search in progress. What the last file filled
+        // beyond it is emptied, because a full bar means this file crossed
+        // here and there is no this file any more. The looking is said by the
+        // stop that is doing it, breathing on its own.
+        chain.set_link(1, 1.0);
         chain.set_link(2, 0.0);
-        bounce.push(1);
     } else {
         chain.set_link(1, 0.0);
         chain.set_link(2, 0.0);
@@ -4081,6 +4118,11 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         .unwrap_or_default();
     // Layer counts as they happen, so the chain can show how far in it is
     // rather than only that something is going on.
+    let (from_id, to_id, layer_count) = (
+        plan.from.id.to_string(),
+        plan.to.id.to_string(),
+        plan.layer_count,
+    );
     let (ptx, prx) = async_channel::unbounded::<(u32, u32)>();
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -4127,6 +4169,7 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         });
     }
     let ui = ui.clone();
+    let source = source.clone();
     let landed = drive.is_some();
     // What the place is called, so the sentence names it. "Copied to the
     // drive" is wrong the moment the destination is a folder, and it is a
@@ -4143,6 +4186,28 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         let ui2 = ui.clone();
         glib::idle_add_local_once(move || auto_pump(&ui2));
         let Ok(result) = result else { return };
+        // Recorded like any other conversion, and marked as WatchDog's. This
+        // is the one kind of entry nobody remembers making - it can happen
+        // while the window is not even being looked at - so history saying it
+        // happened without saying who asked is worse than not saying at all.
+        {
+            let mut hist = ui.history.borrow_mut();
+            hist.record(history::Entry {
+                when: history::now(),
+                source: source.clone(),
+                destination: dest.clone(),
+                from_format: from_id.clone(),
+                to_format: to_id.clone(),
+                layers: layer_count,
+                outcome: match &result {
+                    Ok(()) => history::Outcome::Complete,
+                    Err(_) => history::Outcome::Failed,
+                },
+                detail: result.as_ref().err().cloned().unwrap_or_default(),
+                automatic: true,
+            });
+        }
+        refresh_history(&ui);
         match result {
             Ok(_) => {
                 *ui.watchdog_ready.borrow_mut() = Some(if landed {
@@ -7323,6 +7388,7 @@ fn run_batch(ui: &Rc<App>, plans: Vec<(PathBuf, convert::Plan)>) {
                         Err(_) => history::Outcome::Failed,
                     },
                     detail: outcome.as_ref().err().cloned().unwrap_or_default(),
+                    automatic: false,
                 });
             }
         }
@@ -7464,6 +7530,15 @@ fn refresh_history(ui: &Rc<App>) {
         text.append(&title);
         text.append(&sub);
         row.append(&text);
+
+        // Whose doing it was. Every other row here is something the reader
+        // pressed a button for and can be expected to remember; a WatchDog row
+        // may have happened while they were in another room.
+        if e.automatic {
+            let by = shell::status_chip(WATCHDOG_ICON, "WatchDog", "cz-dim");
+            by.set_tooltip_text(Some("Converted automatically by WatchDog"));
+            row.append(&by);
+        }
 
         // A deleted output is stated rather than offered and then failing.
         if e.output_exists() {
