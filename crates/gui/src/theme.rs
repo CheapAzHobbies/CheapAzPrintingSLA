@@ -319,6 +319,20 @@ fn sheet(p: &Palette) -> String {
   animation: cz-breathe 1400ms ease-in-out infinite;
 }}
 
+/* Waiting on the user, which is not the same as working and must not look the
+   same. The accent colour is what the rest of the program uses for the thing
+   to press, and a different colour is what stops two pulsing stops reading as
+   one event happening twice. */
+@keyframes cz-calling {{
+  0%   {{ color: @cz_dim; opacity: 0.5; }}
+  50%  {{ color: @cz_accent; opacity: 1; }}
+  100% {{ color: @cz_dim; opacity: 0.5; }}
+}}
+.cz-step-calling {{
+  color: @cz_accent;
+  animation: cz-calling 1200ms ease-in-out infinite;
+}}
+
 /* A stop is a button only where there is something to press. The inert ones
    are left unhoverable in code, so this styles the pressable ones alone. */
 .cz-step-button {{

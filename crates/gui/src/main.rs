@@ -175,6 +175,10 @@ struct App {
     /// What WatchDog last finished, so the chain can say it is round again
     /// rather than only that it is waiting.
     watchdog_ready: RefCell<Option<String>>,
+    /// Whether the chain was already holding a file last time it was drawn,
+    /// so the leg into "New file" is filled once when one turns up rather than
+    /// restarted on every redraw.
+    watchdog_found: Cell<bool>,
     /// Whether a file has actually reached the drive. The one thing that
     /// turns the last stop green, and it is cleared the moment the next file
     /// starts - a chain that stays green is a chain reporting an old success.
@@ -783,6 +787,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_doing: RefCell::new(None),
         watchdog_sending: Cell::new(false),
         watchdog_ready: RefCell::new(None),
+        watchdog_found: Cell::new(false),
         watchdog_landed: Cell::new(false),
         dropzone_formats,
         nearby_panel: nearby_panel.clone(),
@@ -2994,7 +2999,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
             // waiting its turn: nothing happens at all until this one is
             // answered, so it is the thing on the page that should catch the
             // eye rather than the thing that sits quietest.
-            chain.set_state(0, State::Live);
+            chain.set_state(0, State::Calling);
             chain.set_note(0, Some("click to choose"));
         }
         (Some(_), None) => {
@@ -3042,7 +3047,12 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
 
     // 3: the conversion. Done stays white until the next file arrives, so the
     // chain finishes reading as a completed pass rather than emptying itself.
+    //
+    // With no drive named nothing converts at all, and that has to be said
+    // here: a file found and then nothing happening, with no reason given, is
+    // the exact thing this chain exists to prevent.
     let landed = ui.watchdog_landed.get();
+    let held = target.is_none();
     match (&doing, ui.watchdog_ready.borrow().is_some()) {
         (Some(_), _) => {
             chain.set_state(2, State::Live);
@@ -3053,8 +3063,19 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
             chain.set_note(2, None);
         }
         (None, false) => {
-            chain.set_state(2, State::Idle);
-            chain.set_note(2, None);
+            // Held for want of a drive is not idle: the file is here and this
+            // is the step that would run next. It flashes for the same reason
+            // "looking" does - something is pending - and it is safe to flash
+            // beside the drive now that the two use different colours.
+            chain.set_state(
+                2,
+                if held && holding {
+                    State::Live
+                } else {
+                    State::Idle
+                },
+            );
+            chain.set_note(2, (held && holding).then_some("needs a drive"));
             chain.set_link(2, 0.0);
             chain.set_link_note(2, None);
         }
@@ -3067,7 +3088,7 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     match (&target, &here) {
         (None, _) => {
             // Same reasoning as the folder: unset is not idle, it is blocking.
-            chain.set_state(3, State::Live);
+            chain.set_state(3, State::Calling);
             chain.set_note(3, Some("click to choose"));
         }
         (Some(_), None) => {
@@ -3100,16 +3121,26 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     // The links. Bouncing is looking; filling is something crossing; empty is
     // a leg that is dead because the step before it is not satisfied.
     let mut bounce = Vec::new();
+    let was_holding = ui.watchdog_found.replace(holding);
     if holding {
-        chain.set_link(1, 1.0);
+        // Run it across rather than snapping it full. The file arriving is the
+        // one moment in the chain where something really did travel that leg,
+        // and showing it travel is the difference between a chain that reports
+        // states and one that shows a file moving through them. Started only
+        // on the change, so a redraw part-way through does not restart it.
+        if !was_holding {
+            chain.clone().fill_link(1, 0.45, || {});
+        }
     } else if watching.is_some() {
         bounce.push(1);
     } else {
         chain.set_link(1, 0.0);
     }
     // Link 2 is left alone while converting: the layer counter owns it, and it
-    // is the one place in the chain with a real number to report.
-    if doing.is_none() && holding {
+    // is the one place in the chain with a real number to report. Held for
+    // want of a drive it stays empty - a bouncing bar would say something is
+    // under way when the whole point is that nothing is.
+    if doing.is_none() && holding && !held {
         bounce.push(2);
     }
     if sending {
@@ -3123,6 +3154,9 @@ fn refresh_watchdog_steps(ui: &Rc<App>) {
     let ready = ui.watchdog_ready.borrow().clone();
     match (&doing, &ready) {
         (Some(name), _) => chain.set_footer(Some(&format!("Converting {name}\u{2026}"))),
+        _ if held && holding => chain.set_footer(Some(
+            "Found a file, but no drive has been chosen to copy it to",
+        )),
         (None, Some(last)) => chain.set_footer(Some(last)),
         (None, None) => chain.set_footer(None),
     }
@@ -3249,7 +3283,14 @@ fn watchdog_drive_menu(ui: &Rc<App>) -> gtk::Popover {
                     let _ = s.save();
                 }
                 pop2.popdown();
-                rearm_auto(&ui2);
+                // Not a rearm: rearming reseeds the folder as already-seen,
+                // which would throw away the very file that has been waiting
+                // for a drive to be chosen. Only the destination changed, so
+                // only what depends on the destination is put back in step.
+                refresh_auto_indicator(&ui2);
+                refresh_watchdog_steps(&ui2);
+                auto_deliver(&ui2);
+                auto_pump(&ui2);
                 ui2.toasts
                     .add_toast(adw::Toast::new(&format!("WatchDog will copy to {name}")));
             });
@@ -3482,6 +3523,12 @@ fn auto_saw(ui: &Rc<App>, path: PathBuf) {
     // moment nothing is settling - so the first file to arrive was watched and
     // then never looked at again.
     auto_start_ticking(ui);
+    // Something turning up is the whole event this chain is about, so say so
+    // now rather than at the next thing that happens to redraw it. Without
+    // this the chain read "looking" from the drop right through to the
+    // conversion starting, and said nothing at all when the file could not
+    // proceed for want of a drive.
+    refresh_watchdog_steps(ui);
 }
 
 /// Begin checking settling files, if that is not already happening.
@@ -3530,6 +3577,7 @@ fn auto_tick(ui: &Rc<App>) {
         ui.auto_queue.borrow_mut().push_back(path);
     }
     auto_pump(ui);
+    refresh_watchdog_steps(ui);
 
     // Kept ticking only while there is something to tick for. The rest of the
     // time this costs nothing at all, which on a slow machine is the point.
@@ -3546,6 +3594,19 @@ fn auto_tick(ui: &Rc<App>) {
 /// Convert the next queued file, if nothing else is being converted.
 fn auto_pump(ui: &Rc<App>) {
     if ui.auto_busy.get() {
+        return;
+    }
+    // Nowhere to send it, so it waits. Converting into a staging folder for a
+    // drive nobody has named is work that was never asked for, against a
+    // destination that may never exist - and it happens quietly, which is the
+    // worst way for a program to do something surprising. The file stays in
+    // the queue instead, so the chain can show it found something and is held
+    // up, and choosing a drive starts it moving.
+    //
+    // A drive that is chosen but unplugged is a different case and keeps its
+    // old behaviour: convert now, copy when it turns up. There the answer to
+    // "where is this going" is known.
+    if ui.settings.borrow().auto_target_uuid.is_none() {
         return;
     }
     let Some(next) = ui.auto_queue.borrow_mut().pop_front() else {

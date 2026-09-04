@@ -34,8 +34,15 @@ use std::rc::Rc;
 pub enum State {
     /// Grey and still. Not this stop's turn, and nothing is wrong with it.
     Idle,
-    /// Breathing between grey and white: looking, or working.
+    /// Breathing between grey and white: looking, or working. The chain is
+    /// getting on with something and nobody need do anything.
     Live,
+    /// Breathing in the accent colour: this stop is waiting on the user, and
+    /// nothing at all happens until it is answered. Deliberately a different
+    /// colour from `Live` - two stops pulsing identically for two different
+    /// reasons is worse than neither pulsing, because it reads as one thing
+    /// happening in two places.
+    Calling,
     /// Solid white. Behind us.
     Done,
     /// Solid green. The end of the chain, actually reached.
@@ -44,9 +51,10 @@ pub enum State {
     Missing,
 }
 
-const CLASSES: [&str; 5] = [
+const CLASSES: [&str; 6] = [
     "cz-step-idle",
     "cz-step-live",
+    "cz-step-calling",
     "cz-step-done",
     "cz-step-landed",
     "cz-step-missing",
@@ -61,6 +69,8 @@ const NOTE_WIDTH: [i32; 3] = [92, 68, 52];
 /// tiled half-screen window, and the legs are the part of it carrying no words
 /// - so they are the part that gives up room first.
 const LINK_WIDTH: [i32; 3] = [96, 48, 22];
+/// How wide the line under the chain may run before it wraps, at each width.
+const FOOTER_CHARS: [i32; 3] = [52, 40, 30];
 const NOTE_SPEED: f64 = 34.0;
 const NOTE_GAP: i32 = 28;
 
@@ -141,14 +151,26 @@ struct Note {
     room: Rc<Cell<i32>>,
     /// Whether overflowing text slides or is simply cut short.
     slides: bool,
+    /// Whether second lines are shown at all at the current window width.
+    /// Shared with the chain, like `room`.
+    allowed: Rc<Cell<bool>>,
+    /// What this line would say if it were being shown.
+    text: RefCell<String>,
 }
 
 impl Note {
-    fn new(room: Rc<Cell<i32>>, slides: bool) -> Self {
+    fn new(room: Rc<Cell<i32>>, allowed: Rc<Cell<bool>>, slides: bool) -> Self {
         let first = gtk::Label::builder().label("").build();
         let second = gtk::Label::builder().label("").build();
-        if !slides {
-            first.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        // Ellipsised even where the text slides. Ellipsising sets how small a
+        // label may be squeezed, not how large it may be drawn - so without it
+        // a label's full text becomes its column's minimum width, and the
+        // whole chain spreads sideways the moment a longer name appears. The
+        // scrolled window still hands the label its full natural width, so the
+        // sliding one slides exactly as before.
+        for l in [&first, &second] {
+            l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            l.set_width_chars(0);
         }
         for l in [&first, &second] {
             l.add_css_class("caption");
@@ -160,9 +182,17 @@ impl Note {
         train.append(&second);
         train.set_halign(gtk::Align::Center);
 
+        // Both bounds, not just the minimum. A width request is a floor, so
+        // with only that a longer name makes its column wider and the whole
+        // chain spreads out the moment a file is found - which is movement
+        // that says nothing, in a row whose job is to hold still while its
+        // states change. max_content_width is the ceiling that stops it.
         let view = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::External)
             .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_width(false)
+            .min_content_width(room.get())
+            .max_content_width(room.get())
             .width_request(room.get())
             .child(&train)
             .build();
@@ -177,22 +207,44 @@ impl Note {
             sliding: Rc::new(Cell::new(false)),
             room,
             slides,
+            allowed,
+            text: RefCell::new(String::new()),
         }
     }
 
     fn set(&self, text: Option<&str>) {
-        let Some(text) = text.filter(|t| !t.is_empty()) else {
+        *self.text.borrow_mut() = text.unwrap_or("").to_string();
+        self.apply();
+    }
+
+    /// Put the line on screen, or not, according to what it says and whether
+    /// there is room for it at this window width.
+    fn apply(&self) {
+        let text = self.text.borrow().clone();
+        // Shown whenever there is room for it, even with nothing to say. A
+        // line that disappears when it empties takes its column's width with
+        // it, and the chain shuffles sideways every time a stop gains or loses
+        // a caption - which is the row moving to report that nothing moved.
+        if !self.allowed.get() {
             self.sliding.set(false);
             self.view.set_visible(false);
             return;
-        };
-        if self.first.text() == text && self.view.is_visible() {
+        }
+        self.view.set_visible(true);
+        if text.is_empty() {
+            self.sliding.set(false);
+            self.first.set_text("");
+            self.second.set_text("");
+            self.second.set_visible(false);
+            return;
+        }
+        let text = text.as_str();
+        if self.first.text() == text {
             return;
         }
         self.sliding.set(false);
         self.first.set_text(text);
         self.second.set_text(text);
-        self.view.set_visible(true);
         self.view.hadjustment().set_value(0.0);
 
         // Only what does not fit gets to move, and only where moving is what
@@ -255,6 +307,13 @@ pub struct Steps {
     filling: RefCell<Vec<usize>>,
     /// How much room a stop's second line has, at the current window width.
     room: Rc<Cell<i32>>,
+    /// Whether second lines are shown at all at this width.
+    notes_allowed: Rc<Cell<bool>>,
+    /// The width band currently in force, so a repeat is not re-animated.
+    level: Cell<usize>,
+    /// Where each connector's width is heading, so a glide already under way
+    /// is not fought by a second one.
+    gliding: Cell<bool>,
 }
 
 impl Steps {
@@ -262,22 +321,27 @@ impl Steps {
     pub fn new(stops: &[(&str, &str)]) -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_2);
         widget.set_halign(gtk::Align::Center);
+        widget.set_margin_bottom(theme::SPACE_3);
         widget.add_css_class("cz-steps");
 
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         row.set_halign(gtk::Align::Center);
 
         let room = Rc::new(Cell::new(NOTE_WIDTH[0]));
+        let notes_allowed = Rc::new(Cell::new(true));
         let mut steps = Vec::new();
         let mut links = Vec::new();
         for (i, (icon_name, text)) in stops.iter().enumerate() {
             if i > 0 {
                 // The time left sits above its own bar rather than in the
                 // middle of the chain, so it is obvious which leg it is about.
+                // Always present, even with nothing to say. Showing and
+                // hiding it would make the connectors jump down the moment a
+                // file was found, which is exactly when the chain most needs
+                // to look like it is holding still.
                 let note = gtk::Label::new(None);
                 note.add_css_class("caption");
                 note.add_css_class("cz-step-eta");
-                note.set_visible(false);
                 let bar = gtk::ProgressBar::builder()
                     .width_request(LINK_WIDTH[0])
                     .build();
@@ -316,7 +380,7 @@ impl Steps {
 
             // The second stop is the one that names the file, and the only one
             // whose second line is worth sliding to read in full.
-            let note = Note::new(room.clone(), i == 1);
+            let note = Note::new(room.clone(), notes_allowed.clone(), i == 1);
             column.append(&note.view);
 
             let button = gtk::Button::builder()
@@ -356,11 +420,16 @@ impl Steps {
         // What just finished, and that the chain is round again. The only line
         // that says a thing has been completed rather than that a thing is
         // true, so it sits under the chain rather than on it.
+        // Wrapped rather than ellipsised: this is a whole sentence, and it is
+        // the line carrying the detail once the stops have given theirs up at
+        // narrow widths. Losing the end of it there is losing the only place
+        // the reason is written.
         let footer = gtk::Label::new(None);
         footer.add_css_class("caption");
         footer.add_css_class("cz-step-footer");
-        footer.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        footer.set_max_width_chars(48);
+        footer.set_wrap(true);
+        footer.set_justify(gtk::Justification::Center);
+        footer.set_max_width_chars(FOOTER_CHARS[0]);
         footer.set_visible(false);
         widget.append(&footer);
 
@@ -373,31 +442,81 @@ impl Steps {
             ticking: Cell::new(false),
             filling: RefCell::new(Vec::new()),
             room,
+            notes_allowed,
+            level: Cell::new(0),
+            gliding: Cell::new(false),
         })
     }
 
     /// Give up room as the window narrows.
     ///
     /// `level` is the window's width band, 0 being widest. The connectors go
-    /// first because they carry no words; the second lines follow, and slide
-    /// what no longer fits rather than hiding it.
-    pub fn set_compact(&self, level: usize) {
+    /// first, because they carry no words. At the narrowest the second lines
+    /// go too: which folder and which drive are details, and the line under
+    /// the chain is already saying the one that matters. What has to survive
+    /// every width is the thing the chain is for - four icons, their state,
+    /// and which link is broken.
+    ///
+    /// The change is glided rather than snapped. A window being dragged
+    /// narrower is a continuous gesture, and a layout that jumps part-way
+    /// through reads as something breaking rather than something fitting.
+    pub fn set_compact(self: &Rc<Self>, level: usize) {
         let level = level.min(LINK_WIDTH.len() - 1);
-        for link in &self.links {
-            link.bar.set_width_request(LINK_WIDTH[level]);
-        }
-        if self.room.replace(NOTE_WIDTH[level]) == NOTE_WIDTH[level] {
+        if self.level.replace(level) == level {
             return;
         }
+        self.glide_links(LINK_WIDTH[level]);
+
+        self.footer.set_max_width_chars(FOOTER_CHARS[level]);
+        self.room.set(NOTE_WIDTH[level]);
+        self.notes_allowed.set(level < LINK_WIDTH.len() - 1);
         for step in &self.steps {
             step.note.view.set_width_request(NOTE_WIDTH[level]);
+            step.note.view.set_min_content_width(NOTE_WIDTH[level]);
+            step.note.view.set_max_content_width(NOTE_WIDTH[level]);
             // Re-measured against the new room: a name that fitted before may
             // now have to slide, and one that was sliding may now fit.
-            let text = step.note.first.text();
             step.note.sliding.set(false);
             step.note.first.set_text("");
-            step.note.set(Some(text.as_str()));
+            step.note.apply();
         }
+    }
+
+    /// Walk the connectors to a new length over a couple of frames.
+    fn glide_links(self: &Rc<Self>, to: i32) {
+        let from = self
+            .links
+            .first()
+            .map(|l| l.bar.width_request())
+            .unwrap_or(to);
+        if from == to || self.gliding.replace(true) {
+            // Already moving: the running glide reads the target each frame,
+            // so it will arrive at the new one without a second timer.
+            if from == to {
+                self.gliding.set(false);
+            }
+            return;
+        }
+        let steps = self.clone();
+        let started = std::time::Instant::now();
+        const OVER: f64 = 0.18;
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            let target = LINK_WIDTH[steps.level.get()];
+            let t = (started.elapsed().as_secs_f64() / OVER).clamp(0.0, 1.0);
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let at = from as f64 + (target - from) as f64 * eased;
+            for link in &steps.links {
+                link.bar.set_width_request(at.round() as i32);
+            }
+            if t >= 1.0 {
+                for link in &steps.links {
+                    link.bar.set_width_request(target);
+                }
+                steps.gliding.set(false);
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// Make a stop pressable, with `hint` as its tooltip.
@@ -436,6 +555,7 @@ impl Steps {
         step.icon.add_css_class(match state {
             State::Idle => "cz-step-idle",
             State::Live => "cz-step-live",
+            State::Calling => "cz-step-calling",
             State::Done => "cz-step-done",
             State::Landed => "cz-step-landed",
             State::Missing => "cz-step-missing",
@@ -443,6 +563,7 @@ impl Steps {
         let words = match state {
             State::Idle | State::Missing => "cz-step-idle",
             State::Live => "cz-step-live",
+            State::Calling => "cz-step-calling",
             State::Done => "cz-step-done",
             State::Landed => "cz-step-landed",
         };
@@ -498,16 +619,8 @@ impl Steps {
         let Some(link) = into.checked_sub(1).and_then(|i| self.links.get(i)) else {
             return;
         };
-        match note.filter(|t| !t.is_empty()) {
-            Some(t) => {
-                link.note.set_text(t);
-                link.note.set_visible(true);
-            }
-            None => {
-                link.note.set_text("");
-                link.note.set_visible(false);
-            }
-        }
+        // Emptied rather than hidden, so the row keeps its height either way.
+        link.note.set_text(note.unwrap_or(""));
     }
 
     /// Run a link smoothly up to full, then call `then`.
@@ -599,7 +712,7 @@ impl Steps {
         self.filling.borrow_mut().clear();
         for link in &self.links {
             link.bar.set_fraction(0.0);
-            link.note.set_visible(false);
+            link.note.set_text("");
         }
         for step in &self.steps {
             step.note.sliding.set(false);
