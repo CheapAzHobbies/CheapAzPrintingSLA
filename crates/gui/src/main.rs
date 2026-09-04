@@ -1595,6 +1595,25 @@ fn build_watchdog_page(
     arm.append(row);
     page.append(&arm);
 
+    // What the thing actually is, in the words someone would use to a person
+    // who had not met it. The line at the top of the page names it; this says
+    // what it would do for you, which is the part that decides whether the
+    // switch above is worth touching. Plain enough to be read once and not
+    // needed again - which is the standard the settings wording is held to,
+    // and there is no reason this should be held to a lower one.
+    let what = gtk::Label::builder()
+        .label(
+            "Leave this on and you can forget about it. WatchDog keeps an eye on one folder.              When your slicer saves a new file there, it converts it to your printer's format              and puts the result where you say - a USB stick, or any folder on this computer.              Nothing to open, nothing to press.",
+        )
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    what.add_css_class("caption");
+    what.add_css_class("cz-dim");
+    what.set_margin_start(theme::SPACE_2);
+    what.set_margin_end(theme::SPACE_2);
+    page.append(&what);
+
     // The chain, given the middle of the page rather than the corner of
     // another one. It is the answer to "what is it doing", which is the
     // question this page exists to answer.
