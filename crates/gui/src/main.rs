@@ -1818,6 +1818,23 @@ fn build_watchdog_page(
 /// did not survive being asked to animate in the middle of a resize, so the
 /// height is driven here instead: a scrolled window to allow a height below
 /// the child's own minimum, and a tick callback to walk it there.
+/// How tall a folded panel wants to be, asked at the width it actually has.
+///
+/// Its own width, not its clip's. The chain inside WatchDog's panel is centred
+/// rather than stretched, so it is allocated its natural width and the clip
+/// around it is wider. Measuring against the clip asked how tall the panel
+/// would be if it were as wide as the window - and a sentence that needs two
+/// lines at the real width answers with one. The panel was then pinned a line
+/// short and the line under the chain was cut off at the top of its letters.
+fn panel_height(inner: &gtk::Widget, clip_width: i32) -> i32 {
+    let width = match (inner.width(), clip_width) {
+        (w, _) if w > 0 => w,
+        (_, w) if w > 0 => w,
+        _ => -1,
+    };
+    inner.measure(gtk::Orientation::Vertical, width).1
+}
+
 struct Fold {
     clip: gtk::ScrolledWindow,
     inner: gtk::Widget,
@@ -1876,9 +1893,7 @@ impl Fold {
     /// which is a different and smaller number for anything that wraps - and
     /// the line under WatchDog's chain is a whole sentence that does.
     fn wanted(&self) -> i32 {
-        let width = self.clip.width();
-        let for_width = if width > 0 { width } else { -1 };
-        self.inner.measure(gtk::Orientation::Vertical, for_width).1
+        panel_height(&self.inner, self.clip.width())
     }
 
     fn set(&self, open: bool, animate: bool) {
@@ -1954,6 +1969,8 @@ impl Fold {
         let at = self.at.clone();
         let generation = self.generation.clone();
         let heading = self.heading.clone();
+        let full = self.full.clone();
+        let inner = self.inner.clone();
         self.clip.add_tick_callback(move |w, _| {
             if generation.get() != mine {
                 return glib::ControlFlow::Break;
@@ -1965,7 +1982,21 @@ impl Fold {
             w.set_size_request(-1, now);
             if t >= 1.0 {
                 heading.set(-1);
-                w.set_visible(target > 0);
+                if target > 0 {
+                    // One last look, now that everything has been laid out at
+                    // the size it is going to keep. A height worked out before
+                    // the panel had settled can come up short, and short means
+                    // the bottom of the panel is cut off - which is a worse
+                    // way to be wrong than being a pixel too tall. Landing on
+                    // the larger of the two costs nothing visible: it is the
+                    // last frame of a movement that is already over.
+                    let settled = panel_height(&inner, w.width()).max(target);
+                    at.set(settled);
+                    full.set(settled);
+                    w.set_size_request(-1, settled);
+                } else {
+                    w.set_visible(false);
+                }
                 return glib::ControlFlow::Break;
             }
             glib::ControlFlow::Continue
