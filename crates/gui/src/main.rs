@@ -324,13 +324,18 @@ struct App {
     watchdog_eye: gtk::ToggleButton,
     /// And its row on the Convert page, which says the whole sentence the eye
     /// can only hint at.
-    watchdog_row: adw::ExpanderRow,
+    watchdog_row: adw::ActionRow,
     watchdog_switch: gtk::Switch,
     /// The two things it has to be told, on the page where it is switched on.
     watchdog_folder: adw::ActionRow,
     watchdog_drive: adw::ActionRow,
     watchdog_more: adw::ActionRow,
     watchdog_folder_btn: gtk::Button,
+    /// The row saying what it converts into, and the button that changes it.
+    watchdog_format: adw::ActionRow,
+    watchdog_format_btn: gtk::MenuButton,
+    /// The list of what WatchDog has done on its own.
+    watchdog_recent: gtk::ListBox,
     watchdog_drive_btn: gtk::MenuButton,
     /// Held, because nothing else holds it. A size group is a plain object
     /// and the widgets in it do not keep it alive - let the last reference go
@@ -484,18 +489,13 @@ fn build(app: &adw::Application) -> Rc<App> {
     header.pack_end(&watchdog_eye);
 
     // --- convert page -----------------------------------------------------
-    // WatchDog on the Convert page, always there, whether it is watching or
-    // not. The eye in the title bar is right for telling you at a glance from
-    // another page, and wrong for finding in the first place - a small icon
-    // beside the window controls is where nobody looks for a feature they do
-    // not know exists yet. This is a row on the page the feature is about,
-    // saying its name and what it would do.
-    // An expander, so the two things it needs to know are behind the row that
-    // needs them rather than on another page. The switch is a suffix rather
-    // than the expander's own enable switch, because the folder and the drive
-    // have to be settable before it is turned on, and the enable switch
-    // disables everything under it.
-    let watchdog_row = adw::ExpanderRow::builder()
+    // WatchDog has its own page now. It shared the Convert page for a while
+    // and the seam showed: Convert is "I have files, do this to them"; this is
+    // "watch that place and act without me". They want opposite things from
+    // the same space - one wants a drop target, the other wants to say what it
+    // is doing - and every layout that served both served neither. Two pages,
+    // one job each.
+    let watchdog_row = adw::ActionRow::builder()
         .title("WatchDog")
         .subtitle("Off")
         .title_lines(1)
@@ -516,10 +516,21 @@ fn build(app: &adw::Application) -> Rc<App> {
     let choose_folder = gtk::Button::with_label("Choose…");
     choose_folder.set_valign(gtk::Align::Center);
     watchdog_folder.add_suffix(&choose_folder);
-    watchdog_row.add_row(&watchdog_folder);
+
+    let watchdog_format = adw::ActionRow::builder()
+        .title("Convert to")
+        .subtitle("GOO")
+        .subtitle_lines(1)
+        .build();
+    let choose_format = gtk::MenuButton::builder()
+        .label("Choose…")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Pick the format WatchDog converts into")
+        .build();
+    watchdog_format.add_suffix(&choose_format);
 
     let watchdog_drive = adw::ActionRow::builder()
-        .title("Drive to copy to")
+        .title("Save into")
         .subtitle("Not chosen")
         .subtitle_lines(1)
         .build();
@@ -530,10 +541,9 @@ fn build(app: &adw::Application) -> Rc<App> {
     let choose_drive = gtk::MenuButton::builder()
         .label("Choose…")
         .valign(gtk::Align::Center)
-        .tooltip_text("Pick which drive WatchDog copies to")
+        .tooltip_text("Pick the drive or folder WatchDog saves into")
         .build();
     watchdog_drive.add_suffix(&choose_drive);
-    watchdog_row.add_row(&watchdog_drive);
 
     let watchdog_widths = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
@@ -544,12 +554,6 @@ fn build(app: &adw::Application) -> Rc<App> {
         .activatable(true)
         .build();
     watchdog_more.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    watchdog_row.add_row(&watchdog_more);
-
-    let watchdog_panel = gtk::ListBox::new();
-    watchdog_panel.add_css_class("boxed-list");
-    watchdog_panel.set_selection_mode(gtk::SelectionMode::None);
-    watchdog_panel.append(&watchdog_row);
 
     let (dropzone, dropzone_title, dropzone_sub, dropzone_formats) = build_dropzone();
 
@@ -562,12 +566,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         ("media-playlist-repeat-symbolic", "Convert"),
         ("drive-removable-media-symbolic", "Drive"),
     ]);
-    // Folded rather than shown, for the same reason the format list is:
-    // switching the mode on made the chain appear in one frame and shoved
-    // every panel below it down the page.
+    // Folded rather than shown, so switching the mode on does not shove the
+    // rows below it down the page in a single frame.
     let watchdog_fold = Fold::new(&watchdog_steps.widget);
     watchdog_fold.land(0);
-    dropzone.append(&watchdog_fold.clip);
     let nearby = build_nearby_panel();
     let nearby_panel = nearby.panel.clone();
     let queue_list = gtk::ListBox::new();
@@ -710,7 +712,6 @@ fn build(app: &adw::Application) -> Rc<App> {
     let (problem, problem_label) = build_problem_bar();
 
     let convert_page = build_convert_page(
-        &watchdog_panel,
         &dropzone,
         &nearby_panel,
         &queue_panel,
@@ -733,6 +734,26 @@ fn build(app: &adw::Application) -> Rc<App> {
     let format_row = convert_page.3;
     let swap_col = convert_page.4;
     shell.add_page(Section::Convert, &convert_page.0);
+
+    // --- watchdog page ----------------------------------------------------
+    let watchdog_recent = gtk::ListBox::new();
+    watchdog_recent.add_css_class("boxed-list");
+    watchdog_recent.set_selection_mode(gtk::SelectionMode::None);
+    let watchdog_recent_group = adw::PreferencesGroup::builder()
+        .title("Recently, automatically")
+        .description("What WatchDog has converted without being asked")
+        .build();
+    watchdog_recent_group.add(&watchdog_recent);
+    let watchdog_page = build_watchdog_page(
+        &watchdog_row,
+        &watchdog_fold,
+        &watchdog_folder,
+        &watchdog_format,
+        &watchdog_drive,
+        &watchdog_more,
+        &watchdog_recent_group,
+    );
+    shell.add_page(Section::WatchDog, &watchdog_page);
 
     // --- preview page -----------------------------------------------------
     let viewer = viewer::LayerViewer::new();
@@ -876,6 +897,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         watchdog_drive: watchdog_drive.clone(),
         watchdog_more: watchdog_more.clone(),
         watchdog_folder_btn: choose_folder.clone(),
+        watchdog_format: watchdog_format.clone(),
+        watchdog_format_btn: choose_format.clone(),
+        watchdog_recent: watchdog_recent.clone(),
         watchdog_drive_btn: choose_drive.clone(),
         watchdog_widths: watchdog_widths.clone(),
         queue_columns: RefCell::new(Vec::new()),
@@ -1544,6 +1568,61 @@ struct NearbyPanel {
     search: gtk::Entry,
 }
 
+/// WatchDog's own page: what it is doing, and the three things it needs.
+///
+/// Laid out in the order the questions are asked. What is happening, at the
+/// top and given room, because that is what the page is opened to find out.
+/// Then the three settings that make it work, as one group of rows, because
+/// they are one decision made three times: watch here, convert to that, put it
+/// there. Then what it has done, because a mode that runs while nobody is
+/// looking has to be able to show its work.
+#[allow(clippy::too_many_arguments)]
+fn build_watchdog_page(
+    row: &adw::ActionRow,
+    chain: &Fold,
+    folder: &adw::ActionRow,
+    format: &adw::ActionRow,
+    into: &adw::ActionRow,
+    more: &adw::ActionRow,
+    recent: &adw::PreferencesGroup,
+) -> gtk::Widget {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, theme::SPACE_5);
+
+    // The switch, on its own, above everything it governs.
+    let arm = gtk::ListBox::new();
+    arm.add_css_class("boxed-list");
+    arm.set_selection_mode(gtk::SelectionMode::None);
+    arm.append(row);
+    page.append(&arm);
+
+    // The chain, given the middle of the page rather than the corner of
+    // another one. It is the answer to "what is it doing", which is the
+    // question this page exists to answer.
+    page.append(&chain.clip);
+
+    let setup = adw::PreferencesGroup::builder()
+        .title("What it does")
+        .description("Where to look, what to make, and where to put it")
+        .build();
+    let rows = gtk::ListBox::new();
+    rows.add_css_class("boxed-list");
+    rows.set_selection_mode(gtk::SelectionMode::None);
+    rows.append(folder);
+    rows.append(format);
+    rows.append(into);
+    rows.append(more);
+    setup.add(&rows);
+    page.append(&setup);
+
+    page.append(recent);
+
+    page_frame(
+        "WatchDog",
+        "Watch a folder, convert what your slicer leaves there, and save it where you want it.",
+        &page,
+    )
+}
+
 /// A panel that folds open and shut by having its height driven.
 ///
 /// Anything appearing or disappearing inside a column takes everything below
@@ -1785,7 +1864,6 @@ fn page_frame(title: &str, subtitle: &str, content: &impl IsA<gtk::Widget>) -> g
 
 #[allow(clippy::too_many_arguments)]
 fn build_convert_page(
-    watchdog_panel: &gtk::ListBox,
     dropzone: &gtk::Box,
     nearby: &gtk::Box,
     queue_panel: &gtk::Box,
@@ -1829,7 +1907,6 @@ fn build_convert_page(
     content.append(nearby);
     // Under Quick Access, which is the other thing on this page that watches
     // folders - and above the form, which is about the file in hand.
-    content.append(watchdog_panel);
 
     // Controls stay hidden until there is a file, so a new user sees one
     // instruction rather than a form (§2, §36).
@@ -2307,11 +2384,11 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
                 let _ = s.save();
             }
             rearm_auto(&ui2);
-            // To Convert, where WatchDog's row is and where the files it acts
-            // on appear. The eye is visible from every page, so pressing it
-            // from History or Settings has to land somewhere that shows what
-            // just changed - and that is not the page you happened to be on.
-            ui2.shell.show(Section::Convert);
+            // To WatchDog's own page, which is where the answer to "what did
+            // that just do" is written. The eye is visible from every page, so
+            // pressing it has to land somewhere that shows what changed - and
+            // that is not the page you happened to be on.
+            ui2.shell.show(Section::WatchDog);
             watchdog_needs_setup(&ui2, on);
         });
     }
@@ -2351,6 +2428,10 @@ fn wire(ui: &Rc<App>, add_more: &gtk::Button) {
     }
     ui.watchdog_drive_btn
         .set_popover(Some(&watchdog_drive_menu(ui)));
+    ui.watchdog_format_btn
+        .set_popover(Some(&watchdog_format_menu(ui)));
+    ui.watchdog_widths.add_widget(&ui.watchdog_format_btn);
+    refresh_watchdog_recent(ui);
     wire_watchdog_steps(ui);
 
     build_sources_menu(ui, &ui.nearby_sources.clone());
@@ -2549,69 +2630,19 @@ fn reset_dropzone(ui: &Rc<App>) {
 /// inviting files the moment a folder is chosen, because converting one file
 /// by hand is still worth being able to do while WatchDog is running.
 fn refresh_dropzone_text(ui: &Rc<App>) {
-    let (armed, needs_folder, watching) = {
-        let s = ui.settings.borrow();
-        (
-            s.auto_convert,
-            s.auto_convert && s.auto_watch_dir.is_none(),
-            s.auto_watch_dir
-                .as_ref()
-                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())),
-        )
-    };
-
-    refresh_watchdog_steps(ui);
-
-    // The heading walks the same setup the chain does, and stops at the first
-    // thing that is not answered. Saying "Watching for files" while there is
-    // no folder to watch is the program describing an intention rather than a
-    // state, and it leaves the one outstanding question unasked.
-    let doing = ui.watchdog_doing.borrow().clone();
-    let waiting = ui.auto_settling.borrow().len() + ui.auto_queue.borrow().len() > 0;
-    let no_target = ui.settings.borrow().auto_target_uuid.is_none()
-        && ui.settings.borrow().auto_target_dir.is_none();
-    if needs_folder {
-        ui.dropzone_title.set_text("Choose a folder to watch");
-        ui.dropzone_sub
-            .set_text("WatchDog will convert whatever your slicer leaves there");
-    } else if armed {
-        if let Some(name) = &doing {
-            ui.dropzone_title.set_text("Converting");
-            ui.dropzone_sub.set_text(name);
-        } else if armed && waiting && no_target {
-            // The file is here and there is nowhere to send it. That is the
-            // question now, so that is what the heading asks.
-            ui.dropzone_title.set_text("Choose where to save");
-            ui.dropzone_sub
-                .set_text("A file is waiting - pick a drive or folder for it to go to");
-        } else if no_target {
-            ui.dropzone_title.set_text("Choose where to save");
-            ui.dropzone_sub
-                .set_text("Pick the drive or folder converted files should go to");
-        } else {
-            // Says what it is doing, not what you could do - and then says what
-            // you could do anyway, because dropping a file by hand still works
-            // and a page that stops mentioning it looks like it stopped
-            // allowing it.
-            ui.dropzone_title.set_text("Watching for files");
-            ui.dropzone_sub.set_text(&match &watching {
-                Some(folder) => format!("in {folder} - or drop one here to convert it now"),
-                None => "or drop one here to convert it now".to_string(),
-            });
-        }
-    } else {
-        ui.dropzone_title.set_text("Drop files here");
-        ui.dropzone_sub.set_text("or browse your computer");
-    }
+    // Convert is a manual page again. It used to change its heading to narrate
+    // whatever WatchDog was up to, which made one page try to be two things:
+    // a place to drop files, and a status display for a mode that runs on its
+    // own. WatchDog has its own page for that now, and the eye in the title
+    // bar says from anywhere whether it is armed.
+    ui.dropzone_title.set_text("Drop files here");
+    ui.dropzone_sub.set_text("or browse your computer");
     if let Some(browse) = find_named(&ui.dropzone, "dropzone-browse") {
         if let Some(label) = browse.child().and_downcast::<gtk::Label>() {
-            label.set_text(if needs_folder {
-                "Choose Folder"
-            } else {
-                "Browse Files"
-            });
+            label.set_text("Browse Files");
         }
     }
+    refresh_watchdog_steps(ui);
 }
 
 fn wire_preview_nav(ui: &Rc<App>) {
@@ -3855,13 +3886,31 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
         Some(name) => shorten(name),
         None => "Choose…".to_string(),
     });
-    ui.watchdog_drive.set_subtitle(&match &target {
-        Some(label) => match &drive_at {
-            Some(mount) => format!("{label} - {mount}"),
-            None => format!("{label} - not plugged in"),
-        },
-        None => "Not chosen".into(),
-    });
+    let to_folder = ui.settings.borrow().auto_target_dir.clone();
+    ui.watchdog_drive
+        .set_subtitle(&match (&target, &to_folder) {
+            // A folder is either there or it is not; "not plugged in" is a thing
+            // only a drive can be.
+            (Some(_), Some(path)) => match path.is_dir() {
+                true => path.display().to_string(),
+                false => format!("{} - folder is gone", path.display()),
+            },
+            (Some(label), None) => match &drive_at {
+                Some(mount) => format!("{label} - {mount}"),
+                None => format!("{label} - not plugged in"),
+            },
+            (None, _) => "Not chosen".into(),
+        });
+    ui.watchdog_format.set_subtitle(
+        &registry::by_id(&to)
+            .map(|h| h.info().name.to_string())
+            .unwrap_or_else(|| to.to_uppercase()),
+    );
+    ui.watchdog_format_btn.set_label(&shorten(
+        &registry::by_id(&to)
+            .map(|h| h.info().extension.to_uppercase())
+            .unwrap_or_else(|| to.to_uppercase()),
+    ));
     ui.watchdog_drive_btn.set_label(&match &target {
         Some(label) => shorten(label),
         None => "Choose…".to_string(),
@@ -3881,6 +3930,59 @@ fn refresh_auto_indicator(ui: &Rc<App>) {
     ui.watchdog_row.set_subtitle(&said);
     ui.watchdog_eye
         .set_tooltip_text(Some(&format!("WatchDog: {said}")));
+}
+
+/// The last few things WatchDog converted on its own.
+///
+/// A short list, not the whole history - the point is "has it been working",
+/// which the last handful answers and two hundred rows do not. History is one
+/// click away for the rest.
+fn refresh_watchdog_recent(ui: &Rc<App>) {
+    while let Some(row) = ui.watchdog_recent.first_child() {
+        ui.watchdog_recent.remove(&row);
+    }
+    let entries: Vec<history::Entry> = ui
+        .history
+        .borrow()
+        .entries
+        .iter()
+        .filter(|e| e.automatic)
+        .take(5)
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("Nothing yet")
+            .subtitle("Files WatchDog converts will be listed here")
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name("document-open-recent-symbolic"));
+        ui.watchdog_recent.append(&row);
+        return;
+    }
+    for e in entries {
+        let row = adw::ActionRow::builder()
+            .title(e.destination_name())
+            .subtitle(format!("from {}  ·  {}", e.source_name(), ago(e.when)))
+            .title_lines(1)
+            .subtitle_lines(1)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name(match e.outcome {
+            history::Outcome::Complete => "object-select-symbolic",
+            history::Outcome::Failed => "dialog-error-symbolic",
+        }));
+        if e.output_exists() {
+            let open = shell::icon_button("folder-open-symbolic", "Open containing folder");
+            let dest = e.destination.clone();
+            open.connect_clicked(move |_| {
+                if let Some(parent) = dest.parent() {
+                    let uri = gio::File::for_path(parent).uri();
+                    let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                }
+            });
+            row.add_suffix(&open);
+        }
+        ui.watchdog_recent.append(&row);
+    }
 }
 
 /// Start or stop watching the folder that automatic mode reads.
@@ -4295,6 +4397,7 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
             });
         }
         refresh_history(&ui);
+        refresh_watchdog_recent(&ui);
         match result {
             Ok(_) => {
                 *ui.watchdog_ready.borrow_mut() = Some(if landed {

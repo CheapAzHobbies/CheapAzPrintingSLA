@@ -55,14 +55,16 @@ const RAIL_WIDTH: i32 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Convert,
+    WatchDog,
     Preview,
     History,
     Settings,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::Convert,
+        Section::WatchDog,
         Section::Preview,
         Section::History,
         Section::Settings,
@@ -71,6 +73,7 @@ impl Section {
     pub fn id(self) -> &'static str {
         match self {
             Section::Convert => "convert",
+            Section::WatchDog => "watchdog",
             Section::Preview => "preview",
             Section::History => "history",
             Section::Settings => "settings",
@@ -80,6 +83,7 @@ impl Section {
     pub fn label(self) -> &'static str {
         match self {
             Section::Convert => "Convert",
+            Section::WatchDog => "WatchDog",
             Section::Preview => "Preview",
             Section::History => "History",
             Section::Settings => "Settings",
@@ -91,6 +95,7 @@ impl Section {
     pub fn icon(self) -> &'static str {
         match self {
             Section::Convert => "media-playlist-repeat-symbolic",
+            Section::WatchDog => "folder-saved-search-symbolic",
             Section::Preview => "view-reveal-symbolic",
             Section::History => "document-open-recent-symbolic",
             Section::Settings => "emblem-system-symbolic",
