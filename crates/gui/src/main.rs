@@ -267,6 +267,9 @@ struct App {
     /// Set while a rebuild is on its way in and its facts should arrive by
     /// fading up rather than simply being there.
     nearby_fade_in: Cell<bool>,
+    /// Which subtitle change is in charge, so a window dragged across the
+    /// step does not leave two of them fighting over one row.
+    nearby_say: Cell<u32>,
     /// Lowercased name and facts for each row, in the same order, so the
     /// search can match what the row shows in columns rather than as text.
     nearby_keys: RefCell<Vec<String>>,
@@ -905,6 +908,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_meta: RefCell::new(Vec::new()),
         nearby_fade: Cell::new(0),
         nearby_fade_in: Cell::new(false),
+        nearby_say: Cell::new(0),
         nearby_keys: RefCell::new(Vec::new()),
         nearby_shown: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
@@ -1441,6 +1445,7 @@ fn wire_responsive(ui: &Rc<App>) {
                 // rather than swapped in one frame.
                 let smooth = ui.settings.borrow().animations;
                 fade_nearby_meta(&ui, smooth);
+                glide_search_width(&ui, smooth);
                 ui.dropzone_formats.set(!narrow, smooth);
             }
         })
@@ -5767,6 +5772,60 @@ const SEARCH_WIDTH: i32 = 190;
 /// And what it grows to when the window has no width to spare.
 const SEARCH_WIDTH_NARROW: i32 = 104;
 
+/// Take the search field to the width its new band calls for.
+///
+/// The field already grows and shrinks when it opens and shuts, but that
+/// animation runs to a target set once at the start. Crossing a width band
+/// with the field already open only changed the target, and a target with no
+/// animation left to run is a snap. This walks the width across instead, so a
+/// window being dragged past the step takes the box with it.
+fn glide_search_width(ui: &Rc<App>, smooth: bool) {
+    let want = if ui.compact.get() {
+        SEARCH_WIDTH_NARROW
+    } else {
+        SEARCH_WIDTH
+    };
+    ui.search_full.set(want);
+    let entry = ui.nearby_search.clone();
+    // Only while it is open and standing still. Shut, or mid-open, the
+    // animation that owns it will pick the new width up on its own.
+    if !ui.search_open.get() || ui.search_moving.get() || !WidgetExt::is_visible(&entry) {
+        return;
+    }
+    let from = entry.width_request();
+    if from == want {
+        return;
+    }
+    if !smooth || from <= 0 {
+        entry.set_size_request(want, -1);
+        return;
+    }
+    let started = std::time::Instant::now();
+    let full = ui.search_full.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        // The target is read each frame, so a second step crossed mid-glide
+        // is arrived at rather than argued with.
+        let to = full.get();
+        let t = (started.elapsed().as_millis() as f64 / SEARCH_STEP_MS).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        let at = from + ((to - from) as f64 * eased).round() as i32;
+        entry.set_size_request(at, -1);
+        entry.set_placeholder_text(if at < SEARCH_HINT_MIN {
+            None
+        } else {
+            Some(SEARCH_HINT)
+        });
+        if t >= 1.0 {
+            entry.set_size_request(to, -1);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// How long the field takes to change width when the window crosses a step.
+const SEARCH_STEP_MS: f64 = 200.0;
+
 /// Open or shut the search field.
 ///
 /// The box fades in first, at a width of almost nothing, and then widens.
@@ -5870,9 +5929,99 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
 /// a convenience for reading the list without opening it, and opening it says
 /// the same thing better.
 fn say_nearby(ui: &Rc<App>, text: &str) {
-    ui.nearby_expander
-        .set_subtitle(if ui.compact.get() { "" } else { text });
+    let want = if ui.compact.get() { "" } else { text }.to_string();
+    let row = ui.nearby_expander.clone();
+    if row.subtitle().as_str() == want {
+        return;
+    }
+    if !ui.settings.borrow().animations {
+        row.set_subtitle(&want);
+        return;
+    }
+
+    let mine = ui.nearby_say.get().wrapping_add(1);
+    ui.nearby_say.set(mine);
+
+    // Which way round the label is looked for matters. Adwaita only builds the
+    // subtitle label once a subtitle has been set, so on the way in there is
+    // nothing to fade until the text is there - and looking first, as the
+    // first attempt did, found nothing and the line simply appeared.
+    if want.is_empty() {
+        let Some(label) = subtitle_label(&row) else {
+            row.set_subtitle("");
+            return;
+        };
+        fade_label(ui, label, false, mine, Some(row));
+    } else {
+        row.set_subtitle(&want);
+        let Some(label) = subtitle_label(&row) else {
+            return;
+        };
+        label.set_opacity(0.0);
+        fade_label(ui, label, true, mine, None);
+    }
 }
+
+/// Take a label's opacity to one or to nothing.
+///
+/// `clear` is the row whose subtitle should be emptied once it has faded out -
+/// the text is only taken away when it can no longer be seen, so what changes
+/// is its presence rather than its wording.
+fn fade_label(
+    ui: &Rc<App>,
+    label: gtk::Label,
+    in_: bool,
+    mine: u32,
+    clear: Option<adw::ExpanderRow>,
+) {
+    let started = std::time::Instant::now();
+    let ui = ui.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        if ui.nearby_say.get() != mine {
+            label.set_opacity(1.0);
+            return glib::ControlFlow::Break;
+        }
+        let t = (started.elapsed().as_millis() as f64 / SAY_FADE_MS).clamp(0.0, 1.0);
+        label.set_opacity(if in_ { t } else { 1.0 - t });
+        if t >= 1.0 {
+            if let Some(row) = &clear {
+                row.set_subtitle("");
+                // Handed back at full strength: the label is Adwaita's, and
+                // the next subtitle to arrive must not inherit this one's
+                // fade.
+                label.set_opacity(1.0);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Walk a row for the label Adwaita draws its subtitle in.
+///
+/// By its style class rather than by position: the header of an expander row
+/// holds a title, a subtitle and whatever has been packed beside them, and
+/// counting children to find one of them is a guess about a layout that is
+/// not ours.
+fn subtitle_label(row: &impl IsA<gtk::Widget>) -> Option<gtk::Label> {
+    let mut waiting: Vec<gtk::Widget> = vec![row.as_ref().clone()];
+    while let Some(w) = waiting.pop() {
+        if let Some(l) = w.downcast_ref::<gtk::Label>() {
+            if l.has_css_class("subtitle") {
+                return Some(l.clone());
+            }
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            waiting.push(c);
+        }
+    }
+    None
+}
+
+/// How long the header line takes to fade away, or to arrive.
+const SAY_FADE_MS: f64 = 140.0;
 
 /// Show only the rows matching what has been typed, and say so.
 ///
