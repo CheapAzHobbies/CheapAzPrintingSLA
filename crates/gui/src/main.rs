@@ -1764,11 +1764,12 @@ fn build_watchdog_page(
     // them keeping the indentation, and the paragraph reached the screen with
     // fourteen spaces between every sentence.
     let what = [
-        "Leave this on and you can forget about it.",
         "WatchDog watches one folder.",
         "When your slicer saves a new file there, it converts the file to your printer's format",
         "and puts the result where you say - a USB stick, or any folder on this computer.",
         "Nothing to open, nothing to press.",
+        "It forgets the folder when you close the app, so it never starts watching on its own -",
+        "leave the app open for as long as you want it working.",
     ]
     .join(" ");
     let what = gtk::Label::builder().label(&what).xalign(0.0).build();

@@ -68,8 +68,17 @@ pub struct Settings {
     /// Off by default, and deliberately so. This is the one thing here that
     /// acts on its own, and a thing that acts on its own should be something
     /// somebody turned on rather than something they inherited.
+    ///
+    /// This and the four fields under it are the only settings in this struct
+    /// that are never written to disk. Everything else here is a preference
+    /// and is remembered; these five are an arrangement pointed at somebody's
+    /// files, and one of those should last exactly as long as the window it
+    /// was set up in. Opening a program should not be the act that starts it
+    /// reading a folder - not even a folder you named yesterday and have since
+    /// forgotten you named. So they load as nothing, every time, and the
+    /// person says where to look while they are sitting there.
     pub auto_convert: bool,
-    /// The folder being watched.
+    /// The folder being watched. Session-only; see `auto_convert`.
     pub auto_watch_dir: Option<PathBuf>,
     /// What to convert to.
     pub auto_to_format: String,
@@ -243,7 +252,16 @@ impl Settings {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        let map = parse(&text);
+        Self::from_text(&text)
+    }
+
+    /// Read settings out of the text of a settings file.
+    ///
+    /// Split from `load` so what a saved file does and does not carry can be
+    /// tested without a home directory to write into - which matters most for
+    /// the settings that are deliberately not carried at all.
+    pub fn from_text(text: &str) -> Self {
+        let map = parse(text);
         let mut s = Self::default();
         if let Some(v) = map.get("warn_on_information_loss") {
             s.warn_on_information_loss = v == "true";
@@ -297,25 +315,10 @@ impl Settings {
                 }
             }
         }
-        if let Some(v) = map.get("auto_convert") {
-            s.auto_convert = v == "true";
-        }
-        if let Some(v) = map.get("auto_watch_dir") {
-            s.auto_watch_dir = (!v.is_empty()).then(|| PathBuf::from(v));
-        }
         if let Some(v) = map.get("auto_to_format") {
             if !v.is_empty() {
                 s.auto_to_format = v.to_string();
             }
-        }
-        if let Some(v) = map.get("auto_target_dir") {
-            s.auto_target_dir = (!v.is_empty()).then(|| PathBuf::from(v));
-        }
-        if let Some(v) = map.get("auto_target_uuid") {
-            s.auto_target_uuid = (!v.is_empty()).then(|| v.to_string());
-        }
-        if let Some(v) = map.get("auto_target_label") {
-            s.auto_target_label = (!v.is_empty()).then(|| v.to_string());
         }
         if let Some(v) = map.get("auto_staging") {
             if !v.is_empty() {
@@ -432,6 +435,11 @@ impl Settings {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        std::fs::write(path, self.to_text())
+    }
+
+    /// The text a settings file is made of.
+    pub fn to_text(&self) -> String {
         let recent = self
             .recent_output_dirs
             .iter()
@@ -462,12 +470,7 @@ impl Settings {
              quick_access_limit = {}\n\
              follow_drive = {}\n\
              sort_drive_on_eject = {}\n\
-             auto_convert = {}\n\
-             auto_watch_dir = {}\n\
              auto_to_format = {}\n\
-             auto_target_dir = {}\n\
-             auto_target_uuid = {}\n\
-             auto_target_label = {}\n\
              auto_staging = {}\n\
              auto_cap_mb = {}\n\
              auto_keep_days = {}\n\
@@ -514,18 +517,7 @@ impl Settings {
             self.quick_access_limit,
             self.follow_drive,
             self.sort_drive_on_eject,
-            self.auto_convert,
-            self.auto_watch_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
             self.auto_to_format,
-            self.auto_target_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            self.auto_target_uuid.clone().unwrap_or_default(),
-            self.auto_target_label.clone().unwrap_or_default(),
             self.auto_staging,
             self.auto_cap_mb,
             self.auto_keep_days,
@@ -541,7 +533,7 @@ impl Settings {
                 .unwrap_or_default(),
             self.startup_output_format.clone().unwrap_or_default(),
         );
-        std::fs::write(path, body)
+        body
     }
 
     /// Record a folder as most recently used.
@@ -608,6 +600,50 @@ fn parse(text: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_never_arms_itself_from_a_saved_file() {
+        // The point of the whole arrangement: opening the program is not the
+        // act that starts it reading somebody's folder.
+        let mut s = Settings::default();
+        s.auto_convert = true;
+        s.auto_watch_dir = Some(PathBuf::from("/home/somebody/Downloads"));
+        s.auto_target_dir = Some(PathBuf::from("/home/somebody/Sticks"));
+        s.auto_target_uuid = Some("1234-ABCD".into());
+        s.auto_target_label = Some("SATURN".into());
+        s.auto_to_format = "ctb".into();
+        s.auto_cap_mb = 4096;
+
+        let back = Settings::from_text(&s.to_text());
+        assert!(!back.auto_convert, "WatchDog must start off");
+        assert_eq!(back.auto_watch_dir, None, "no folder is inherited");
+        assert_eq!(back.auto_target_dir, None);
+        assert_eq!(back.auto_target_uuid, None);
+        assert_eq!(back.auto_target_label, None);
+
+        // The preferences around it are still preferences, and are kept.
+        assert_eq!(back.auto_to_format, "ctb");
+        assert_eq!(back.auto_cap_mb, 4096);
+    }
+
+    #[test]
+    fn a_settings_file_written_before_this_still_arms_nothing() {
+        // Files saved by earlier versions have the keys in them, and a folder
+        // named months ago is exactly the folder somebody has forgotten they
+        // named. Present but ignored.
+        let s = Settings::from_text(
+            "auto_convert = true\n\
+             auto_watch_dir = /home/somebody/Downloads\n\
+             auto_target_dir = /home/somebody/Downloads\n\
+             auto_target_label = Downloads\n\
+             auto_to_format = goo\n",
+        );
+        assert!(!s.auto_convert);
+        assert_eq!(s.auto_watch_dir, None);
+        assert_eq!(s.auto_target_dir, None);
+        assert_eq!(s.auto_target_label, None);
+        assert_eq!(s.auto_to_format, "goo", "but the format is still read");
+    }
 
     #[test]
     fn defaults_warn_before_dropping_information() {

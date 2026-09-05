@@ -106,7 +106,7 @@ struct Step {
     icon: gtk::Image,
     cross: gtk::DrawingArea,
     label: gtk::Label,
-    note: Note,
+    note: Rc<Note>,
 }
 
 /// Two strokes, struck corner to corner over a stop's icon.
@@ -173,6 +173,9 @@ struct Note {
     second: gtk::Label,
     labels: [gtk::Label; 2],
     sliding: Rc<Cell<bool>>,
+    /// Whether there is more of this line than its column will hold. Set when
+    /// the text changes, read when the pointer arrives.
+    overflows: Cell<bool>,
     /// Shared with the chain, so a change of width is one write rather than
     /// one per stop.
     room: Rc<Cell<i32>>,
@@ -189,17 +192,15 @@ impl Note {
     fn new(room: Rc<Cell<i32>>, allowed: Rc<Cell<bool>>, slides: bool) -> Self {
         let first = gtk::Label::builder().label("").build();
         let second = gtk::Label::builder().label("").build();
-        // Cut short where the line does not slide, and left whole where it
-        // does. An ellipsised label inside the marquee gets squeezed to share
-        // the view with its second copy, and two four-character stubs is not a
-        // name being read - it is a name being destroyed twice. The column
-        // cannot grow either way: the scrolled window's content width is
-        // pinned at both ends below.
-        if !slides {
-            for l in [&first, &second] {
-                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                l.set_width_chars(0);
-            }
+        // Cut short at rest, whole while sliding. The ellipsis is the thing
+        // that says a name is longer than the space, so it earns its place
+        // whenever the line is standing still; it is dropped only while the
+        // line is actually moving, when the whole name is being shown anyway.
+        // The column cannot grow either way: the scrolled window's content
+        // width is pinned at both ends below.
+        for l in [&first, &second] {
+            l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            l.set_width_chars(0);
         }
         for l in [&first, &second] {
             l.add_css_class("caption");
@@ -237,6 +238,7 @@ impl Note {
             first,
             second,
             sliding: Rc::new(Cell::new(false)),
+            overflows: Cell::new(false),
             room,
             slides,
             allowed,
@@ -249,6 +251,11 @@ impl Note {
         self.apply();
     }
 
+    /// Put the line back where it started and let the ellipsis say the rest.
+    fn stop_sliding(&self) {
+        self.sliding.set(false);
+    }
+
     /// Put the line on screen, or not, according to what it says and whether
     /// there is room for it at this window width.
     fn apply(&self) {
@@ -258,13 +265,14 @@ impl Note {
         // it, and the chain shuffles sideways every time a stop gains or loses
         // a caption - which is the row moving to report that nothing moved.
         if !self.allowed.get() {
-            self.sliding.set(false);
+            self.stop_sliding();
             self.view.set_visible(false);
             return;
         }
         self.view.set_visible(true);
         if text.is_empty() {
-            self.sliding.set(false);
+            self.stop_sliding();
+            self.overflows.set(false);
             self.first.set_text("");
             self.second.set_text("");
             self.second.set_visible(false);
@@ -274,31 +282,52 @@ impl Note {
         if self.first.text() == text {
             return;
         }
-        self.sliding.set(false);
+        self.stop_sliding();
         self.first.set_text(text);
         self.second.set_text(text);
         self.view.hadjustment().set_value(0.0);
 
-        // Only what does not fit gets to move, and only where moving is what
-        // this stop does. A name that is already readable sliding about would
-        // be motion carrying no information.
+        // Whether it could slide, not whether it will. Only a line too long
+        // for its column has anything to gain by moving, and even then it
+        // waits to be asked - see `start_sliding`.
         let wanted = self.first.measure(gtk::Orientation::Horizontal, -1).1;
-        if !self.slides || wanted <= self.room.get() {
-            self.second.set_visible(false);
-            self.first.set_halign(gtk::Align::Center);
+        self.overflows.set(self.slides && wanted > self.room.get());
+        self.first.set_halign(if self.overflows.get() {
+            gtk::Align::Start
+        } else {
+            gtk::Align::Center
+        });
+    }
+
+    /// Start the line moving, if there is more of it than fits.
+    ///
+    /// Asked for by the pointer arriving over the stop, rather than done the
+    /// moment a long name turns up. Four captions setting off on their own the
+    /// instant a file is found is a row of things wriggling, and a chain whose
+    /// whole job is to be glanced at should be still when it is only being
+    /// glanced at. Hovering is the reader saying they want to read it, and
+    /// that is when it is worth moving.
+    fn start_sliding(&self) {
+        if !self.overflows.get() || !self.view.is_visible() || self.sliding.replace(true) {
             return;
         }
-        self.first.set_halign(gtk::Align::Start);
+        // The ellipsis is what says "there is more of this". It goes while the
+        // line is moving, because the whole of it is being shown, and comes
+        // back when it stops.
+        self.first.set_ellipsize(gtk::pango::EllipsizeMode::None);
+        self.second.set_ellipsize(gtk::pango::EllipsizeMode::None);
         self.second.set_visible(true);
-        self.sliding.set(true);
 
         let sliding = self.sliding.clone();
         let adj = self.view.hadjustment();
         let lead = self.first.clone();
+        let first = self.first.clone();
         let second = self.second.clone();
         let last: Cell<Option<i64>> = Cell::new(None);
         self.view.add_tick_callback(move |_, clock| {
             if !sliding.get() {
+                first.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                second.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 second.set_visible(false);
                 adj.set_value(0.0);
                 return glib::ControlFlow::Break;
@@ -440,7 +469,7 @@ impl Steps {
             // drive are names too, and a name cut short is the half of it you
             // cannot check. Only what overflows moves - a caption that already
             // fits stays still.
-            let note = Note::new(room.clone(), notes_allowed.clone(), true);
+            let note = Rc::new(Note::new(room.clone(), notes_allowed.clone(), true));
             column.append(&note.view);
 
             let button = gtk::Button::builder()
@@ -453,6 +482,26 @@ impl Steps {
             // not light up under the pointer as though it would.
             button.set_can_target(false);
             button.set_can_focus(false);
+
+            // The pointer arriving anywhere over the stop is what sets its
+            // second line moving, if there is more of it than fits. The whole
+            // stop rather than the line itself, because the line is the part
+            // of the stop too small to aim at - which is the same reason it
+            // needed sliding.
+            //
+            // On the column rather than the button: a stop with nothing
+            // attached to it has `can_target` off, and a widget that cannot be
+            // targeted never hears the pointer. Reading a name is not the same
+            // as pressing the thing it is written on, and it should not need
+            // the stop to be pressable.
+            {
+                let hover = gtk::EventControllerMotion::new();
+                let enter = note.clone();
+                hover.connect_enter(move |_, _, _| enter.start_sliding());
+                let leave = note.clone();
+                hover.connect_leave(move |_| leave.stop_sliding());
+                column.add_controller(hover);
+            }
 
             row.append(&button);
             steps.push(Step {
