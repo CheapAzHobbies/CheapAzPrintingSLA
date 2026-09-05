@@ -785,13 +785,29 @@ pub fn set_tooltip_deep(widget: &impl IsA<gtk::Widget>, text: &str) {
 
 /// Status shown as an icon and a word, never colour alone (§15).
 pub fn status_chip(icon: &str, text: &str, class: &str) -> gtk::Box {
+    chip_with_words(icon, text, class, true)
+}
+
+/// The same, with the option of dropping the word.
+///
+/// At narrow widths the word costs about fifty pixels and the symbol says the
+/// same thing: a green tick is ready, a red cross is failed, an amber triangle
+/// is worth reading. Those fifty pixels are the difference between a file name
+/// you can read and one cut to four letters, and the name is the thing the row
+/// is there to show. The word survives as the tooltip, so nothing is lost -
+/// it just has to be asked for.
+pub fn chip_with_words(icon: &str, text: &str, class: &str, words: bool) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
     let i = gtk::Image::from_icon_name(icon);
     i.add_css_class(class);
-    let l = gtk::Label::new(Some(text));
-    l.add_css_class(class);
-    l.add_css_class("caption");
     b.append(&i);
-    b.append(&l);
+    if words {
+        let l = gtk::Label::new(Some(text));
+        l.add_css_class(class);
+        l.add_css_class("caption");
+        b.append(&l);
+    } else {
+        b.set_tooltip_text(Some(text));
+    }
     b
 }

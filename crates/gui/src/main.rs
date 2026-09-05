@@ -71,7 +71,7 @@ enum Status {
 }
 
 impl Status {
-    fn chip(&self) -> gtk::Widget {
+    fn chip(&self, words: bool) -> gtk::Widget {
         match self {
             Status::Reading => {
                 let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
@@ -85,10 +85,11 @@ impl Status {
                 b.upcast()
             }
             Status::Ready => {
-                shell::status_chip("object-select-symbolic", "Ready", "cz-ok").upcast()
+                shell::chip_with_words("object-select-symbolic", "Ready", "cz-ok", words).upcast()
             }
             Status::Warning(_) => {
-                shell::status_chip("dialog-warning-symbolic", "Warning", "cz-warn").upcast()
+                shell::chip_with_words("dialog-warning-symbolic", "Warning", "cz-warn", words)
+                    .upcast()
             }
             Status::Converting => {
                 let b = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
@@ -101,10 +102,12 @@ impl Status {
                 b.upcast()
             }
             Status::Complete(_) => {
-                shell::status_chip("object-select-symbolic", "Complete", "cz-ok").upcast()
+                shell::chip_with_words("object-select-symbolic", "Complete", "cz-ok", words)
+                    .upcast()
             }
             Status::Failed(_) => {
-                shell::status_chip("dialog-error-symbolic", "Failed", "cz-error").upcast()
+                shell::chip_with_words("dialog-error-symbolic", "Failed", "cz-error", words)
+                    .upcast()
             }
         }
     }
@@ -5476,7 +5479,7 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
         if in_columns {
             let name = marquee(&name);
             name.set_margin_start(theme::SPACE_2);
-            marquee_auto(&name);
+            marquee_on_hover(&name, &row);
             row.add_prefix(&name);
         } else {
             row.set_title(&name);
@@ -6145,8 +6148,6 @@ fn refresh_input_label(ui: &Rc<App>) {
 /// the end of one pass and the start of the next.
 const MARQUEE_SPEED: f64 = 46.0;
 const MARQUEE_GAP: i32 = 48;
-/// How often a name is re-asked whether it still fits.
-const MARQUEE_CHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A name that slides itself past a fixed width while the pointer is over it.
 ///
@@ -6205,20 +6206,19 @@ fn marquee_train(view: &gtk::ScrolledWindow) -> Option<gtk::Box> {
     }
 }
 
-/// Slide the name in `view` whenever it is too long for the room it has.
+/// Slide the name in `view` while the pointer is over `over`, if there is more
+/// of it than fits.
 ///
-/// Not on hover, and not only when the window is narrow. A name gets cut short
-/// at whatever width the row happens to have, the widest included, and a row
-/// that will only tell you what it says once you have found it and pointed at
-/// it has hidden the answer behind a gesture. If it does not fit, it moves.
+/// On hover rather than on its own. A list of names all sliding at once is a
+/// page of things wriggling, and most of the time you are looking for one row
+/// rather than reading every row - the ellipsis is enough to say a name has
+/// been cut. Hovering is the reader saying they want the rest of it, and that
+/// is the moment it is worth moving.
 ///
-/// Only if it does not fit: a name with room to spare sits still, because
-/// movement carrying no information is noise.
-///
-/// Whether it fits is asked a couple of times a second rather than once. A
-/// name that fits at one window width does not at another, and these rows are
-/// rebuilt when the layout changes bands, not for every pixel of a drag.
-fn marquee_auto(view: &gtk::ScrolledWindow) {
+/// The trigger is the whole row rather than the name itself, because the name
+/// is the part of the row too small to aim at - which is the same reason it
+/// needed sliding.
+fn marquee_on_hover(view: &gtk::ScrolledWindow, over: &impl IsA<gtk::Widget>) {
     let Some(train) = marquee_train(view) else {
         return;
     };
@@ -6250,13 +6250,13 @@ fn marquee_auto(view: &gtk::ScrolledWindow) {
         let second = second.clone();
         let running = running.clone();
         move || {
-            if running.replace(true) {
+            // Nothing to slide if the whole name is already on screen. The
+            // natural width is the whole name; ellipsising only lowers what
+            // the label will settle for, not what it wants.
+            let wanted = first.measure(gtk::Orientation::Horizontal, -1).1;
+            if wanted <= view.width() || running.replace(true) {
                 return;
             }
-            // The ellipsis goes, a second copy appears behind the first, and
-            // the pair slides by exactly one copy's width before starting
-            // again - so the loop has no rewind in it and the name can be read
-            // round and round without waiting.
             first.set_ellipsize(gtk::pango::EllipsizeMode::None);
             second.set_visible(true);
 
@@ -6292,30 +6292,10 @@ fn marquee_auto(view: &gtk::ScrolledWindow) {
         }
     };
 
-    // A weak handle, so the row being taken out of the list is what ends this
-    // rather than the timer being what keeps the row alive.
-    let weak = view.downgrade();
-    let lead = first.clone();
-    glib::timeout_add_local(MARQUEE_CHECK, move || {
-        let Some(view) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        let width = view.width();
-        // Off screen, or not laid out yet. Nothing to measure against, and
-        // sliding a row nobody is looking at is work for its own sake.
-        if width == 0 || !view.is_mapped() {
-            stop();
-            return glib::ControlFlow::Continue;
-        }
-        // The natural width is the whole name; ellipsising only lowers what
-        // the label will settle for, not what it wants.
-        if lead.measure(gtk::Orientation::Horizontal, -1).1 > width {
-            start();
-        } else {
-            stop();
-        }
-        glib::ControlFlow::Continue
-    });
+    let hover = gtk::EventControllerMotion::new();
+    hover.connect_enter(move |_, _, _| start());
+    hover.connect_leave(move |_| stop());
+    over.as_ref().add_controller(hover);
 }
 
 /// The list of formats the selected file can be read as (§21).
@@ -6581,10 +6561,14 @@ fn refresh_queue(ui: &Rc<App>) {
         // to be behind a Details button next to it, which is a second control
         // saying the same thing as the first: "Failed" is already the thing
         // you want to know more about, so it is the thing to press.
+        // Narrow, the symbol carries the status on its own and the word is
+        // moved to the tooltip. The row's width is spent on the file name
+        // instead, which is what it is there to show.
+        let words = !ui.compact.get();
         let chip = if f.changed_since {
-            shell::status_chip("document-edit-symbolic", "Edited", "cz-warn").upcast()
+            shell::chip_with_words("document-edit-symbolic", "Edited", "cz-warn", words).upcast()
         } else {
-            f.status.chip()
+            f.status.chip(words)
         };
         let detail = match f.status {
             Status::Failed(_) | Status::Warning(_) => f.status.detail(),
@@ -6635,7 +6619,7 @@ fn refresh_queue(ui: &Rc<App>) {
         remove.connect_clicked(move |_| remove_file(&ui2, &path));
         row.append(&remove);
 
-        marquee_auto(&name);
+        marquee_on_hover(&name, &row);
         let list_row = gtk::ListBoxRow::builder().child(&row).build();
         ui.queue_list.append(&list_row);
         if i == selected {

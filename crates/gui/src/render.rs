@@ -235,8 +235,13 @@ pub fn human_age(t: std::time::SystemTime) -> String {
 /// The same age in as few characters as it can be said in.
 ///
 /// For the narrow window, where the row has given up the format, the size and
-/// the folder and the age is the only thing left. "2 hours ago" is a sentence;
-/// this is a stamp, and at that width a stamp is what there is room for.
+/// the folder, and the age is the only thing left. "2 hours ago" is a
+/// sentence; this is a stamp, and at that width a stamp is what there is room
+/// for.
+///
+/// It does keep the "ago". "16hr" alone is a duration and could as easily be
+/// how long something took as how long since it happened, and the whole point
+/// of the column is which of the files in it is the recent one.
 pub fn short_age(t: std::time::SystemTime) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(t)
@@ -244,14 +249,14 @@ pub fn short_age(t: std::time::SystemTime) -> String {
         .unwrap_or(0);
     match secs {
         0..=59 => "now".to_string(),
-        60..=3_599 => format!("{}min", secs / 60),
-        3_600..=86_399 => format!("{}hr", secs / 3_600),
-        86_400..=604_799 => format!("{}d", secs / 86_400),
+        60..=3_599 => format!("{}min ago", secs / 60),
+        3_600..=86_399 => format!("{}hr ago", secs / 3_600),
+        86_400..=604_799 => format!("{}d ago", secs / 86_400),
         // Four weeks, not a month: weeks are what a week-based count can
         // divide into honestly.
-        604_800..=2_419_199 => format!("{}w", secs / 604_800),
-        2_419_200..=31_535_999 => format!("{}mo", secs / 2_592_000),
-        _ => format!("{}y", secs / 31_536_000),
+        604_800..=2_419_199 => format!("{}w ago", secs / 604_800),
+        2_419_200..=31_535_999 => format!("{}mo ago", secs / 2_592_000),
+        _ => format!("{}y ago", secs / 31_536_000),
     }
 }
 
@@ -273,12 +278,12 @@ mod tests {
         use std::time::{Duration, SystemTime};
         let ago = |d: Duration| short_age(SystemTime::now() - d);
         assert_eq!(ago(Duration::from_secs(5)), "now");
-        assert_eq!(ago(Duration::from_secs(600)), "10min");
-        assert_eq!(ago(Duration::from_secs(6 * 3600)), "6hr");
-        assert_eq!(ago(Duration::from_secs(86_400)), "1d");
-        assert_eq!(ago(Duration::from_secs(7 * 86_400)), "1w");
-        assert_eq!(ago(Duration::from_secs(60 * 86_400)), "2mo");
-        assert_eq!(ago(Duration::from_secs(400 * 86_400)), "1y");
+        assert_eq!(ago(Duration::from_secs(600)), "10min ago");
+        assert_eq!(ago(Duration::from_secs(6 * 3600)), "6hr ago");
+        assert_eq!(ago(Duration::from_secs(86_400)), "1d ago");
+        assert_eq!(ago(Duration::from_secs(7 * 86_400)), "1w ago");
+        assert_eq!(ago(Duration::from_secs(60 * 86_400)), "2mo ago");
+        assert_eq!(ago(Duration::from_secs(400 * 86_400)), "1y ago");
     }
 
     #[test]
