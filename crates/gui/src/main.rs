@@ -270,6 +270,17 @@ struct App {
     /// Which subtitle change is in charge, so a window dragged across the
     /// step does not leave two of them fighting over one row.
     nearby_say: Cell<u32>,
+    /// Whether the header line is currently put away, and how big it was when
+    /// it was not.
+    nearby_said_hidden: Cell<bool>,
+    nearby_said_size: Cell<(i32, i32)>,
+    /// The parts of a queue row that get out of the way when the window
+    /// narrows, and how wide each is when it is not. Held so they can be
+    /// walked to nothing and back rather than appearing and disappearing -
+    /// which is what lets everything to their right slide instead of jump.
+    queue_collapse: RefCell<Vec<(gtk::Widget, i32)>>,
+    /// Which collapse is in charge.
+    queue_collapse_gen: Cell<u32>,
     /// Lowercased name and facts for each row, in the same order, so the
     /// search can match what the row shows in columns rather than as text.
     nearby_keys: RefCell<Vec<String>>,
@@ -909,6 +920,10 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_fade: Cell::new(0),
         nearby_fade_in: Cell::new(false),
         nearby_say: Cell::new(0),
+        nearby_said_hidden: Cell::new(false),
+        nearby_said_size: Cell::new((0, 0)),
+        queue_collapse: RefCell::new(Vec::new()),
+        queue_collapse_gen: Cell::new(0),
         nearby_keys: RefCell::new(Vec::new()),
         nearby_shown: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
@@ -1437,9 +1452,12 @@ fn wire_responsive(ui: &Rc<App>) {
             }
             if ui.compact.get() != narrow {
                 ui.compact.set(narrow);
-                if !ui.files.borrow().is_empty() {
-                    refresh_queue(&ui);
-                }
+                // Walked rather than rebuilt. Rebuilding puts the row into its
+                // new shape in one frame, which is the jump; the columns are
+                // still there and can simply be asked to leave.
+                let smooth = ui.settings.borrow().animations;
+                collapse_queue(&ui, narrow, smooth);
+                refresh_input_label(&ui);
                 // The Quick Access rows give up their columns at the same
                 // width the queue rows do, and are faded across the change
                 // rather than swapped in one frame.
@@ -5929,72 +5947,82 @@ fn open_nearby_search(ui: &Rc<App>, open: bool) {
 /// a convenience for reading the list without opening it, and opening it says
 /// the same thing better.
 fn say_nearby(ui: &Rc<App>, text: &str) {
-    let want = if ui.compact.get() { "" } else { text }.to_string();
     let row = ui.nearby_expander.clone();
-    if row.subtitle().as_str() == want {
+    // The words are always carried. Whether they are shown is a separate
+    // question, and keeping the label means it can be shrunk rather than
+    // taken away - which is what lets "Quick Access" travel. Clearing the
+    // subtitle, as this used to, moves the title from the top of a two-line
+    // row to the middle of a one-line row in a single frame, and that jump is
+    // the thing being complained about: the line fading was fine, the title
+    // arriving somewhere else was not.
+    if row.subtitle().as_str() != text {
+        row.set_subtitle(text);
+    }
+    let hide = ui.compact.get();
+    if ui.nearby_said_hidden.get() == hide {
         return;
     }
-    if !ui.settings.borrow().animations {
-        row.set_subtitle(&want);
+    ui.nearby_said_hidden.set(hide);
+    let Some(label) = subtitle_label(&row) else {
         return;
-    }
+    };
 
+    // Measured while it can be measured. A label held at no size has no
+    // natural size left to ask for, so the way back has to remember.
+    let (full_w, full_h) = if hide {
+        let size = (natural_width(&label), natural_height(&label));
+        ui.nearby_said_size.set(size);
+        size
+    } else {
+        let remembered = ui.nearby_said_size.get();
+        if remembered.1 > 0 {
+            remembered
+        } else {
+            (natural_width(&label), natural_height(&label))
+        }
+    };
     let mine = ui.nearby_say.get().wrapping_add(1);
     ui.nearby_say.set(mine);
 
-    // Which way round the label is looked for matters. Adwaita only builds the
-    // subtitle label once a subtitle has been set, so on the way in there is
-    // nothing to fade until the text is there - and looking first, as the
-    // first attempt did, found nothing and the line simply appeared.
-    if want.is_empty() {
-        let Some(label) = subtitle_label(&row) else {
-            row.set_subtitle("");
-            return;
-        };
-        fade_label(ui, label, false, mine, Some(row));
-    } else {
-        row.set_subtitle(&want);
-        let Some(label) = subtitle_label(&row) else {
-            return;
-        };
-        label.set_opacity(0.0);
-        fade_label(ui, label, true, mine, None);
+    if !ui.settings.borrow().animations {
+        label.set_opacity(if hide { 0.0 } else { 1.0 });
+        label.set_size_request(if hide { 0 } else { -1 }, if hide { 0 } else { -1 });
+        return;
     }
-}
-
-/// Take a label's opacity to one or to nothing.
-///
-/// `clear` is the row whose subtitle should be emptied once it has faded out -
-/// the text is only taken away when it can no longer be seen, so what changes
-/// is its presence rather than its wording.
-fn fade_label(
-    ui: &Rc<App>,
-    label: gtk::Label,
-    in_: bool,
-    mine: u32,
-    clear: Option<adw::ExpanderRow>,
-) {
     let started = std::time::Instant::now();
     let ui = ui.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
         if ui.nearby_say.get() != mine {
-            label.set_opacity(1.0);
             return glib::ControlFlow::Break;
         }
         let t = (started.elapsed().as_millis() as f64 / SAY_FADE_MS).clamp(0.0, 1.0);
-        label.set_opacity(if in_ { t } else { 1.0 - t });
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        let gone = if hide { eased } else { 1.0 - eased };
+        // The words go a little ahead of the space they were in, so what
+        // closes up is a gap rather than a line of text being crushed.
+        label.set_opacity(if hide {
+            (1.0 - t * 1.6).clamp(0.0, 1.0)
+        } else {
+            ((t - 0.3) / 0.7).clamp(0.0, 1.0)
+        });
+        label.set_size_request(
+            (full_w as f64 * (1.0 - gone)).round() as i32,
+            (full_h as f64 * (1.0 - gone)).round() as i32,
+        );
         if t >= 1.0 {
-            if let Some(row) = &clear {
-                row.set_subtitle("");
-                // Handed back at full strength: the label is Adwaita's, and
-                // the next subtitle to arrive must not inherit this one's
-                // fade.
-                label.set_opacity(1.0);
-            }
+            // Released on the way back, so a longer count later is not held to
+            // the size this one happened to have.
+            label.set_size_request(if hide { 0 } else { -1 }, if hide { 0 } else { -1 });
+            label.set_opacity(if hide { 0.0 } else { 1.0 });
             return glib::ControlFlow::Break;
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// How tall a widget is when nothing is squeezing it.
+fn natural_height(w: &impl IsA<gtk::Widget>) -> i32 {
+    w.as_ref().measure(gtk::Orientation::Vertical, -1).1
 }
 
 /// Walk a row for the label Adwaita draws its subtitle in.
@@ -6021,7 +6049,7 @@ fn subtitle_label(row: &impl IsA<gtk::Widget>) -> Option<gtk::Label> {
 }
 
 /// How long the header line takes to fade away, or to arrive.
-const SAY_FADE_MS: f64 = 140.0;
+const SAY_FADE_MS: f64 = 190.0;
 
 /// Show only the rows matching what has been typed, and say so.
 ///
@@ -6390,14 +6418,29 @@ fn refresh_input_label(ui: &Rc<App>) {
         Some(f) if f.forced_format.is_some() => {
             f.forced_format.clone().unwrap_or_default().to_uppercase()
         }
-        Some(f) if !f.format.is_empty() => {
-            format!("{} (Detect Automatically)", f.format.to_uppercase())
-        }
+        // Narrow, the same thing in one word. "GOO (Detect Automatic..." is
+        // the phrase being cut off mid-word to say something the short form
+        // says whole, and the menu behind the control spells it out in full
+        // for anyone who wants the longer version.
+        Some(f) if !f.format.is_empty() => format!(
+            "{} ({})",
+            f.format.to_uppercase(),
+            if ui.compact.get() {
+                "Auto"
+            } else {
+                "Detect Automatically"
+            }
+        ),
         // A file that has not been read yet, or could not be. It still has a
         // setting, and "—" alone said nothing about what that setting was -
         // the row looked the same whether the format was being worked out or
         // had been chosen by hand.
-        Some(f) if f.forced_format.is_none() => "Detect Automatically".to_string(),
+        Some(f) if f.forced_format.is_none() => if ui.compact.get() {
+            "Auto"
+        } else {
+            "Detect Automatically"
+        }
+        .to_string(),
         _ => "—".to_string(),
     };
     ui.input_label.set_text(&text);
@@ -6555,6 +6598,86 @@ fn marquee_on_hover(view: &gtk::ScrolledWindow, over: &impl IsA<gtk::Widget>) {
     hover.connect_enter(move |_, _, _| start());
     hover.connect_leave(move |_| stop());
     over.as_ref().add_controller(hover);
+}
+
+/// How wide a widget is when nothing is squeezing it.
+fn natural_width(w: &impl IsA<gtk::Widget>) -> i32 {
+    w.as_ref().measure(gtk::Orientation::Horizontal, -1).1
+}
+
+/// How long a queue row takes to give up its columns, or take them back.
+const COLLAPSE_MS: f64 = 200.0;
+
+/// Walk the parts of every queue row that give way to nothing, or back.
+///
+/// Width rather than visibility. A widget that stops existing takes its space
+/// with it in one frame and everything to its right jumps into the gap; a
+/// widget walked to no width takes the same space away over a fifth of a
+/// second, and the tick and the close button to its right travel rather than
+/// teleport. That travel is the whole point - it is what says the row gave
+/// something up, rather than that a different row appeared.
+fn collapse_queue(ui: &Rc<App>, away: bool, smooth: bool) {
+    let parts: Vec<(gtk::Widget, i32)> = ui.queue_collapse.borrow().clone();
+    if parts.is_empty() {
+        return;
+    }
+    let mine = ui.queue_collapse_gen.get().wrapping_add(1);
+    ui.queue_collapse_gen.set(mine);
+
+    if !smooth {
+        for (w, full) in &parts {
+            w.set_size_request(if away { 0 } else { *full }, -1);
+            w.set_opacity(if away { 0.0 } else { 1.0 });
+            w.set_visible(!away);
+        }
+        return;
+    }
+
+    if !away {
+        // Coming back, they have to be there before they can grow.
+        for (w, _) in &parts {
+            w.set_visible(true);
+        }
+    }
+    let from: Vec<i32> = parts
+        .iter()
+        .map(|(w, full)| {
+            let at = w.width_request();
+            if at >= 0 {
+                at
+            } else {
+                *full
+            }
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let ui = ui.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        if ui.queue_collapse_gen.get() != mine {
+            return glib::ControlFlow::Break;
+        }
+        let t = (started.elapsed().as_millis() as f64 / COLLAPSE_MS).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        for (i, (w, full)) in parts.iter().enumerate() {
+            let to = if away { 0 } else { *full };
+            let at = from[i] + ((to - from[i]) as f64 * eased).round() as i32;
+            w.set_size_request(at, -1);
+            // The words go before the width does, so what shrinks is a gap
+            // rather than a letter being squeezed.
+            w.set_opacity(if away { 1.0 - t } else { t });
+        }
+        if t >= 1.0 {
+            for (w, full) in &parts {
+                w.set_size_request(if away { 0 } else { *full }, -1);
+                w.set_opacity(if away { 0.0 } else { 1.0 });
+                // Hidden at the end so it stops claiming the row's spacing
+                // too, which no width request can give back.
+                w.set_visible(!away);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// The list of formats the selected file can be read as (§21).
@@ -6732,6 +6855,7 @@ fn read_file(path: &Path, forced: Option<&str>) -> Result<ReadFile, ReadFailure>
 
 fn refresh_queue(ui: &Rc<App>) {
     let selected = *ui.selected.borrow();
+    ui.queue_collapse.borrow_mut().clear();
     while let Some(row) = ui.queue_list.first_child() {
         ui.queue_list.remove(&row);
     }
@@ -6779,7 +6903,6 @@ fn refresh_queue(ui: &Rc<App>) {
             f.format.to_uppercase()
         };
         let conversion = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_1);
-        conversion.set_width_request(if ui.compact.get() { 0 } else { 112 });
         let from_label = gtk::Label::new(Some(&from));
         from_label.add_css_class("cz-dim");
         conversion.append(&from_label);
@@ -6813,27 +6936,31 @@ fn refresh_queue(ui: &Rc<App>) {
         size.add_css_class("cz-value");
         size.set_width_chars(9);
         size.set_xalign(1.0);
-        size.set_visible(!ui.compact.get());
         row.append(&size);
 
         // Full technical text behind the status itself, as §28 asks. It used
         // to be behind a Details button next to it, which is a second control
         // saying the same thing as the first: "Failed" is already the thing
         // you want to know more about, so it is the thing to press.
-        // Narrow, the symbol carries the status on its own and the word is
-        // moved to the tooltip. The row's width is spent on the file name
-        // instead, which is what it is there to show.
-        let words = !ui.compact.get();
+        // The word is always built, and taken away by being walked to no
+        // width at all rather than by not being there. Narrow it is gone and
+        // the symbol carries the status on its own - but it leaves, rather
+        // than simply ceasing to have been there, and everything to its right
+        // slides across as it goes.
         let chip = if f.changed_since {
-            shell::chip_with_words("document-edit-symbolic", "Edited", "cz-warn", words).upcast()
+            shell::chip_with_words("document-edit-symbolic", "Edited", "cz-warn", true).upcast()
         } else {
-            f.status.chip(words)
+            f.status.chip(true)
         };
+        let word = chip
+            .downcast_ref::<gtk::Box>()
+            .and_then(|b| b.last_child())
+            .and_then(|w| w.downcast::<gtk::Label>().ok());
         let detail = match f.status {
             Status::Failed(_) | Status::Warning(_) => f.status.detail(),
             _ => None,
         };
-        let width = if ui.compact.get() { 0 } else { 104 };
+        let width = 104;
         match detail {
             Some(detail) => {
                 let failed = matches!(f.status, Status::Failed(_));
@@ -6878,6 +7005,18 @@ fn refresh_queue(ui: &Rc<App>) {
         remove.connect_clicked(move |_| remove_file(&ui2, &path));
         row.append(&remove);
 
+        // Everything that gives way when the window narrows, with the width
+        // it holds when it does not. Collected here rather than sized in
+        // place, so a change of band can walk them rather than set them.
+        {
+            let mut going = ui.queue_collapse.borrow_mut();
+            going.push((conversion.clone().upcast(), 112));
+            going.push((size.clone().upcast(), natural_width(&size)));
+            if let Some(word) = &word {
+                going.push((word.clone().upcast(), natural_width(word)));
+            }
+        }
+
         marquee_on_hover(&name, &row);
         let list_row = gtk::ListBoxRow::builder().child(&row).build();
         ui.queue_list.append(&list_row);
@@ -6885,6 +7024,10 @@ fn refresh_queue(ui: &Rc<App>) {
             ui.queue_list.select_row(Some(&list_row));
         }
     }
+    // Freshly built rows arrive at their full width; put them straight into
+    // the state this window is already in, with no animation - there is
+    // nothing to animate from.
+    collapse_queue(ui, ui.compact.get(), false);
     revalidate(ui);
 }
 
