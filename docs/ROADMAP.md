@@ -30,11 +30,9 @@ not a roadmap.
 Small, real, and written down so they are not carried around in somebody's
 head.
 
-- **The guide is a blank page.** The About dialog has a "How to use
-  CheapAzSLA" section holding nothing but a note saying it is not written yet
-  because the interface was being reworked. That rework is done: WatchDog is
-  its own section, the milestone chain has settled, and the guide is now
-  writable. It is the one place the program admits to being unfinished.
+- ~~**The guide is a blank page.**~~ Written. Five walkthroughs in a panel
+  on the right, opened from the rail. The blank section in About goes when
+  the two About surfaces below are settled.
 - **Two About surfaces.** There is an About dialog on the rail and an About
   section in Settings, and the Settings one is the better of the two - it
   lists the formats and where the settings file lives, which the dialog does
