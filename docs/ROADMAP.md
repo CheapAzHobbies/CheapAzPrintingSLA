@@ -11,6 +11,9 @@ What is done, what is not, and which formats are worth adding next.
 | 12–13 | GOO: parse and write, SL1 ↔ GOO both directions |
 | 14–17 | Interface, layer preview, batch conversion, history and settings |
 | 18 | Command line, sharing the engine |
+| 19–20 | CTB and PHZ: read and written, verified against real UVtools files |
+| — | UVJ: read and written, verified lossless against UVtools both ways |
+| — | WatchDog: watch a folder, convert what lands in it, deliver where told |
 
 ## Not done
 
@@ -19,10 +22,35 @@ not a roadmap.
 
 | Phase | | Notes |
 |---|---|---|
-| 19 | CTB | Done. Reading verified against real UVtools files v3-v5; writing verified by UVtools reading it back at every real printer resolution. |
-| 20 | PHZ | Done. Read and written, verified against a real file from UVtools. |
 | 21 | Packaging | deb done, with dependencies read from the binary. Flatpak, AppImage, rpm, AUR not started. |
-| 22 | Final polish | Ongoing. |
+| 22 | Final polish | Ongoing. See "Known and not yet fixed" below. |
+
+### Known and not yet fixed
+
+Small, real, and written down so they are not carried around in somebody's
+head.
+
+- **The guide is a blank page.** The About dialog has a "How to use
+  CheapAzSLA" section holding nothing but a note saying it is not written yet
+  because the interface was being reworked. That rework is done: WatchDog is
+  its own section, the milestone chain has settled, and the guide is now
+  writable. It is the one place the program admits to being unfinished.
+- **Two About surfaces.** There is an About dialog on the rail and an About
+  section in Settings, and the Settings one is the better of the two - it
+  lists the formats and where the settings file lives, which the dialog does
+  not. Worth deciding which is the real one rather than maintaining both.
+- **The page runs off the right edge below about 480px.** The chain copes;
+  the rows and the Clear button on the WatchDog page do not. A real window
+  manager will not let a window go below its minimum, so this shows up when
+  tiling into a narrow column.
+
+Built but never run against the hardware, which is a different kind of not
+done:
+
+- **The eject button.** It only appears for a removable drive that is present,
+  so it has never been exercised.
+- **The 0.03 mm exposure profile** (2.1s) is unvalidated, and the bus tilt fix
+  has not been printed.
 
 Smaller pieces of the specification still outstanding:
 
@@ -70,15 +98,23 @@ understood, and it keeps older machines working.
 
 ### Tier 2 — cheap and disproportionately useful
 
-**PNG image stack** (`png`, and the other image types)
-
-Exporting layers as numbered images is nearly free given the engine already
-decodes every layer to greyscale, and it turns CheapAzSLA into something you
-can point at a file to find out what is actually in it. It is also the most
-useful thing possible when a print fails and nobody can say why.
-
 **UVJ** — done. A ZIP of PNG layers and a JSON manifest, verified lossless
 against UVtools in both directions.
+
+**PNG image stack** (`png`, and the other image types) — **not worth doing,
+and here is why, so it does not get picked up again.**
+
+The argument for it was that exporting layers as numbered images is nearly
+free, and that it turns CheapAzSLA into something you can point at a file to
+find out what is actually in it — the most useful thing possible when a print
+fails and nobody can say why. That argument was written before UVJ landed, and
+UVJ is exactly that: one 8-bit greyscale PNG per layer, plus a manifest, read
+and written. SL1 is the same thing again, since a PrusaSlicer file is already a
+ZIP of numbered greyscale PNGs.
+
+So the job is done twice over. Convert to UVJ, unzip it, and page through
+`slice/00000000.png` onwards in any image viewer. A folder of loose PNGs would
+save the unzip step and nothing else, which is not a format's worth of work.
 
 **OSLA**
 
@@ -152,13 +188,14 @@ worth doing before someone has a printer that needs one.
 
 ## Order
 
-1. CTB, because it unblocks the most printers
-2. PNG image stack, because it is nearly free and immediately useful
-3. Packaging, because software nobody can install is not finished
-4. PHZ, riding on CTB
-5. The 3D layer view
-6. Anycubic
-7. Everything else, on request
+CTB, PHZ and UVJ are done, and the PNG stack turned out to be covered by UVJ.
+What is left, in order:
+
+1. Packaging, because software nobody can install is not finished
+2. Final polish — the list above, and the guide that is still a blank page
+3. The 3D layer view
+4. Anycubic, when there is a real Anycubic panel size to test against
+5. Everything else, on request
 
 Adding a format is one handler, one line in the registry, and its tests. See
 [ADDING_A_FORMAT.md](ADDING_A_FORMAT.md).
