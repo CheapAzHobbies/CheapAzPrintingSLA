@@ -4436,16 +4436,11 @@ fn auto_saw(ui: &Rc<App>, path: PathBuf) {
     if !path.is_file() {
         return;
     }
-    // Only formats that can be read, and never the format being written - a
-    // folder that is both watched and written to would otherwise convert its
-    // own output round and round.
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return;
     };
     let to = ui.settings.borrow().auto_to_format.clone();
-    let readable = registry::by_extension(ext).is_some_and(|h| h.info().capabilities.reads);
-    let is_output = registry::by_extension(ext).map(|h| h.info().id) == Some(to.as_str());
-    if !readable || is_output {
+    if !auto::worth_converting(ext, &to) {
         return;
     }
     {
@@ -4589,6 +4584,27 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
             s.ram_budget_mb as u64,
         )
     };
+    // Checked again here, not only where files are noticed. Choosing a file by
+    // hand goes straight into the queue - deliberately, because being asked
+    // for a particular file is a good reason to take it - and that route used
+    // to skip this, which is how a GOO in a folder that GOO was being written
+    // to got converted into another GOO beside it, and that one into another.
+    let same_format = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| !auto::worth_converting(ext, &to));
+    if same_format {
+        let name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        *ui.watchdog_trouble.borrow_mut() = Some((name, format!("already {}", to.to_uppercase())));
+        // Remembered, so the same file is not offered up again on every touch.
+        ui.auto_done.borrow_mut().push(key);
+        release(ui);
+        refresh_watchdog_steps(ui);
+        return;
+    }
     let drive = watchdog_where(ui).1;
 
     let coming = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
@@ -4774,6 +4790,14 @@ fn auto_convert_one(ui: &Rc<App>, source: PathBuf) {
         refresh_watchdog_recent(&ui);
         match result {
             Ok(_) => {
+                // What we just wrote is not new work. Where the folder being
+                // watched is also the folder being written to, the result
+                // lands right under the monitor that is watching for arrivals
+                // - so it is put on the done list the moment it exists, and
+                // the arrangement stops being able to feed on itself at all.
+                if let Some(made) = auto_key(&dest) {
+                    ui.auto_done.borrow_mut().push(made);
+                }
                 *ui.watchdog_ready.borrow_mut() = Some(if landed {
                     format!("Copied {name} to {where_to} - ready for the next file")
                 } else {

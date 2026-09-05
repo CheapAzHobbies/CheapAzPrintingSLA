@@ -18,6 +18,7 @@
 //! has finished being written, keeping the staging area from growing without
 //! bound - can be tested without a window.
 
+use cheapazsla_core::registry;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -459,5 +460,63 @@ mod tests {
     #[test]
     fn memory_is_refused_when_the_budget_is_smaller_than_the_file() {
         assert!(!ram_is_sensible(10, 50 * 1024 * 1024));
+    }
+}
+
+/// Whether a file that has turned up in the watched folder is one to convert.
+///
+/// Two ways to be no, and the second one matters more than it looks.
+///
+/// A format nothing here can read is not this program's business. And a file
+/// that is *already in the format being written* is, when the folder being
+/// watched is also the folder being written to, this arrangement's own output.
+/// Convert it and the result lands in the folder as well, is noticed, and is
+/// converted again - each pass leaving another copy behind. That is not a slow
+/// leak. It fills the folder as fast as the disk will take it, under names
+/// like "print (1) (1) (2).goo", and it does it while nobody is watching,
+/// which is the whole reason this feature has to be careful.
+///
+/// Asked of a bare extension rather than a path so it can be checked in both
+/// places that need it - when a file is noticed, and again before it is
+/// converted - and tested without a folder or a window.
+pub fn worth_converting(ext: &str, to: &str) -> bool {
+    let Some(handler) = registry::by_extension(ext) else {
+        return false;
+    };
+    let info = handler.info();
+    info.capabilities.reads && info.id != to
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_in_the_format_being_written_is_left_alone() {
+        // The exact shape that filled a Downloads folder with copies: watch a
+        // folder, write GOO into that same folder, and every GOO already there
+        // - including the ones just written - looks like new work.
+        assert!(!worth_converting("goo", "goo"));
+        assert!(!worth_converting("sl1", "sl1"));
+    }
+
+    #[test]
+    fn a_file_in_another_format_is_still_converted() {
+        assert!(worth_converting("sl1", "goo"));
+        assert!(worth_converting("goo", "ctb"));
+    }
+
+    #[test]
+    fn a_format_nothing_can_read_is_not_our_business() {
+        assert!(!worth_converting("txt", "goo"));
+        assert!(!worth_converting("", "goo"));
+    }
+
+    #[test]
+    fn the_extension_is_taken_case_insensitively() {
+        // Slicers on other platforms write .GOO, and a capital letter is not a
+        // different format.
+        assert!(!worth_converting("GOO", "goo"));
+        assert!(worth_converting("SL1", "goo"));
     }
 }

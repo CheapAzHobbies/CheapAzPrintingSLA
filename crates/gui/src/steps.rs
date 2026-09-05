@@ -67,11 +67,17 @@ const CLASSES: [&str; 6] = [
 // The connectors shed most of their width as the window narrows, and that
 // room is better spent on the stops: a connector carries no words, and the
 // second line under a stop is a folder or a file name.
-const NOTE_WIDTH: [i32; 3] = [92, 76, 62];
+const NOTE_WIDTH: [i32; 4] = [92, 76, 68, 56];
 /// And how long the connectors are at those widths. The chain has to fit in a
 /// tiled half-screen window, and the legs are the part of it carrying no words
 /// - so they are the part that gives up room first.
-const LINK_WIDTH: [i32; 3] = [96, 48, 22];
+///
+/// Four settings rather than three. The window has four widths it can be in,
+/// and the narrowest two used to share the tightest of these - so a window
+/// merely narrow was dressed for a window at its absolute minimum, and sat
+/// huddled in the middle of the page with a third of the width empty either
+/// side of it. Only the last setting is the emergency one now.
+const LINK_WIDTH: [i32; 4] = [96, 48, 40, 22];
 /// How much room the time-left caption above a connector is given, and how
 /// many characters it may use before it is cut short.
 ///
@@ -86,10 +92,10 @@ const LINK_WIDTH: [i32; 3] = [96, 48, 22];
 /// so reserving it costs nothing at all. Only at the narrowest does the
 /// caption need more room than the bar, and there it drops the "ETA:" and
 /// shows the figure alone - the number being the whole of what it came to say.
-const ETA_WIDTH: [i32; 3] = [64, 48, 30];
-const ETA_CHARS: [i32; 3] = [10, 6, 5];
+const ETA_WIDTH: [i32; 4] = [64, 48, 40, 30];
+const ETA_CHARS: [i32; 4] = [10, 6, 5, 5];
 /// How wide the line under the chain may run before it wraps, at each width.
-const FOOTER_CHARS: [i32; 3] = [52, 40, 30];
+const FOOTER_CHARS: [i32; 4] = [52, 40, 34, 28];
 const NOTE_SPEED: f64 = 34.0;
 const NOTE_GAP: i32 = 28;
 
@@ -533,7 +539,15 @@ impl Steps {
 
         self.footer.set_max_width_chars(FOOTER_CHARS[level]);
         self.room.set(NOTE_WIDTH[level]);
-        self.notes_allowed.set(level < LINK_WIDTH.len() - 1);
+        // Kept at every width now. They used to be dropped at the narrowest
+        // on the grounds that there was no room, and there is: four stops at
+        // 62 and three connectors at 22 come to 314 pixels, which fits inside
+        // the narrowest window this is allowed to be with room to spare. What
+        // was actually happening was a chain huddled in the middle of a page
+        // with a third of the width empty on either side of it, having thrown
+        // away the folder name, the file name and the destination to make room
+        // that was already there.
+        self.notes_allowed.set(true);
         for step in &self.steps {
             step.note.view.set_width_request(NOTE_WIDTH[level]);
             step.note.view.set_min_content_width(NOTE_WIDTH[level]);
