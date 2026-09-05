@@ -256,6 +256,17 @@ struct App {
     /// The rows currently inside the expander, so a refresh can take them out
     /// again without rebuilding the row and losing whether it was open.
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
+    /// The block of small facts on each Quick Access row - format, size,
+    /// folder, age. Held so they can be faded rather than simply vanishing
+    /// when the window narrows past the width that holds them.
+    nearby_meta: RefCell<Vec<gtk::Box>>,
+    /// Which fade is in charge. A window dragged back and forth across the
+    /// step starts a fade before the one before it has finished, and the newer
+    /// one has to win rather than fight.
+    nearby_fade: Cell<u32>,
+    /// Set while a rebuild is on its way in and its facts should arrive by
+    /// fading up rather than simply being there.
+    nearby_fade_in: Cell<bool>,
     /// Lowercased name and facts for each row, in the same order, so the
     /// search can match what the row shows in columns rather than as text.
     nearby_keys: RefCell<Vec<String>>,
@@ -891,6 +902,9 @@ fn build(app: &adw::Application) -> Rc<App> {
         nearby_gen: Rc::new(Cell::new(0)),
         nearby_sources: nearby.sources.clone(),
         nearby_rows: RefCell::new(Vec::new()),
+        nearby_meta: RefCell::new(Vec::new()),
+        nearby_fade: Cell::new(0),
+        nearby_fade_in: Cell::new(false),
         nearby_keys: RefCell::new(Vec::new()),
         nearby_shown: RefCell::new(Vec::new()),
         volume_monitor: RefCell::new(None),
@@ -1423,9 +1437,10 @@ fn wire_responsive(ui: &Rc<App>) {
                     refresh_queue(&ui);
                 }
                 // The Quick Access rows give up their columns at the same
-                // width the queue rows do.
-                refresh_nearby(&ui);
+                // width the queue rows do, and are faded across the change
+                // rather than swapped in one frame.
                 let smooth = ui.settings.borrow().animations;
+                fade_nearby_meta(&ui, smooth);
                 ui.dropzone_formats.set(!narrow, smooth);
             }
         })
@@ -5205,6 +5220,7 @@ fn recheck_edits(ui: &Rc<App>) {
 /// snap it shut while the user is reading it.
 fn refresh_nearby(ui: &Rc<App>) {
     if !ui.settings.borrow().show_nearby_files {
+        ui.nearby_meta.borrow_mut().clear();
         for row in ui.nearby_rows.borrow_mut().drain(..) {
             ui.nearby_rows_list.remove(&row);
         }
@@ -5337,6 +5353,7 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
     // where the panel actually is instead of snapping back.
     let was = ui.nearby_clip.height();
 
+    ui.nearby_meta.borrow_mut().clear();
     for row in ui.nearby_rows.borrow_mut().drain(..) {
         ui.nearby_rows_list.remove(&row);
     }
@@ -5460,11 +5477,14 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
         };
         keys.push(format!("{name} {}", facts.join(" ")).to_lowercase());
 
-        // The name is carried by a marquee rather than by the row's own title,
-        // so a name too long for the row can be read by hovering it. The title
-        // is left empty and the marquee added as a prefix, which keeps the
-        // row's styling, its padding and its activation while taking over the
-        // one part that needed to move.
+        // In columns the row's insides are built here rather than left to
+        // AdwActionRow. A prefix does not expand - the title area is the part
+        // of an action row that takes up the slack - so the name sat in a slot
+        // the width of its own text with the rest of the row empty beside it,
+        // ellipsised while there was room to spare. Laid out here the name can
+        // be told to take the space, and the row is still an AdwActionRow, so
+        // its styling, its activation and everything that holds a list of them
+        // are untouched.
         let row = if in_columns {
             adw::ActionRow::builder().activatable(true).build()
         } else {
@@ -5474,22 +5494,25 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
                 .activatable(true)
                 .build()
         };
-        // Added in reverse: a prefix goes in ahead of the ones already there,
-        // so the marquee first and the icon second leaves the icon leading.
         if in_columns {
-            let name = marquee(&name);
-            name.set_margin_start(theme::SPACE_2);
-            marquee_on_hover(&name, &row);
-            row.add_prefix(&name);
-        } else {
-            row.set_title(&name);
-            row.set_title_lines(1);
-        }
-        row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_3);
+            line.set_margin_top(theme::SPACE_2);
+            line.set_margin_bottom(theme::SPACE_2);
+            line.set_margin_start(theme::SPACE_3);
+            line.set_margin_end(theme::SPACE_3);
+            line.append(&gtk::Image::from_icon_name("document-open-symbolic"));
 
-        if in_columns {
+            let name_view = marquee(&name);
+            name_view.set_hexpand(true);
+            marquee_on_hover(&name_view, &row);
+            line.append(&name_view);
+
             let meta = gtk::Box::new(gtk::Orientation::Horizontal, theme::SPACE_4);
             meta.set_valign(gtk::Align::Center);
+            // Held off the name. Given the whole row the name would otherwise
+            // run right up against the age, and two unrelated things touching
+            // read as one thing.
+            meta.set_margin_start(theme::SPACE_5);
             for (i, fact) in facts.iter().enumerate() {
                 let cell = gtk::Label::new(Some(fact));
                 cell.add_css_class("caption");
@@ -5501,7 +5524,13 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
                 columns[i].add_widget(&cell);
                 meta.append(&cell);
             }
-            row.add_suffix(&meta);
+            line.append(&meta);
+            ui.nearby_meta.borrow_mut().push(meta);
+            row.set_child(Some(&line));
+        } else {
+            row.set_title(&name);
+            row.set_title_lines(1);
+            row.add_prefix(&gtk::Image::from_icon_name("document-open-symbolic"));
         }
         let ui2 = ui.clone();
         let path = item.path.clone();
@@ -5537,6 +5566,87 @@ fn show_nearby(ui: &Rc<App>, sources: Vec<nearby::Source>, found: Vec<nearby::Fo
     // still applies to them.
     apply_nearby_filter(ui);
     animate_nearby_height(ui, was);
+    if ui.nearby_fade_in.replace(false) {
+        fade_meta_in(ui, ui.nearby_fade.get());
+    }
+}
+
+/// How long the small facts take to go, and to come back.
+///
+/// Short. This is a change of dress, not a journey - long enough not to be a
+/// jump, short enough that a window being dragged does not trail behind the
+/// pointer.
+const META_FADE_MS: f64 = 130.0;
+
+/// Fade the Quick Access facts out, rebuild the rows, fade them back in.
+///
+/// The columns are dropped rather than shrunk as the window narrows, because
+/// there is no width at which "1.2 MB" is usefully half there. Dropped in one
+/// frame that reads as the row breaking. Faded out and the simpler row faded
+/// in, it reads as the row giving something up - which is what is happening.
+fn fade_nearby_meta(ui: &Rc<App>, smooth: bool) {
+    if !smooth {
+        refresh_nearby(ui);
+        return;
+    }
+    let mine = ui.nearby_fade.get().wrapping_add(1);
+    ui.nearby_fade.set(mine);
+    // The rebuild scans the folder on a thread and fills the rows in when it
+    // comes back, so there is nothing to fade in at the moment the old rows go
+    // - the facts do not exist yet. The rebuild is told to fade them up as it
+    // makes them instead.
+    ui.nearby_fade_in.set(true);
+    let going: Vec<gtk::Box> = ui.nearby_meta.borrow().clone();
+    if going.is_empty() {
+        refresh_nearby(ui);
+        return;
+    }
+    let started = std::time::Instant::now();
+    let ui = ui.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        if ui.nearby_fade.get() != mine {
+            return glib::ControlFlow::Break;
+        }
+        let t = (started.elapsed().as_millis() as f64 / META_FADE_MS).clamp(0.0, 1.0);
+        for m in &going {
+            m.set_opacity(1.0 - t);
+        }
+        if t >= 1.0 {
+            refresh_nearby(&ui);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Bring the facts on the newly built rows up from nothing.
+fn fade_meta_in(ui: &Rc<App>, mine: u32) {
+    let arriving: Vec<gtk::Box> = ui.nearby_meta.borrow().clone();
+    if arriving.is_empty() {
+        return;
+    }
+    for m in &arriving {
+        m.set_opacity(0.0);
+    }
+    let started = std::time::Instant::now();
+    let ui = ui.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        if ui.nearby_fade.get() != mine {
+            // Somebody else owns these now, and left them mid-fade.
+            for m in &arriving {
+                m.set_opacity(1.0);
+            }
+            return glib::ControlFlow::Break;
+        }
+        let t = (started.elapsed().as_millis() as f64 / META_FADE_MS).clamp(0.0, 1.0);
+        for m in &arriving {
+            m.set_opacity(t);
+        }
+        if t >= 1.0 {
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// How long the list takes to move between two heights, in seconds.
