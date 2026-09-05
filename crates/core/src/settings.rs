@@ -98,6 +98,14 @@ pub struct Settings {
     pub auto_staging: String,
     /// A ceiling on the staging area, in MB.
     pub auto_cap_mb: u32,
+    /// How many of WatchDog's conversions the list on its page shows before it
+    /// starts scrolling.
+    pub auto_recent_shown: u32,
+    /// And how many it holds altogether. Counted in files rather than in
+    /// conversions: the same file converted five times is one thing that
+    /// happened five times, and a list of five copies of one name has crowded
+    /// out the four other files it should have been telling you about.
+    pub auto_recent_kept: u32,
     /// And on how long anything waits in it, in days.
     pub auto_keep_days: u32,
     /// What this program may hold in memory for staging, in MB.
@@ -206,6 +214,8 @@ impl Default for Settings {
             auto_target_uuid: None,
             auto_target_dir: None,
             auto_target_label: None,
+            auto_recent_shown: 5,
+            auto_recent_kept: 10,
             auto_staging: "disk".into(),
             auto_cap_mb: 2048,
             auto_keep_days: 7,
@@ -231,6 +241,12 @@ impl Default for Settings {
 
 /// How many recent folders to remember. Short on purpose (§ recent locations).
 const MAX_RECENT: usize = 5;
+/// Ceilings on WatchDog's list. The first is how tall the list may be asked to
+/// stand before it scrolls; the second how much it may remember. Both are
+/// bounds on a number somebody types, not opinions about what they should
+/// choose.
+pub const MAX_RECENT_SHOWN: u32 = 20;
+pub const MAX_RECENT_KEPT: u32 = 50;
 
 impl Settings {
     /// Path of the settings file, honouring `XDG_CONFIG_HOME`.
@@ -289,6 +305,16 @@ impl Settings {
         }
         if let Some(v) = map.get("pinned_subfolder") {
             s.pinned_subfolder = v.clone();
+        }
+        if let Some(v) = map.get("auto_recent_shown") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.auto_recent_shown = n.clamp(1, MAX_RECENT_SHOWN);
+            }
+        }
+        if let Some(v) = map.get("auto_recent_kept") {
+            if let Ok(n) = v.parse::<u32>() {
+                s.auto_recent_kept = n.clamp(1, MAX_RECENT_KEPT);
+            }
         }
         if let Some(v) = map.get("auto_lock_new_drives") {
             s.auto_lock_new_drives = v == "true";
@@ -474,6 +500,8 @@ impl Settings {
              auto_staging = {}\n\
              auto_cap_mb = {}\n\
              auto_keep_days = {}\n\
+             auto_recent_shown = {}\n\
+             auto_recent_kept = {}\n\
              ram_budget_mb = {}\n\
              recent_output_shown = {}\n\
              hidden_input_formats = {}\n\
@@ -521,6 +549,8 @@ impl Settings {
             self.auto_staging,
             self.auto_cap_mb,
             self.auto_keep_days,
+            self.auto_recent_shown,
+            self.auto_recent_kept,
             self.ram_budget_mb,
             self.recent_output_shown,
             self.hidden_input_formats.join("\x1f"),

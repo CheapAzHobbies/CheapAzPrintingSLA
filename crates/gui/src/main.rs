@@ -766,7 +766,17 @@ fn build(app: &adw::Application) -> Rc<App> {
     clear_recent.set_valign(gtk::Align::Center);
     clear_recent.set_tooltip_text(Some("Forget what WatchDog converted on its own"));
     watchdog_recent_group.set_header_suffix(Some(&clear_recent));
-    watchdog_recent_group.add(&watchdog_recent);
+    // Clipped to a few rows rather than allowed to run down the page. A list
+    // of everything WatchDog has ever done pushes the things you came to this
+    // page to change off the bottom of it; how many rows is a setting, because
+    // how much of it anyone wants to see at once is not something to guess.
+    let watchdog_recent_clip = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&watchdog_recent)
+        .build();
+    watchdog_recent_group.add(&watchdog_recent_clip);
     let watchdog_page = build_watchdog_page(
         &watchdog_row,
         &watchdog_fold,
@@ -1717,11 +1727,64 @@ fn watchdog_detail_rows(ui: &Rc<App>) -> Vec<adw::PreferencesRow> {
         })
         .build();
 
+    // How much of the list to show, and how much of it to keep. Two numbers
+    // rather than one, because they answer different questions: how tall the
+    // list may stand on the page, and how far back it remembers.
+    let shown_row = adw::SpinRow::builder()
+        .title("Conversions to show at once")
+        .subtitle("The list scrolls past this")
+        .adjustment(&gtk::Adjustment::new(
+            current.auto_recent_shown as f64,
+            1.0,
+            cheapazsla_core::settings::MAX_RECENT_SHOWN as f64,
+            1.0,
+            5.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        shown_row.connect_value_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.auto_recent_shown = r.value() as u32;
+                let _ = s.save();
+            }
+            refresh_watchdog_recent(&ui);
+        });
+    }
+
+    let kept_row = adw::SpinRow::builder()
+        .title("Files to keep in the list")
+        .subtitle("Counted in files, so the same one converted twice is one line")
+        .adjustment(&gtk::Adjustment::new(
+            current.auto_recent_kept as f64,
+            1.0,
+            cheapazsla_core::settings::MAX_RECENT_KEPT as f64,
+            1.0,
+            5.0,
+            0.0,
+        ))
+        .build();
+    {
+        let ui = ui.clone();
+        kept_row.connect_value_notify(move |r| {
+            {
+                let mut s = ui.settings.borrow_mut();
+                s.auto_recent_kept = r.value() as u32;
+                let _ = s.save();
+            }
+            refresh_watchdog_recent(&ui);
+        });
+    }
+
     vec![
         staging_row.upcast(),
         ram_row.upcast(),
         cap_row.upcast(),
         keep_row.upcast(),
+        shown_row.upcast(),
+        kept_row.upcast(),
         waiting_row.upcast(),
     ]
 }
@@ -4315,13 +4378,30 @@ fn refresh_watchdog_recent(ui: &Rc<App>) {
     while let Some(row) = ui.watchdog_recent.first_child() {
         ui.watchdog_recent.remove(&row);
     }
+    let (shown, kept) = {
+        let s = ui.settings.borrow();
+        (s.auto_recent_shown as usize, s.auto_recent_kept as usize)
+    };
+    // One line per file, not per conversion. WatchDog converting the same file
+    // again is the same file, and five rows carrying one name have crowded out
+    // the four other files the list was there to tell you about. The newest
+    // conversion of a file is the one that counts, and history is newest
+    // first, so the first sighting of a name is the one to keep.
+    let mut seen: Vec<PathBuf> = Vec::new();
     let entries: Vec<history::Entry> = ui
         .history
         .borrow()
         .entries
         .iter()
         .filter(|e| e.automatic)
-        .take(5)
+        .filter(|e| {
+            if seen.contains(&e.destination) {
+                return false;
+            }
+            seen.push(e.destination.clone());
+            true
+        })
+        .take(kept)
         .cloned()
         .collect();
     if entries.is_empty() {
@@ -4331,8 +4411,10 @@ fn refresh_watchdog_recent(ui: &Rc<App>) {
             .build();
         row.add_prefix(&gtk::Image::from_icon_name("document-open-recent-symbolic"));
         ui.watchdog_recent.append(&row);
+        fit_watchdog_recent(ui, 1, shown);
         return;
     }
+    let entry_count = entries.len();
     for e in entries {
         let row = adw::ActionRow::builder()
             .title(e.destination_name())
@@ -4357,6 +4439,51 @@ fn refresh_watchdog_recent(ui: &Rc<App>) {
         }
         ui.watchdog_recent.append(&row);
     }
+    fit_watchdog_recent(ui, entry_count, shown);
+}
+
+/// Let the list stand at its full height up to `shown` rows, and scroll past
+/// that.
+///
+/// Measured rather than worked out from a number of pixels: rows are as tall
+/// as the font and the theme make them, and a figure right on one machine is a
+/// row and a half on another.
+///
+/// And measured after the list has been laid out, not before. Asking a row how
+/// tall it would like to be gets an answer that leaves out what the theme adds
+/// around it once it is really drawn - which is how asking for five rows first
+/// produced three and a half. The cap comes off, the list stands at its full
+/// height for one frame, and the height it actually took is the one divided up.
+fn fit_watchdog_recent(ui: &Rc<App>, rows: usize, shown: usize) {
+    let Some(clip) = watchdog_recent_clip(ui) else {
+        return;
+    };
+    clip.set_max_content_height(-1);
+    clip.set_vscrollbar_policy(gtk::PolicyType::Never);
+    if rows <= shown || rows == 0 {
+        return;
+    }
+    let ui = ui.clone();
+    glib::idle_add_local_once(move || {
+        let Some(clip) = watchdog_recent_clip(&ui) else {
+            return;
+        };
+        let all = ui.watchdog_recent.height();
+        if all <= 0 {
+            return;
+        }
+        let per = all as f64 / rows as f64;
+        clip.set_max_content_height((per * shown as f64).round() as i32);
+        clip.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    });
+}
+
+/// The scroller the recent list is clipped by.
+fn watchdog_recent_clip(ui: &Rc<App>) -> Option<gtk::ScrolledWindow> {
+    ui.watchdog_recent
+        .parent()
+        .and_then(|p| p.ancestor(gtk::ScrolledWindow::static_type()))
+        .and_downcast::<gtk::ScrolledWindow>()
 }
 
 /// Start or stop watching the folder that automatic mode reads.
