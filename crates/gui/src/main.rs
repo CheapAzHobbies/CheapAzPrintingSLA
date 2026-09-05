@@ -313,6 +313,10 @@ struct App {
     preview_nav_ends: Vec<gtk::Widget>,
     /// True while the window is narrow enough that columns are being dropped.
     compact: Cell<bool>,
+    /// Puts the page into the layout for a given width band. Held so that
+    /// anything which changes how much room the page has - the guide panel
+    /// opening, not only the window resizing - can ask for it again.
+    layout: RefCell<Option<LayoutApplier>>,
 
     // history page
     history_list: gtk::ListBox,
@@ -920,6 +924,7 @@ fn build(app: &adw::Application) -> Rc<App> {
         swap_col,
         preview_nav_ends,
         compact: Cell::new(false),
+        layout: RefCell::new(None),
         history_list,
         history_ticks: RefCell::new(Vec::new()),
         overwrite_switch: RefCell::new(None),
@@ -979,22 +984,31 @@ fn build(app: &adw::Application) -> Rc<App> {
     {
         // The guide is built once and kept: it holds screenshots, and
         // rebuilding it on every open would decode them again for nothing.
-        let shell = ui.shell.clone();
         let guide = help::Help::new({
-            let shell = ui.shell.clone();
-            move || shell.show_guide(false)
+            // Closing gives the page its width back, so the layout is asked
+            // for again - otherwise the page stays in the shape it took while
+            // the panel was beside it.
+            let ui = ui.clone();
+            move || {
+                ui.shell.show_guide(false);
+                refresh_layout(&ui);
+            }
         });
         ui.shell.set_guide(&guide.widget);
-        let toasts = ui.shell.toasts.clone();
+        let ui2 = ui.clone();
         ui.shell.connect_help(move || {
             // Pressing it anyway says why, rather than doing nothing. The
             // button is deliberately still live at narrow widths so that it
             // can answer for itself.
-            if !shell.guide_allowed() {
-                toasts.add_toast(adw::Toast::new("Make the window wider to open the guide"));
+            if !ui2.shell.guide_allowed() {
+                ui2.shell
+                    .toasts
+                    .add_toast(adw::Toast::new("Make the window wider to open the guide"));
                 return;
             }
-            shell.show_guide(!shell.guide_open());
+            ui2.shell.show_guide(!ui2.shell.guide_open());
+            // Opening takes width away from the page; the page is told.
+            refresh_layout(&ui2);
         });
     }
     let animate = ui.settings.borrow().animations;
@@ -1284,6 +1298,53 @@ fn report_minimums(window: &adw::ApplicationWindow) {
 /// icons and loses its labels, the layer scale gives up its fixed width, and
 /// the first/last buttons go — they are the two of the five that a keyboard
 /// Home and End already cover.
+/// Puts the page into the layout for one of the width bands.
+type LayoutApplier = Rc<dyn Fn(u8)>;
+
+/// Below this the guide is not offered: there is not room for it beside a page
+/// still worth looking at.
+const GUIDE_MIN_WIDTH: i32 = 900;
+
+/// How much width the page actually has, which is not the same as how wide the
+/// window is once the guide is open beside it.
+fn usable_width(ui: &Rc<App>) -> i32 {
+    (ui.window.width() - ui.shell.guide_width()).max(1)
+}
+
+/// Which layout band that width falls in. Same thresholds as the breakpoints,
+/// read from the width rather than inferred from which breakpoint libadwaita
+/// happens to have applied.
+fn usable_level(ui: &Rc<App>) -> u8 {
+    match usable_width(ui) {
+        w if w <= 480 => 3,
+        w if w <= 760 => 2,
+        w if w <= 1140 => 1,
+        _ => 0,
+    }
+}
+
+/// Put the page into the layout its current width calls for.
+///
+/// Decides whether the guide may be opened first, because refusing it closes
+/// it, and a guide that has just closed has given its width back.
+fn refresh_layout(ui: &Rc<App>) {
+    // A window that has not been shown yet reports a width of zero, and zero
+    // is narrower than every threshold - so answering it would mark the guide
+    // unavailable and fold the rail on a window that is about to open wide.
+    // There is nothing to decide until there is a width to decide from.
+    let width = ui.window.width();
+    if width <= 0 {
+        return;
+    }
+    ui.shell.set_guide_allowed(width >= GUIDE_MIN_WIDTH);
+    let level = usable_level(ui);
+    ui.shell.aim(level >= 2);
+    let apply = ui.layout.borrow().clone();
+    if let Some(apply) = apply {
+        apply(level);
+    }
+}
+
 fn wire_responsive(ui: &Rc<App>) {
     // Each threshold sits above the width the layout actually needs in the
     // state below it, measured rather than guessed: the full sidebar and a
@@ -1380,33 +1441,43 @@ fn wire_responsive(ui: &Rc<App>) {
     // unapply for as long as the drag lasts. The lateness that costs is dealt
     // with in the fold itself, which will not let the rail be wider than the
     // window can fit.
-    let hit = Rc::new([Cell::new(false), Cell::new(false), Cell::new(false)]);
+    // Kept so anything that changes how much room the page has can re-apply it.
+    *ui.layout.borrow_mut() = Some(apply.clone());
+
     let pending = Rc::new(Cell::new(false));
-    for (index, condition) in [WIDE_BELOW, NARROW_BELOW, STACKED_BELOW]
-        .into_iter()
-        .enumerate()
-    {
+    for condition in [WIDE_BELOW, NARROW_BELOW, STACKED_BELOW, GUIDE_NEEDS] {
         let bp = adw::Breakpoint::new(
             adw::BreakpointCondition::parse(condition).expect("breakpoint condition"),
         );
         for state in [true, false] {
-            let (hit, apply, pending) = (hit.clone(), apply.clone(), pending.clone());
-            let ui_for_aim = ui.clone();
+            let _ = state;
+            let pending = pending.clone();
+            let ui = ui.clone();
             let handler = move |_: &adw::Breakpoint| {
-                hit[index].set(state);
-                let level = hit.iter().rposition(|h| h.get()).map_or(0, |i| i as u8 + 1);
+                // The width is read, not inferred from which breakpoint fired.
+                //
+                // libadwaita applies one breakpoint at a time - the last one
+                // added whose condition holds - so the others are unapplied
+                // whether or not their conditions still hold. Counting the
+                // flags therefore stopped working the moment a fourth
+                // breakpoint was added for the guide: below 900px that one won,
+                // the three layout ones were unapplied, and the page laid
+                // itself out for a wide window inside a narrow one and ran off
+                // the edge. Asking the window how wide it is cannot go wrong
+                // that way, and the breakpoints are left doing the one thing
+                // they are reliable for - telling us something changed.
+                let level = usable_level(&ui);
                 // Aim the rail now and do the rest on the idle: a fast drag is
                 // several frames past the step by the time an idle runs, and
                 // those are the frames the fold should have started in.
-                ui_for_aim.shell.aim(level >= 2);
+                ui.shell.aim(level >= 2);
                 if pending.replace(true) {
                     return;
                 }
-                let (hit, apply, pending) = (hit.clone(), apply.clone(), pending.clone());
+                let (ui, pending) = (ui.clone(), pending.clone());
                 glib::idle_add_local_once(move || {
                     pending.set(false);
-                    let level = hit.iter().rposition(|h| h.get()).map_or(0, |i| i as u8 + 1);
-                    apply(level);
+                    refresh_layout(&ui);
                 });
             };
             if state {
@@ -1418,19 +1489,20 @@ fn wire_responsive(ui: &Rc<App>) {
         ui.window.add_breakpoint(bp);
     }
 
+    // Once the window actually has a size, and again whenever it changes.
+    //
+    // Breakpoints alone are not enough to keep this right. They fire when a
+    // threshold is crossed, so a window that opens wider than every threshold
+    // fires nothing at all - and at the moment this is being wired the window
+    // has not been shown yet and reports a width of zero, which reads as "too
+    // narrow for the guide". Without this the Guide button stayed struck
+    // through on a window that had plenty of room for it.
     {
-        // Its own breakpoint rather than another entry in the array above:
-        // that array's index decides how compact the layout is, and this is
-        // not a fifth degree of compactness - it is one control being
-        // available or not.
-        let bp = adw::Breakpoint::new(
-            adw::BreakpointCondition::parse(GUIDE_NEEDS).expect("breakpoint condition"),
-        );
-        let shut = ui.shell.clone();
-        bp.connect_apply(move |_| shut.set_guide_allowed(false));
-        let open = ui.shell.clone();
-        bp.connect_unapply(move |_| open.set_guide_allowed(true));
-        ui.window.add_breakpoint(bp);
+        let ui2 = ui.clone();
+        ui.window.connect_map(move |_| refresh_layout(&ui2));
+        let ui3 = ui.clone();
+        ui.window
+            .connect_notify_local(Some("default-width"), move |_, _| refresh_layout(&ui3));
     }
 
     // "1" drives a scripted resize; anything else just records what a real

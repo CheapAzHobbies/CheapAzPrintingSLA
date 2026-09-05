@@ -413,6 +413,28 @@ impl Shell {
         }
     }
 
+    /// How much width the guide is taking away from the page right now.
+    ///
+    /// Zero when it is shut. The page's layout has to know: opening a panel
+    /// 400px wide leaves the page with 400px less to lay itself out in, and a
+    /// page that carries on as though it still had the whole window simply
+    /// runs off the edge of what it has been given.
+    pub fn guide_width(&self) -> i32 {
+        if !self.split.shows_sidebar() {
+            return 0;
+        }
+        let whole = self.split.width();
+        if whole <= 0 {
+            return self.split.min_sidebar_width() as i32;
+        }
+        let want = whole as f64 * self.split.sidebar_width_fraction();
+        want.clamp(
+            self.split.min_sidebar_width(),
+            self.split.max_sidebar_width(),
+        )
+        .round() as i32
+    }
+
     /// Whether the guide could be opened at this window width.
     pub fn guide_allowed(&self) -> bool {
         self.guide_allowed.get()
