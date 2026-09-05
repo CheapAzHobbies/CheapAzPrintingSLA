@@ -143,6 +143,11 @@ pub struct Shell {
     animate: Rc<Cell<bool>>,
     /// The About button at the foot of the rail.
     about: RefCell<Option<gtk::Button>>,
+    help: RefCell<Option<gtk::Button>>,
+    /// Whether the window is wide enough to hold the guide beside the page.
+    guide_allowed: Cell<bool>,
+    /// The panel the guide lives in, on the right of the content.
+    split: adw::OverlaySplitView,
     compact: Cell<bool>,
 }
 
@@ -250,6 +255,18 @@ impl Shell {
             want_labels: Rc::new(Cell::new(true)),
             animate: Rc::new(Cell::new(true)),
             about: RefCell::new(None),
+            help: RefCell::new(None),
+            guide_allowed: Cell::new(true),
+            split: adw::OverlaySplitView::builder()
+                .sidebar_position(gtk::PackType::End)
+                .show_sidebar(false)
+                // A third of a wide window, but never so narrow that a
+                // sentence breaks every four words, and never so wide that
+                // the page it is explaining is the smaller half.
+                .sidebar_width_fraction(0.30)
+                .min_sidebar_width(340.0)
+                .max_sidebar_width(460.0)
+                .build(),
             compact: Cell::new(false),
         });
 
@@ -265,6 +282,11 @@ impl Shell {
         let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spacer.set_vexpand(true);
         content.append(&spacer);
+        // The guide above the About row: it is the one somebody reaches for
+        // while they are stuck, and About is the one they reach for once.
+        let help = shell.rail_button("help-browser-symbolic", "Guide");
+        content.append(&help);
+        *shell.help.borrow_mut() = Some(help);
         let about = shell.rail_button("help-about-symbolic", "About");
         about.set_margin_bottom(theme::SPACE_2);
         content.append(&about);
@@ -278,7 +300,13 @@ impl Shell {
         // the stack rather than the shell puts them where the eye already is,
         // and keeps them off the rail.
         shell.toasts.set_child(Some(&stack));
-        shell.widget.append(&shell.toasts);
+        // The guide opens beside the page rather than over it, so you can
+        // follow a step while you are reading it. On a narrow window there is
+        // no room for two columns and it slides over the top instead - see
+        // `set_compact`.
+        shell.split.set_content(Some(&shell.toasts));
+        shell.split.set_hexpand(true);
+        shell.widget.append(&shell.split);
         shell.select_visual(Section::Convert);
         shell
     }
@@ -321,6 +349,81 @@ impl Shell {
     }
 
     /// Called when the About button at the foot of the rail is pressed.
+    /// Put the guide in the panel on the right. Called once, at start-up.
+    pub fn set_guide(&self, guide: &impl IsA<gtk::Widget>) {
+        self.split.set_sidebar(Some(guide));
+    }
+
+    /// Whether the guide panel is open.
+    pub fn guide_open(&self) -> bool {
+        self.split.shows_sidebar()
+    }
+
+    /// Open or close the guide panel.
+    ///
+    /// The rail button is marked while it is open, the same way the section
+    /// rows are marked: the rail is the one place that says where you are, and
+    /// a panel open with nothing in the rail to say so is a panel you close by
+    /// hunting for the button that opened it.
+    pub fn show_guide(&self, open: bool) {
+        if open && !self.guide_allowed.get() {
+            return;
+        }
+        self.split.set_show_sidebar(open);
+        if let Some(button) = self.help.borrow().as_ref() {
+            if open {
+                button.add_css_class("selected");
+            } else {
+                button.remove_css_class("selected");
+            }
+        }
+    }
+
+    /// Whether there is room to open the guide at all.
+    ///
+    /// Two columns need room for two columns. Rather than slide the panel over
+    /// the page on a narrow window - which hides the thing being explained,
+    /// and makes a guide about pressing a button cover the button - the guide
+    /// is simply not offered below the width where both fit. The rail button
+    /// says why instead of doing nothing.
+    ///
+    /// A window that shrinks past the limit with the guide open closes it.
+    /// Leaving it open would mean holding the page at a width it cannot use.
+    pub fn set_guide_allowed(&self, allowed: bool) {
+        self.guide_allowed.set(allowed);
+        if let Some(button) = self.help.borrow().as_ref() {
+            // Struck through and faded rather than switched off. An insensitive
+            // widget in GTK does not receive the pointer at all, so it cannot
+            // show a tooltip - and a button that is greyed out with no way to
+            // ask why is the most annoying kind of dead control. This one still
+            // takes the pointer, so hovering explains itself.
+            if allowed {
+                button.remove_css_class("cz-unavailable");
+            } else {
+                button.add_css_class("cz-unavailable");
+            }
+            button.set_tooltip_text(Some(if allowed {
+                "Open the guide"
+            } else {
+                "Make the window wider to open the guide"
+            }));
+        }
+        if !allowed && self.guide_open() {
+            self.show_guide(false);
+        }
+    }
+
+    /// Whether the guide could be opened at this window width.
+    pub fn guide_allowed(&self) -> bool {
+        self.guide_allowed.get()
+    }
+
+    pub fn connect_help(&self, f: impl Fn() + 'static) {
+        if let Some(button) = self.help.borrow().as_ref() {
+            button.connect_clicked(move |_| f());
+        }
+    }
+
     pub fn connect_about(&self, f: impl Fn() + 'static) {
         if let Some(button) = self.about.borrow().as_ref() {
             button.connect_clicked(move |_| f());
@@ -427,6 +530,8 @@ impl Shell {
         for reveal in self.reveals.borrow().iter() {
             reveal.set_transition_duration(if on { COLLAPSE_MS } else { 0 });
         }
+        self.split.set_enable_show_gesture(on);
+        self.split.set_enable_hide_gesture(on);
     }
 
     /// Point the rail at its folded or open width, without touching anything

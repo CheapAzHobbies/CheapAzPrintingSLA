@@ -299,6 +299,29 @@ fn sheet(p: &Palette) -> String {
 .cz-step-eta {{ color: @cz_dim; font-size: 0.78rem; }}
 .cz-step-footer {{ color: @cz_dim; }}
 
+/* The guide. A step's number sits in its own circle to the left of the
+   instruction, so the steps can be counted without being read. */
+.cz-step-number {{
+  background: alpha(@accent_bg_color, 0.18);
+  color: @accent_color;
+  font-weight: 700;
+  border-radius: 999px;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+}}
+/* A rail row for something there is no room for. Faded and struck through, but
+   still able to take the pointer, so hovering can say why. */
+.cz-nav-item.cz-unavailable {{ opacity: 0.45; }}
+.cz-nav-item.cz-unavailable label {{ text-decoration-line: line-through; }}
+
+/* A screenshot is a picture of the program, not part of the panel, and the
+   border is what says so. */
+.cz-help-shot {{
+  border: 1px solid @cz_line;
+  border-radius: 8px;
+}}
+
 /* Grey is not done. White is done. Breathing is live. Nothing else, so the
    three can be told apart across the room without reading any of them. */
 .cz-step-idle {{ color: @cz_dim; }}

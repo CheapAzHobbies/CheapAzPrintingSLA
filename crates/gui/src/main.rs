@@ -9,6 +9,7 @@
 mod auto;
 mod drives;
 mod format_picker;
+mod help;
 mod nearby;
 mod palette;
 mod penguin;
@@ -975,6 +976,27 @@ fn build(app: &adw::Application) -> Rc<App> {
         let window = ui.window.clone();
         ui.shell.connect_about(move || show_about(&window));
     }
+    {
+        // The guide is built once and kept: it holds screenshots, and
+        // rebuilding it on every open would decode them again for nothing.
+        let shell = ui.shell.clone();
+        let guide = help::Help::new({
+            let shell = ui.shell.clone();
+            move || shell.show_guide(false)
+        });
+        ui.shell.set_guide(&guide.widget);
+        let toasts = ui.shell.toasts.clone();
+        ui.shell.connect_help(move || {
+            // Pressing it anyway says why, rather than doing nothing. The
+            // button is deliberately still live at narrow widths so that it
+            // can answer for itself.
+            if !shell.guide_allowed() {
+                toasts.add_toast(adw::Toast::new("Make the window wider to open the guide"));
+                return;
+            }
+            shell.show_guide(!shell.guide_open());
+        });
+    }
     let animate = ui.settings.borrow().animations;
     ui.shell.set_animate(animate);
     ui.controls_reveal
@@ -1270,6 +1292,10 @@ fn wire_responsive(ui: &Rc<App>) {
     const WIDE_BELOW: &str = "max-width: 1140px";
     const NARROW_BELOW: &str = "max-width: 760px";
     const STACKED_BELOW: &str = "max-width: 480px";
+    // The guide needs its own 340 beside a page still worth looking at, and
+    // the folded rail takes its slice first. Below this there is not room for
+    // two columns, so the guide is not offered rather than being squeezed in.
+    const GUIDE_NEEDS: &str = "max-width: 900px";
 
     let apply = {
         let ui = ui.clone();
@@ -1389,6 +1415,21 @@ fn wire_responsive(ui: &Rc<App>) {
                 bp.connect_unapply(handler);
             }
         }
+        ui.window.add_breakpoint(bp);
+    }
+
+    {
+        // Its own breakpoint rather than another entry in the array above:
+        // that array's index decides how compact the layout is, and this is
+        // not a fifth degree of compactness - it is one control being
+        // available or not.
+        let bp = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse(GUIDE_NEEDS).expect("breakpoint condition"),
+        );
+        let shut = ui.shell.clone();
+        bp.connect_apply(move |_| shut.set_guide_allowed(false));
+        let open = ui.shell.clone();
+        bp.connect_unapply(move |_| open.set_guide_allowed(true));
         ui.window.add_breakpoint(bp);
     }
 
